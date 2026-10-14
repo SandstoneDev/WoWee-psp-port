@@ -411,6 +411,9 @@ void WorldSocket::send(const Packet& packet) {
     // Without a retry loop, the server receives a truncated packet and the
     // TCP stream permanently desyncs (next header lands mid-payload).
     size_t totalSent = 0;
+#ifdef __psp__
+    noBufRetries_ = 0;
+#endif
     while (totalSent < sendData.size()) {
         ssize_t sent = net::portableSend(sockfd, sendData.data() + totalSent,
                                           sendData.size() - totalSent);
@@ -421,6 +424,16 @@ void WorldSocket::send(const Packet& packet) {
                 std::this_thread::sleep_for(std::chrono::microseconds(100));
                 continue;
             }
+#ifdef __psp__
+            // PSP (HW 113: a burst of ~96 creature / quest-status queries at world entry): the
+            // PSP's network stack answers ENOBUFS when its buffers are full. Dropping the packet then desyncs
+            // the header cipher (already advanced for it) and the server closes the link - wait and retry
+            // (up to ~3 s) as for EWOULDBLOCK.
+            if (err == ENOBUFS && ++noBufRetries_ <= 3000) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                continue;
+            }
+#endif
             LOG_ERROR("Send failed: ", net::errorString(err));
             break;
         }

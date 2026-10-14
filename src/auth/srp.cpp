@@ -163,9 +163,12 @@ void SRP::computeSessionKey() {
     LOG_DEBUG("Computing session key");
 
     // u = H(A | B) - scrambling parameter
-    // Use natural BigNum sizes to match TrinityCore's UpdateBigNumbers behavior
-    std::vector<uint8_t> A_bytes_u = A.toArray(true);
-    std::vector<uint8_t> B_bytes_u = B.toArray(true);
+    // PSP: A and B at 32 bytes, as the TrinityCore-family servers' SRP6 (u = SHA1(A[32], B[32])) and the
+    // original client hash them. The natural sizes (upstream, "TrinityCore's UpdateBigNumbers") failed the login
+    // whenever the top byte of A or B was 0 - about 1 login in 128, "tried to login with invalid password" in
+    // the authserver log (owner's screenshot, 2026-10-03).
+    std::vector<uint8_t> A_bytes_u = A.toArray(true, 32);
+    std::vector<uint8_t> B_bytes_u = B.toArray(true, 32);
 
     std::vector<uint8_t> AB;
     AB.insert(AB.end(), A_bytes_u.begin(), A_bytes_u.end());
@@ -199,8 +202,16 @@ void SRP::computeSessionKey() {
     // Split S into even and odd bytes, hash each half, then interleave
     std::vector<uint8_t> S_bytes = S.toArray(true, 32);  // 32 bytes for WoW
 
+    // PSP: the servers' SRP6::SHA1Interleave (and the original client) skip the zero bytes at the
+    // start of S (little-endian, the low end), rounded up to an even count, before hashing the halves; upstream
+    // hashed all 32 bytes - 1 login in 256 failed.
+    size_t skip = 0;
+    while (skip < S_bytes.size() && S_bytes[skip] == 0) ++skip;
+    if (skip & 1) ++skip;
+    skip /= 2;
+
     std::vector<uint8_t> S1, S2;
-    for (size_t i = 0; i < 16; ++i) {
+    for (size_t i = skip; i < 16; ++i) {
         S1.push_back(S_bytes[i * 2]);       // Even indices
         S2.push_back(S_bytes[i * 2 + 1]);   // Odd indices
     }
@@ -244,10 +255,11 @@ void SRP::computeProofs(const std::string& username) {
     // Compute H(username)
     std::vector<uint8_t> user_hash = Crypto::sha1(upperUser);
 
-    // Get A, B, and salt as byte arrays - natural sizes for hash inputs
-    std::vector<uint8_t> A_bytes = A.toArray(true);
-    std::vector<uint8_t> B_bytes = B.toArray(true);
-    std::vector<uint8_t> s_bytes = s.toArray(true);
+    // PSP: A, B and the salt at 32 bytes, as the server hashes them (the server's SRP6:
+    // M = SHA1(NgHash, H(I), s[32], A[32], B[32], K), M2 = SHA1(A[32], M, K)) - upstream used natural sizes.
+    std::vector<uint8_t> A_bytes = A.toArray(true, 32);
+    std::vector<uint8_t> B_bytes = B.toArray(true, 32);
+    std::vector<uint8_t> s_bytes = s.toArray(true, 32);
 
     // M1 = H( H(N)^H(g) | H(I) | s | A | B | K )
     std::vector<uint8_t> M1_input;

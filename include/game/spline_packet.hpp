@@ -99,6 +99,12 @@ namespace SplineFlagWotlk {
     constexpr uint32_t FROZEN          = 0x00400000;
 
     constexpr uint32_t UNCOMPRESSED_MASK = CATMULLROM | CYCLIC | ENTER_CYCLE;
+    // PSP: npc-walk - SMSG_MONSTER_MOVE's path is written whole (every point a float3) for a smooth spline,
+    // MoveSplineFlag::Mask_CatmullRom = Flying | Catmullrom (TrinityCore / AzerothCore / CMaNGOS
+    // PacketBuilder::WriteMonsterMove), else linear (destination + packed middle points) - also when Cyclic /
+    // Enter_Cycle is set on a ground path. UNCOMPRESSED_MASK above missed Flying, so every flying creature's
+    // path was read as packed points (waypoints garbage, the rest of the packet left over).
+    constexpr uint32_t MONSTER_MOVE_UNCOMPRESSED_MASK = FLYING | CATMULLROM;
 } // namespace SplineFlagWotlk
 
 [[nodiscard]] constexpr bool isPreWotlkSplineWalking(uint32_t splineFlags) {

@@ -1,0 +1,10 @@
+// B2: guild, guild bank, calendar, mail, bank - OWN strings (WOWEE_PS).
+// mail session (psp_world_session_mail.cpp)
+WOWEE_PS(MAIL_ERROR_CODE, "Mail error (%u).", "Ошибка почты (%u).")
+WOWEE_PS(MAIL_SEND_NOT_NOW, "The letter cannot be sent now.", "Сейчас нельзя отправить письмо.")
+WOWEE_PS(MAIL_SEND_NO_CONNECTION, "No connection to the server.", "Нет связи с сервером.")
+WOWEE_PS(MAIL_SEND_NOT_AT_MAILBOX, "You are not at a mailbox.", "Вы не у почтового ящика.")
+// guild bank (ui_world_guildbank.cpp)
+WOWEE_PS(GB_MONEY_EDIT, "%ug  %us  %uc", "%u з.  %u с.  %u м.")
+WOWEE_PS(GB_MONEY_INPUT_HINT, "gold silver copper", "золото серебро медь")
+// calendar (ui_world_calendar.cpp)

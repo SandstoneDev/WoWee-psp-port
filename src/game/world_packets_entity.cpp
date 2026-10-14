@@ -555,7 +555,7 @@ bool ItemQueryResponseParser::parse(network::Packet& packet, ItemQueryResponseDa
     }
 
     // Server sends exactly statsCount stat pairs (not always 10).
-    uint32_t statsToRead = std::min(statsCount, 10u);
+    uint32_t statsToRead = std::min(statsCount, kMaxItemStats);
     for (uint32_t i = 0; i < statsToRead; i++) {
         // Each stat is 2 uint32s (type + value) = 8 bytes
         if (!packet.hasRemaining(8)) {

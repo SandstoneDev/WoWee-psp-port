@@ -102,9 +102,10 @@ bool parseMonsterMoveSplineBody(
     if (pointCount == 0) return true;
 
     // Determine compressed vs uncompressed
+    // PSP: npc-walk - 3.3.5a: Flying | Catmullrom (MONSTER_MOVE_UNCOMPRESSED_MASK), was UNCOMPRESSED_MASK.
     uint32_t uncompMask = useTbcUncompressedMask
         ? SplineFlag::UNCOMPRESSED_MASK_TBC
-        : (wotlk ? SplineFlagWotlk::UNCOMPRESSED_MASK
+        : (wotlk ? SplineFlagWotlk::MONSTER_MOVE_UNCOMPRESSED_MASK
                  : SplineFlag::UNCOMPRESSED_MASK);
     bool uncompressed = (splineFlags & uncompMask) != 0;
 

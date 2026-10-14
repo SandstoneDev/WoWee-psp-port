@@ -102,6 +102,9 @@ private:
     std::atomic<bool> connected{false};
     bool encryptionEnabled = false;            // THREAD-SAFE: protected by ioMutex_
     bool useVanillaCrypt = false;  // true = XOR cipher, false = RC4
+#ifdef __psp__
+    int noBufRetries_ = 0;  // PSP: ENOBUFS retries of the packet being sent
+#endif
     bool useAsyncPump_ = true;
     std::thread asyncPumpThread_;
     std::atomic<bool> asyncPumpStop_{false};   // THREAD-SAFE: atomic

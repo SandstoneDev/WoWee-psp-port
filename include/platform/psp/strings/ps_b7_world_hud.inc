@@ -1,0 +1,96 @@
+// B7: character / inspect / dressup, HUD, windows, map, minimap, death, combat, world session - OWN strings (WOWEE_PS).
+// Dressing room (ui_world_dressup.cpp): DRESSUP_FRAME_INSTRUCTIONS' first half (the PSP keys follow), no art.
+WOWEE_PS(DU_INSTRUCTIONS, "To put an item on your character, press", "Чтобы надеть предмет на своего персонажа, нажмите на нем")
+WOWEE_PS(DU_NO_ART, "No dressing room art: rebake ui.pak.", "Нет арта примерочной: перепеките ui.pak.")
+// Reputation / Skills tabs (ui_world_char_tabs.cpp): an old pak on the card.
+WOWEE_PS(CHARTAB_NO_ART, "No tab art: rebake ui.pak.", "Нет арта вкладки: перепеките ui.pak.")
+WOWEE_PS(CHARTAB_NO_FACTION_TEXT, "No faction_text: rebake text.pak.", "Нет faction_text: перепеките text.pak.")
+WOWEE_PS(CHARTAB_NO_SKILL_TEXT, "No skill_text: rebake text.pak.", "Нет skill_text: перепеките text.pak.")
+// Inspect (ui_world_inspect.cpp): the talents tab before / without its data.
+WOWEE_PS(INSPECT_TALENTS_LOADING, "Talents are loading...", "Таланты загружаются...")
+// The Debug window (ui_world_windows.cpp) and the window column's buttons.
+WOWEE_PS(DBG_TITLE, "Debug", "Отладка")
+WOWEE_PS(WIN_BOOK, "Book", "Книга")
+WOWEE_PS(PORT_ON_LC, "on", "вкл")
+WOWEE_PS(DBG_IMP_QUADS, "quads", "квады")
+WOWEE_PS(DBG_IMP_SPRITES, "sprites", "спрайты")
+WOWEE_PS(DBG_TERRAIN_UNTEXTURED, "untextured", "без текстур")
+WOWEE_PS(DBG_TERRAIN_HIDDEN, "hidden", "скрыт")
+WOWEE_PS(DBG_TERRAIN_NO_DETAIL, "no detail", "без детали")
+WOWEE_PS(DBG_TERRAIN_NORMAL, "normal", "обычный")
+WOWEE_PS(DBG_NUMBERS, "Numbers", "Цифры")
+WOWEE_PS(DBG_NUMBERS_PLUS, "Numbers+", "Цифры+")
+WOWEE_PS(DBG_DROP, "Drop", "Обрыв")
+WOWEE_PS(DBG_PROFILER, "Profiler: %s", "Профайлер: %s")
+WOWEE_PS(DBG_CAPTURING, "Capturing...", "Идёт захват...")
+WOWEE_PS(DBG_CAPTURE, "Capture 300 frames", "Захват 300 кадров")
+WOWEE_PS(DBG_MODELS, "Models: %s", "Модели: %s")
+WOWEE_PS(DBG_NPCS, "NPC: %s", "NPC: %s")
+WOWEE_PS(DBG_TERRAIN, "Terrain: %s", "Земля: %s")
+WOWEE_PS(DBG_CHARACTER, "Character: %s", "Персонаж: %s")
+WOWEE_PS(DBG_ANIMATED, "animated", "анимация")
+WOWEE_PS(DBG_STATIC, "static", "статичный")
+WOWEE_PS(DBG_FILL_TEST, "Fill test: %s", "Тест заливки: %s")
+WOWEE_PS(DBG_BLEND, "Transitions: %d%%", "Переходы: %d%%")
+WOWEE_PS(DBG_TREE_LOD, "Tree LOD: %d (%u)", "LOD дер.: %d (%u)")
+WOWEE_PS(DBG_LOD2_FROM, "LOD2 from %.0f yd", "LOD2 от %.0f ярд")
+WOWEE_PS(DBG_IMPOSTORS, "Imp.: %s (%u)", "Имп.: %s (%u)")
+WOWEE_PS(DBG_IMP_FROM, "Imp. from %.0f yd", "Имп. от %.0f ярд")
+WOWEE_PS(DBG_NPC_ANIM, "NPC animation: %s", "Анимация NPC: %s")
+WOWEE_PS(DBG_ITEMS, "Items: %s", "Предметы: %s")
+// XP bar (ui_world_mainmenubar.cpp): Exhaustion.dbc's rest state names (not in strings.pak yet).
+WOWEE_PS(REST_STATE_RESTED, "Rested", "Состояние бодрости")
+WOWEE_PS(REST_STATE_NORMAL, "Normal", "Нормальное состояние")
+WOWEE_PS(REST_STATE_TIRED, "XXXTired", "XXXУсталость")
+WOWEE_PS(REST_STATE_EXHAUSTED, "XXXExhausted", "XXXИстощение")
+WOWEE_PS(REST_STATE_RAF, "Recruit a Friend", "Пригласи друга")
+// HUD debug lines and AFK (ui_world_hud.cpp).
+WOWEE_PS(HUD_POS_FMT, "%s  map %u  (%.0f, %.0f, %.0f)", "%s  карта %u  (%.0f, %.0f, %.0f)")
+WOWEE_PS(HUD_STATS_FMT, "build %d  %.1f fps  ge %u us  tiles %u  chunks %u/%u  tris %u", "build %d  %.1f fps  ge %u us  тайлы %u  чанки %u/%u  треуг %u")
+WOWEE_PS(HUD_MODELS_FMT, "models %u/%u  tris %u  batches %u  cpu %u us  dist %.0f", "модели %u/%u  треуг %u  батчи %u  cpu %u us  дальн %.0f")
+WOWEE_PS(HUD_MODELS_OFF, "models off", "модели выкл")
+WOWEE_PS(HUD_AFK, "Away (AFK)", "Нет на месте (AFK)")
+// The world's data on the card (ui_world_screen.cpp).
+WOWEE_PS(MAP_DATA_MISSING, "No data for the map \"%s\" (%s): the world is not loaded.", "Нет данных карты \"%s\" (%s): мир не загружен.")
+WOWEE_PS(MAP_NO_DATA, "No data for this map yet", "Для этой карты ещё нет данных")
+WOWEE_PS(MAP_NO_FILE, "No file %s", "Нет файла %s")
+WOWEE_PS(MAP_TILES_NOT_BAKED, "This area's tiles are not baked", "Тайлы этой местности не запечены")
+// Minimap (ui_world_minimap.cpp): the compass letter without the compass art.
+WOWEE_PS(MM_NORTH, "N", "С")
+// World map (ui_world_map.cpp): not baked.
+WOWEE_PS(MAP_ZONE_NOT_BAKED, "This map is not baked (--worldmap all)", "Эта карта не запечена (--worldmap all)")
+WOWEE_PS(WORLDMAP_NOT_BAKED1, "The world map is not baked: no \"wmhdr\" in", "Карта мира не запечена: нет \"wmhdr\" в")
+WOWEE_PS(WORLDMAP_NOT_BAKED2, "data/minimap_<map>.pak (psp_minimap_conv).", "data/minimap_<карта>.pak (psp_minimap_conv).")
+// Combat (ui_world_combat.cpp): the port's refused-attack lines.
+WOWEE_PS(ATTACK_TOO_FAR, "The target is too far away.", "Цель слишком далеко.")
+WOWEE_PS(ATTACK_STOPPED_FAR, "Auto attack stopped: the target is far away.", "Автоатака остановлена: цель далеко.")
+WOWEE_PS(ATTACK_BAD_FACING, "You are facing the wrong way!", "Вы смотрите не в ту сторону!")
+WOWEE_PS(ATTACK_NOT_STANDING, "You need to stand up.", "Нужно встать.")
+WOWEE_PS(ATTACK_CANT, "You cannot attack this target.", "Эту цель нельзя атаковать.")
+// Totem bar (psp_world_session_classbars.cpp): a spell that does not fit the slot.
+WOWEE_PS(SESSION_TOTEM_SLOT, "This spell cannot be put in this slot.", "Это заклинание нельзя поместить в эту ячейку.")
+// Unit frames (ui_world_target.cpp): the player frame's dead / ghost line.
+WOWEE_PS(UNIT_GHOST, "Ghost", "Дух")
+WOWEE_PS(UNIT_DEAD, "Dead", "Мёртв")
+// Controls (ui_world_controls.cpp): the mode line, no mount.
+WOWEE_PS(MODE_WEAPON_DRAWN, "Weapon drawn", "Оружие в руках")
+WOWEE_PS(MODE_WEAPON_SHEATHED, "Weapon sheathed", "Оружие убрано")
+WOWEE_PS(NO_MOUNT, "You have no mount.", "Нет верхового животного.")
+// Map transfer (psp_world_session_transfer.cpp): TRANSFER_ABORT_ERROR / an unknown reason (no client line).
+WOWEE_PS(TRANSFER_ABORTED, "Transfer aborted.", "Перемещение отменено.")
+// World session failures (psp_world_session.cpp) - the login screen shows them as they are.
+WOWEE_PS(SESSION_NO_OPCODES, "no opcode tables (Data/expansions/wotlk)", "нет таблиц опкодов (Data/expansions/wotlk)")
+WOWEE_PS(SESSION_WORLD_NO_ANSWER, "the world server does not answer: %s", "мир-сервер не отвечает: %s")
+WOWEE_PS(SESSION_TIMEOUT, "timeout: %s", "таймаут: %s")
+WOWEE_PS(SESSION_BAD_PACKET, "could not parse %s", "не разобран %s")
+WOWEE_PS(SESSION_WORLD_REFUSED, "the world refused: %s", "мир отказал: %s")
+WOWEE_PS(SESSION_CHAR_LOGIN_REFUSED, "the server refused the character's login", "сервер отказал во входе персонажа")
+// Debug window sound row (ui_world_sounds.cpp).
+WOWEE_PS(SND_TEST_FMT, "Sound: test (%u KB)", "Звук: тест (%u КБ)")
+WOWEE_PS(SND_NO_PAK, "Sound: no sounds.pak", "Звук: нет sounds.pak")
+WOWEE_PS(SND_STEPS_FMT, "Steps: %s", "Шаги: %s")
+WOWEE_PS(SND_STEPS_OWN, "own", "свои")
+WOWEE_PS(SND_STEPS_ALL, "all", "все")
+// FrameXML adapter (ui_world_framexml_game.cpp).
+WOWEE_PS(FX_SKILL_LINE, "Skill %u", "Навык %u")
+WOWEE_PS(FX_ITEM_USE_UNSUPPORTED, "Using items is not supported yet.", "Использование предметов пока не поддерживается.")

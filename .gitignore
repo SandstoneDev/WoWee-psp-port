@@ -175,3 +175,19 @@ android/local.properties
 # installation; it does not belong in this repository. See
 # docs/upgraded-assets.md.
 asset_packs/
+
+# PSP port
+# build output
+psp/bin/
+*.elf
+*.prx
+*.PBP
+# never: game data, converted packs, your settings and logs
+*.pak
+wowee.cfg
+session.log
+
+# SandstoneDebug sources (the generic lib/ and Makefile rules above must not hide them)
+!psp/sandstone-debug/lib/
+!psp/sandstone-debug/lib/Makefile
+!psp/sandstone-debug/prx/Makefile

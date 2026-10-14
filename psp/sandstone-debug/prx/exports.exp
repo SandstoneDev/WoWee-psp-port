@@ -1,0 +1,30 @@
+# Exports of the sdbg kernel module.
+#
+# THE FOUR-LINE syslib BLOCK IS MANDATORY -- without it the module does not
+# load at all. The pattern was taken from a sibling port's kernel module,
+# where it works on this same hardware and this same firmware.
+PSP_BEGIN_EXPORTS
+
+PSP_EXPORT_START(syslib, 0, 0x8000)
+PSP_EXPORT_FUNC_HASH(module_start)
+PSP_EXPORT_VAR_HASH(module_info)
+PSP_EXPORT_FUNC(module_stop)
+PSP_EXPORT_END
+
+# TWO EXPORTS, NOT ONE, AND THE SECOND IS NOT DECORATION.
+#   psrcCrashInstall -- install the handler and take the base of the game's text;
+#   psrcCrashArmed   -- REPORT THAT IT IS INSTALLED. Without it "the instrument
+#                       did not install" and "it installed, but there was no
+#                       crash" look the same -- that is, a silent instrument
+#                       is indistinguishable from a working mechanism.
+PSP_EXPORT_START(sdbg, 0, 0x4001)
+PSP_EXPORT_FUNC_HASH(psrcCrashInstall)
+PSP_EXPORT_FUNC_HASH(psrcCrashArmed)
+PSP_EXPORT_FUNC_HASH(psrcCrashSelfTest)
+PSP_EXPORT_FUNC_HASH(psrcCrashKernelFault)
+# Removing the handlers before exit -- the game calls it through
+# sctrlHENFindFunction + kuKernelCall (see crash_release_all in sdbg_prx.c).
+PSP_EXPORT_FUNC_HASH(psrcCrashUninstall)
+PSP_EXPORT_END
+
+PSP_END_EXPORTS

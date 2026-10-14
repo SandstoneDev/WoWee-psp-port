@@ -1049,7 +1049,7 @@ bool UpdateObjectParser::parseMovementBlock(network::Packet& packet, UpdateBlock
             block.transportZ = packet.readFloat();
             block.transportO = packet.readFloat();
             /*uint32_t tTime =*/ packet.readUInt32();
-            /*int8_t tSeat =*/ packet.readUInt8();
+            block.transportSeat = static_cast<int8_t>(packet.readUInt8());  // PSP: kept
 
             LOG_DEBUG("  OnTransport: guid=0x", std::hex, block.transportGuid, std::dec,
                       " offset=(", block.transportX, ", ", block.transportY, ", ", block.transportZ, ")");
@@ -1173,14 +1173,16 @@ bool UpdateObjectParser::parseMovementBlock(network::Packet& packet, UpdateBlock
     // Transport time
     if (updateFlags & UPDATEFLAG_TRANSPORT) {
         if (rem() < 4) return false;
-        /*uint32_t transportTime =*/ packet.readUInt32();
+        // PSP: kept - the transport game object's path time.
+        block.goTransportTime = packet.readUInt32();
+        block.hasGoTransportTime = true;
     }
 
     // Vehicle
     if (updateFlags & UPDATEFLAG_VEHICLE) {
         if (rem() < 8) return false;
-        /*uint32_t vehicleId =*/ packet.readUInt32();
-        /*float vehicleOrientation =*/ packet.readFloat();
+        block.vehicleId = packet.readUInt32();            // PSP: kept
+        block.vehicleOrientation = packet.readFloat();
     }
 
     // Rotation (GameObjects)

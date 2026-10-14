@@ -557,6 +557,20 @@ struct UpdateBlock {
     uint64_t transportGuid = 0;
     float transportX = 0.0f, transportY = 0.0f, transportZ = 0.0f, transportO = 0.0f;
 
+    // PSP (transports): UPDATEFLAG_TRANSPORT's u32 - a transport game object's path progress in ms when the server
+    // built the block (AzerothCore Object::BuildMovementUpdate writes GetPathProgress(); MotionTransport::Update
+    // advances it by the elapsed ms). Upstream reads and drops it.
+    bool hasGoTransportTime = false;
+    uint32_t goTransportTime = 0;
+
+    // PSP (class bars): the vehicle kit of a unit (UPDATEFLAG_VEHICLE: u32 Vehicle.dbc id + an orientation, as
+    // AzerothCore Object::BuildMovementUpdate writes GetVehicleKit()->GetVehicleInfo()->m_ID - the unit HAS a
+    // vehicle kit, nobody entered it) and the seat of a passenger (the ONTRANSPORT block's int8); upstream reads and
+    // drops both.
+    uint32_t vehicleId = 0;
+    float vehicleOrientation = 0.0f;
+    int8_t transportSeat = -1;
+
     // Field data (for VALUES and CREATE updates) - sorted flat vector instead of
     // std::map to drop the per-field heap allocation on every UPDATE_OBJECT block.
     FlatFieldMap fields;

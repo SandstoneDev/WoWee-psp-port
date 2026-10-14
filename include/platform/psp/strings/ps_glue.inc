@@ -1,0 +1,11 @@
+// S1: the glue screens - login, realm list, character select / create / delete, loading, movies - OWN strings (WOWEE_PS).
+WOWEE_PS(CFG_NO_SERVER, "No server/account in wowee.cfg", "нет server/account в wowee.cfg")
+WOWEE_PS(WIFI_SWITCH_OFF, "Wi-Fi: the WLAN switch is OFF", "Wi-Fi: выключатель WLAN в положении OFF")
+WOWEE_PS(WIFI_NO_PROFILE, "No saved Wi-Fi network (Settings > Network Settings)", "нет сохранённой Wi-Fi сети (Настройки > Сеть)")
+WOWEE_PS(WIFI_NOT_FOUND, "Wi-Fi: network %s not found nearby", "Wi-Fi: сеть %s не найдена рядом")
+WOWEE_PS(WIFI_REJECTED, "Wi-Fi: %s refused the connection (password?)", "Wi-Fi: %s отклонила подключение (пароль?)")
+WOWEE_PS(WIFI_SIGNAL_LOST, "Wi-Fi: lost the signal of %s", "Wi-Fi: потерян сигнал %s")
+WOWEE_PS(WIFI_NO_IP, "Wi-Fi: %s gave no IP address (DHCP)", "Wi-Fi: %s не выдала IP (DHCP)")
+WOWEE_PS(AUTH_TIMEOUT, "Authentication timed out", "таймаут авторизации")
+WOWEE_PS(PSP_BUILD_LINE, "WoWee PSP, build %d", "WoWee PSP, сборка %d")
+WOWEE_PS(PSP_KEYBOARD_FAILED, "The keyboard did not open", "Клавиатура не открылась")

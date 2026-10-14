@@ -5,6 +5,9 @@
 #include "network/packet.hpp"
 #include "core/logger.hpp"
 #include "core/data_paths.hpp"
+#ifdef __psp__
+#include "platform/psp/psp_integrity.hpp"  // PSP: streamed from the card
+#endif
 #include <sstream>
 #include <iomanip>
 #include <algorithm>
@@ -306,6 +309,14 @@ void AuthHandler::sendLogonProof() {
 
     // Legacy client integrity hash (aka "CRC hash"). Some servers enforce this for classic builds.
     // We compute it when checksumSalt was provided (always present on success challenge) and files exist.
+#ifdef __psp__
+    // PSP: the client's executable (data/client/) streamed from the card, the checksum kept per salt (psp_integrity.cpp) - the
+    // search below reads the whole 7.7 MB executable into memory. Missing: no hash, as before.
+    {
+        std::string err;
+        if (wowee::platform::psp::integrityHash(checksumSalt_, A, crcHash, err)) crcHashPtr = &crcHash;
+    }
+#else
     {
         std::vector<std::string> candidateDirs;
         if (const char* env = std::getenv("WOWEE_INTEGRITY_DIR")) {
@@ -370,6 +381,7 @@ void AuthHandler::sendLogonProof() {
                         "Set WOWEE_INTEGRITY_DIR to your client folder.");
         }
     }
+#endif
 
     if (clientInfo.protocolVersion < 8) {
         // Legacy proof format: no securityFlags byte on the wire, but CRC/integrity hash still applies.

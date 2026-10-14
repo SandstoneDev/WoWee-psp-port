@@ -1,0 +1,15 @@
+# WoWee PSP settings - copy to wowee.cfg next to EBOOT.PBP. key=value, '#' starts a comment.
+# The account and password are typed on the login screen (saved outside the game folder after the first login).
+
+# realm list server (IP address or host name) and port
+server=127.0.0.1
+port=3724
+
+# Wi-Fi profile number of the PSP's network settings; 0 = pick one automatically
+netprofile=0
+
+# frame limit: 60 or 30
+framecap=60
+
+# private development servers that unlock the debug aids (public addresses are always ignored)
+#devhosts=127.0.0.1,localhost

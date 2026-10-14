@@ -1,0 +1,11 @@
+// B5: auction, trade / duel, merchant, loot, trade skills - OWN strings (WOWEE_PS).
+WOWEE_PS(PSP_KEYBOARD_UNAVAILABLE, "The on-screen keyboard is not available.", "Экранная клавиатура недоступна.")
+WOWEE_PS(LOOT_HINT_TAKE, "take", "взять")
+WOWEE_PS(LOOT_HINT_ALL, "all", "всё")
+WOWEE_PS(LOOT_HINT_CLOSE, "close", "закрыть")
+WOWEE_PS(LOOT_NOTHING_NEAR, "Nothing to loot.", "Нечего обыскать.")
+WOWEE_PS(LOOT_DEBUG_BUTTON, "Loot (%u)", "Лут (%u)")
+WOWEE_PS(CRAFT_PAK_MISSING, "No craft.pak: rebake the paks (tools/psp/build_craft_pak.py).", "Нет craft.pak: перепеките паки (tools/psp/build_craft_pak.py).")
+WOWEE_PS(TRADESKILL_ART_MISSING, "No profession window art: rebake ui.pak.", "Нет арта окна профессии: перепеките ui.pak.")
+WOWEE_PS(TRADESKILL_NO_RECIPES, "No recipes.", "Нет рецептов.")
+WOWEE_PS(LIST_ALL_FILTERED, "The filter hides everything.", "Фильтр скрыл все.")
