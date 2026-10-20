@@ -1,7 +1,8 @@
 // PSP Wi-Fi bring-up: loads the network modules, connects to a saved
 // network profile (Settings > Network Settings on the XMB) without a system
 // dialog, and is polled once per frame so the UI keeps drawing while the
-// access point is joined.
+// access point is joined. PSP: the login uses the system connection dialog
+// instead (psp_netconf.hpp) unless wowee.cfg netdialog=0 or a run is automated.
 //
 // The usual pattern (pspdev 15.2): sceUtilityLoadModule (not the deprecated
 // LoadNetModule), an apctl
@@ -31,6 +32,16 @@ bool netStart(int profile, const char* ssid = nullptr);
 // Advances the connection state machine. Cheap; call every frame.
 void netPoll();
 void netStop();
+
+// PSP: for the system connection dialog (psp_netconf.hpp). netPrepare() checks
+// the WLAN switch, loads the modules, brings sceNet / sceNetInet / sceNetApctl
+// up and drops a half-made connection; false = state NoSwitch or Failed.
+bool netPrepare();
+// The access point is joined and has an IP (apctl GOT_IP), whoever connected it.
+bool netApConnected();
+// Takes over a connection made outside netStart() (the dialog): state
+// Connected, SSID and IP read back from apctl. `via` goes to the log.
+void netAdoptConnection(const char* via);
 
 NetState netState();
 // Short English status for the log ("joining", "got_ip", "err=80410D17").

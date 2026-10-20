@@ -1,6 +1,7 @@
 #include "platform/psp/psp_osk.hpp"
 
 #include "platform/psp/psp_log.hpp"
+#include "platform/psp/psp_netconf.hpp"
 
 #include <psputility.h>
 #include <psputility_osk.h>
@@ -71,7 +72,7 @@ std::string toUtf8(const uint16_t* s) {
 } // namespace
 
 bool oskBegin(const std::string& title, const std::string& initial, int maxChars, OskCharset charset) {
-    if (g_active) return false;
+    if (g_active || netconfActive()) return false;  // one system dialog at a time
     // Only start from NONE: a dialog left mid-shutdown answers 0x80110001 and
     // keeps doing so until the console reboots (seen on hardware).
     const int status = sceUtilityOskGetStatus();

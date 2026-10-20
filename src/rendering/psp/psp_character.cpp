@@ -107,6 +107,64 @@ void blitLayer(uint32_t* canvas, const uint8_t* blob, uint32_t size, bool base, 
     }
 }
 
+// PSP: the race / sex model blobs (n_R_S, c_R_S of characters.pak) shared by every model of that race and sex.
+// A blob is read-only after the load (SkinView / ModelHeader views, the GE draws from it), so one copy serves them
+// all: in a crowd every remote player read its own 0.7-1.3 MB copy and the heap ran out (pak_alloc_fail
+// n_R_S with ~25 players, 10-15). Main thread only (the world screen, the character screens). Refcounted; the
+// last release frees it.
+struct SharedBlob {
+    const pp::Pak* pak = nullptr;
+    char name[16] = {};
+    void* blob = nullptr;
+    uint32_t size = 0;
+    uint32_t refs = 0;
+};
+std::vector<SharedBlob> g_sharedBlobs;
+uint32_t g_sharedLogs = 0;
+
+// -> the blob (refs + 1) or nullptr; `fresh` = read now (the first holder).
+void* sharedAcquire(pp::Pak& pak, const pp::PakEntry* e, const char* name, bool& fresh) {
+    fresh = false;
+    for (SharedBlob& s : g_sharedBlobs)
+        if (s.pak == &pak && std::strcmp(s.name, name) == 0) {
+            ++s.refs;
+            return s.blob;
+        }
+    void* blob = pak.load(e);
+    if (!blob) return nullptr;
+    SharedBlob s;
+    s.pak = &pak;
+    std::snprintf(s.name, sizeof(s.name), "%s", name);
+    s.blob = blob;
+    s.size = e->size;
+    s.refs = 1;
+    g_sharedBlobs.push_back(s);
+    fresh = true;
+    if (++g_sharedLogs <= 40)
+        PSP_LOGI(pp::tag::Gfx, "char_blob_load name=%s kb=%u shared=%u", name, static_cast<unsigned>(e->size / 1024u),
+                 static_cast<unsigned>(g_sharedBlobs.size()));
+    return blob;
+}
+
+void sharedRelease(void* blob) {
+    if (!blob) return;
+    for (size_t i = 0; i < g_sharedBlobs.size(); ++i) {
+        if (g_sharedBlobs[i].blob != blob) continue;
+        if (--g_sharedBlobs[i].refs == 0) {
+            pp::pakFree(blob);
+            g_sharedBlobs.erase(g_sharedBlobs.begin() + static_cast<std::ptrdiff_t>(i));
+        }
+        return;
+    }
+    pp::pakFree(blob);  // not a shared one
+}
+
+const SharedBlob* sharedFind(const pp::Pak& pak, const char* name) {
+    for (const SharedBlob& s : g_sharedBlobs)
+        if (s.pak == &pak && std::strcmp(s.name, name) == 0) return &s;
+    return nullptr;
+}
+
 // GE fast-mode swizzle: blocks of 16 bytes x 8 rows.
 void swizzle(const uint8_t* in, uint8_t* out, int widthBytes, int height) {
     for (int by = 0; by < height / 8; ++by)
@@ -131,11 +189,36 @@ void unswizzle(const uint8_t* in, uint8_t* out, int widthBytes, int height) {
 
 CharacterModel::~CharacterModel() { clear(); }
 
+uint32_t CharacterModel::raceBlobBytes(pp::Pak& pak, const CharacterLook& look, bool animated) {
+    char name[32];
+    if (animated) {
+        std::snprintf(name, sizeof(name), "n_%u_%u", look.race, look.sex);
+        if (const pp::PakEntry* e = pak.find(name)) return e->size;
+    }
+    std::snprintf(name, sizeof(name), "c_%u_%u", look.race, look.sex);
+    const pp::PakEntry* e = pak.find(name);
+    return e ? e->size : 0u;
+}
+
+bool CharacterModel::raceBlobResident(const pp::Pak& pak, const CharacterLook& look, bool animated) {
+    char name[32];
+    std::snprintf(name, sizeof(name), "%s_%u_%u", animated ? "n" : "c", look.race, look.sex);
+    return sharedFind(pak, name) != nullptr;
+}
+
+uint32_t CharacterModel::sharedBlobCount() { return static_cast<uint32_t>(g_sharedBlobs.size()); }
+
+uint32_t CharacterModel::sharedBlobKb() {
+    uint32_t b = 0;
+    for (const SharedBlob& s : g_sharedBlobs) b += s.size;
+    return b / 1024u;
+}
+
 void CharacterModel::clear() {
     for (auto& t : textures_)
         if (t.block) pp::textureRelease(t);
     textures_.clear();
-    if (modelBlob_ && !view_) pp::pakFree(modelBlob_);  // a view's blob is its base model's
+    if (modelBlob_ && !view_) sharedRelease(modelBlob_);  // a view's blob is its base model's (no reference)
     modelBlob_ = nullptr;
     view_ = false;
     h_ = nullptr;
@@ -188,13 +271,14 @@ bool CharacterModel::load(pp::Pak& pak, const CharacterLook& look, bool animated
     if (animated) {
         std::snprintf(name, sizeof(name), "n_%u_%u", look.race, look.sex);
         const pp::PakEntry* ne = pak.find(name);
-        auto* nb = ne ? static_cast<uint8_t*>(pak.load(ne)) : nullptr;
+        bool fresh = false;
+        auto* nb = ne ? static_cast<uint8_t*>(sharedAcquire(pak, ne, name, fresh)) : nullptr;
         if (nb && skin_.init(nb, ne->size)) {
             skinned_ = true;
             modelBlob_ = nb;
             batches_ = skin_.batches;
             batchCount_ = skin_.h->batchCount;
-            memoryBytes_ += ne->size;
+            if (fresh) memoryBytes_ += ne->size;  // counted once, by the model that read it
             const uint32_t bones = skin_.h->boneCount;
             pose_.resize(bones);
             geBones_ = static_cast<ScePspFMatrix4*>(memalign(16, bones * sizeof(ScePspFMatrix4)));
@@ -207,8 +291,12 @@ bool CharacterModel::load(pp::Pak& pak, const CharacterLook& look, bool animated
             playAnimation(anim::STAND, true);
         } else if (nb) {
             PSP_LOGE(pp::tag::Gfx, "char_skin_bad name=%s size=%u", name, static_cast<unsigned>(ne->size));
-            pp::pakFree(nb);
+            sharedRelease(nb);
             skin_ = SkinView{};
+        } else if (ne) {
+            // PSP: no memory for the animated model - no static stand-in (a white, frozen body in a crowd); the
+            // caller tries again when there is room.
+            return false;
         }
     }
     const uint16_t* geo = nullptr;
@@ -217,7 +305,8 @@ bool CharacterModel::load(pp::Pak& pak, const CharacterLook& look, bool animated
     } else {
         std::snprintf(name, sizeof(name), "c_%u_%u", look.race, look.sex);
         const pp::PakEntry* e = pak.find(name);
-        auto* blob = e ? static_cast<uint8_t*>(pak.load(e)) : nullptr;
+        bool fresh = false;
+        auto* blob = e ? static_cast<uint8_t*>(sharedAcquire(pak, e, name, fresh)) : nullptr;
         if (!blob) return false;
         const auto* h = reinterpret_cast<const ModelHeader*>(blob);
         const uint32_t batches = h->batchCount[0];
@@ -227,7 +316,7 @@ bool CharacterModel::load(pp::Pak& pak, const CharacterLook& look, bool animated
             h->indexOffset + h->indexCount * 2u > e->size || h->batchOffset + batches * sizeof(ModelBatch) > e->size ||
             h->geosetOffset + batches * 2u > e->size) {
             PSP_LOGE(pp::tag::Gfx, "char_bad name=%s size=%u", name, static_cast<unsigned>(e->size));
-            pp::pakFree(blob);
+            sharedRelease(blob);
             return false;
         }
         modelBlob_ = blob;
@@ -237,7 +326,7 @@ bool CharacterModel::load(pp::Pak& pak, const CharacterLook& look, bool animated
         batches_ = reinterpret_cast<const ModelBatch*>(blob + h->batchOffset);
         batchCount_ = batches;
         geo = reinterpret_cast<const uint16_t*>(blob + h->geosetOffset);
-        memoryBytes_ += e->size;
+        if (fresh) memoryBytes_ += e->size;  // counted once, by the model that read it
     }
     look_ = look;
     geo_ = geo;

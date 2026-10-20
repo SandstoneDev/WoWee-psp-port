@@ -145,6 +145,9 @@ void WorldScreen::applySettings() {
     session_.setAutoLoot(s.autoloot != 0);  // AUTO_LOOT_DEFAULT_TEXT
     models_.viewDistance = static_cast<float>(s.m2view);
     remoteView_ = static_cast<float>(s.playerview);
+    remoteMax_ = static_cast<uint32_t>(s.playermax);
+    remoteCapMem_ = remoteMax_;
+    remoteCapNextMs_ = 0;  // ranked again now
     creatures_.viewDistance = static_cast<float>(s.npcview);
     creatures_.maxDrawn = static_cast<uint32_t>(s.npcmax);
     terrain_.sharpFloor = s.terrainsharp != 0;
@@ -156,6 +159,7 @@ void WorldScreen::applySettings() {
         PSP_LOGI(pp::tag::Gfx, "frame_cap fps=%d interval=%d", s.framecap, interval);
     }
     remotePredict_ = s.remotepredict != 0;
+    perfHud_ = s.perfhud != 0;
     afkSec_ = static_cast<float>(s.afksit);
     rendering::psp::CharacterModel::blendPercent = pp::configGetInt("animblend", 100);
     // the client's weapon placement (0 = upstream's), ranged on the back (option).
@@ -1110,8 +1114,71 @@ void WorldScreen::syncRemotePlayers() {
         for (auto it = remotes_.begin(); it != remotes_.end();)
             it = alive.count(it->first) ? std::next(it) : remotes_.erase(it);
     }
+    remoteCapTurn(nowMs);
     dressRemoteQueue(nowMs);
     remoteCrowdTurn(nowMs);
+}
+
+// PSP: playermax - every 500 ms the other players are ranked by distance (one that has its model counts 5 yd nearer:
+// no swapping at the edge) and the nearest remoteMax_ are in the cap. Out of it: not drawn, no new model; a model is
+// released 3 s after its player left the cap and is read again when it comes back. On a crowded server (~25 players
+// in a starting zone, 10-15) every model cost memory and GE time; the server cannot be asked to send fewer
+// (layers / shards are the server's).
+void WorldScreen::remoteCapTurn(uint32_t nowMs) {
+    if (static_cast<int32_t>(nowMs - remoteCapNextMs_) < 0) return;
+    remoteCapNextMs_ = nowMs + 500u;
+    // Memory (hardware, 35 players of 9 races / sexes in a starting zone: the race blobs alone ~8 MB, the heap full and
+    // the game ended): under 2 MB free the cap goes one lower a turn and the farthest model goes at once; from 6 MB
+    // free it comes back one a turn, up to playermax.
+    uint32_t models0 = 0;
+    for (const auto& [g, r] : remotes_) models0 += r.model ? 1u : 0u;
+    const uint32_t freeKb = pp::heapFreeKb();
+    const bool squeeze = freeKb < 2048u;
+    if (squeeze && remoteCapMem_ > 3u)
+        remoteCapMem_ = std::min<uint32_t>(remoteCapMem_ - 1u, std::max<uint32_t>(3u, models0 > 0u ? models0 - 1u : 3u));
+    else if (freeKb >= 6144u && remoteCapMem_ < remoteMax_) ++remoteCapMem_;
+    if (remoteCapMem_ > remoteMax_) remoteCapMem_ = remoteMax_;
+    remoteCapRank_.clear();
+    for (auto& [guid, r] : remotes_) {
+        r.dist = remoteDistance(guid, r);
+        // a model held counts 5 yd nearer (no swapping at the edge), a race whose model is resident 8 yd (fewer
+        // race models in memory)
+        const bool resident = rendering::psp::CharacterModel::raceBlobResident(charPak_, r.wantLook, true);
+        remoteCapRank_.emplace_back(r.dist - (r.model ? 5.0f : 0.0f) - (resident ? 8.0f : 0.0f), guid);
+    }
+    std::sort(remoteCapRank_.begin(), remoteCapRank_.end());
+    uint32_t in = 0, out = 0, models = 0;
+    for (size_t i = 0; i < remoteCapRank_.size(); ++i) {
+        RemotePlayer& r = remotes_[remoteCapRank_[i].second];
+        const bool inCap = i < remoteCapMem_;
+        if (r.inCap && !inCap) r.outSinceMs = nowMs;
+        r.inCap = inCap;
+        in += inCap ? 1u : 0u;
+        out += inCap ? 0u : 1u;
+        if (!inCap && r.model && (squeeze || nowMs - r.outSinceMs >= 3000u)) {
+            r.model.reset();
+            r.mountReady = false;  // the mount comes back with the rider
+            r.anim = ~0u;
+            r.attachWanted = false;
+            r.dressWanted = true;  // dressed again (r.wantLook / r.wantEquip) when it is back in the cap
+            r.equip = rendering::psp::Equipment{};
+            ++remoteCapUnloads_;
+        }
+        models += r.model ? 1u : 0u;
+    }
+    if (nowMs - remoteCapLogMs_ >= 10000u && !remotes_.empty()) {
+        remoteCapLogMs_ = nowMs;
+        // two lines: the log cuts a line past ~160 characters
+        PSP_LOGI(pp::tag::Gfx, "remote_cap max=%u mem_cap=%u players=%u in=%u models=%u free_kb=%u",
+                 static_cast<unsigned>(remoteMax_), static_cast<unsigned>(remoteCapMem_),
+                 static_cast<unsigned>(remotes_.size()), static_cast<unsigned>(in), static_cast<unsigned>(models),
+                 static_cast<unsigned>(freeKb));
+        PSP_LOGI(pp::tag::Gfx, "remote_cap2 out=%u unloads=%u mem_waits=%u races=%u races_kb=%u",
+                 static_cast<unsigned>(out), static_cast<unsigned>(remoteCapUnloads_),
+                 static_cast<unsigned>(remoteMemWaits_),
+                 static_cast<unsigned>(rendering::psp::CharacterModel::sharedBlobCount()),
+                 static_cast<unsigned>(rendering::psp::CharacterModel::sharedBlobKb()));
+    }
 }
 
 // yd from the player - the drawn position once it has one, else the entity's.
@@ -1148,10 +1215,23 @@ void WorldScreen::dressRemoteQueue(uint32_t nowMs) {
         RemotePlayer& r = it->second;
         const uint64_t j0 = sceKernelGetSystemTimeWide();
         const char* kind = nullptr;
+        bool again = false;  // the model could not be read now (memory): the dress stays wanted
         if (r.dressWanted) {
             const bool newModel = !r.model || std::memcmp(&r.look, &r.wantLook, sizeof(r.look)) != 0;
             if (newModel) {
+                if (!r.inCap) continue;   // playermax: not among the nearest - waits (dressWanted stays)
                 if (loads > 0) continue;  // one model a frame
+                // Memory: a race model not resident yet needs its blob + 4 MB left after it, any model 1.5 MB free
+                // (its textures and bones); else it waits (not drawn) - no static white stand-in.
+                {
+                    namespace rp = rendering::psp;
+                    const bool resident = rp::CharacterModel::raceBlobResident(charPak_, r.wantLook, true);
+                    const uint32_t blob = resident ? 0u : rp::CharacterModel::raceBlobBytes(charPak_, r.wantLook, true);
+                    if (resident ? pp::heapFreeKb() < 1536u : !pp::heapRoomFor(blob, 4096u)) {
+                        ++remoteMemWaits_;
+                        continue;
+                    }
+                }
                 if (!charPak_.isOpen()) {
                     r.dressWanted = false;
                     continue;
@@ -1168,7 +1248,9 @@ void WorldScreen::dressRemoteQueue(uint32_t nowMs) {
                     if (!r.model->load(charPak_, r.look, true, &r.equip, &items_)) r.model.reset();
                 }
                 if (r.model) r.model->setEmotePak(&charPak_);
-                r.modelFailed = !r.model;
+                // not tried again only when characters.pak has no model for this race / sex (no memory: next time)
+                r.modelFailed = !r.model && rendering::psp::CharacterModel::raceBlobBytes(charPak_, r.look, true) == 0;
+                again = !r.model && !r.modelFailed;  // no memory: dressed again when there is room
                 r.attachWanted = r.model != nullptr;
                 kind = "player";
                 if (++dressLogs_ <= 200)
@@ -1189,7 +1271,7 @@ void WorldScreen::dressRemoteQueue(uint32_t nowMs) {
                              static_cast<unsigned>((sceKernelGetSystemTimeWide() - j0) / 1000u),
                              static_cast<double>(dist), static_cast<unsigned>(r.model->attachmentsCapped()));
             }
-            r.dressWanted = false;
+            r.dressWanted = again;
         } else if (r.attachWanted) {
             r.attachWanted = false;
             if (!r.model) continue;
@@ -1520,6 +1602,7 @@ void WorldScreen::drawRemotePlayers(const rendering::psp::TerrainCamera& cam) {
         if (!r.model || !session_.entities().getEntity(guid)) continue;
         const glm::vec3 d = r.pos - cam.pos;
         if (glm::dot(d, d) > remoteView_ * remoteView_) continue;  // was 120 yd, now wowee.cfg playerview
+        if (!r.inCap) continue;  // playermax: only the nearest N are drawn
         r.visible = true;
         if (classBarRemoteHidden(guid)) continue;  // drawn as its form's creature (appendClassBarUnits)
         // Mounts - upstream: the rider at the mount's position + riderHeight.

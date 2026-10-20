@@ -186,7 +186,7 @@ void WorldSession::update() {
     // (game_handler.hpp kPingInterval); the server answers SMSG_PONG.
     if (state_ == State::InWorld && nowUs() - lastPingUs_ > 30ull * 1000 * 1000) {
         lastPingUs_ = nowUs();
-        socket_->send(game::PingPacket::build(++pingSeq_, 50));
+        socket_->send(game::PingPacket::build(++pingSeq_, pingLatencyMs()));
     }
     if (waiting && nowUs() - stateSinceUs_ > kStepTimeoutUs) fail(OWN_FMT(SESSION_TIMEOUT, stateName()));
     if (state_ == State::InWorld) chatUpdate();  // chat
@@ -730,7 +730,7 @@ void WorldSession::onPacket(const network::Packet& packetIn) {
             // As GameHandler::handleLoginVerifyWorld: we are the active mover.
             socket_->send(game::SetActiveMoverPacket::build(playerGuid_));
             lastPingUs_ = nowUs();
-            socket_->send(game::PingPacket::build(++pingSeq_, 50));
+            socket_->send(game::PingPacket::build(++pingSeq_, pingLatencyMs()));
             setState(State::InWorld);
             break;
         }
@@ -745,6 +745,19 @@ void WorldSession::onPacket(const network::Packet& packetIn) {
             resp.writeUInt32(static_cast<uint32_t>(nowUs() / 1000u));
             socket_->send(resp);
             if (++timeSyncs_ <= 2) PSP_LOGI(tag::Net, "time_sync counter=%u", static_cast<unsigned>(counter));
+            break;
+        }
+        case LogicalOpcode::SMSG_PONG: {
+            // Upstream GameHandler::handlePong: the answer to the last CMSG_PING (lastPingUs_ = when it went) gives
+            // the round trip; a stale sequence is ignored. PSP: kept for the perf line (perfhud) and sent back as
+            // the next ping's latency (upstream lastLatency; was a fixed 50).
+            game::PongData pong{};
+            if (!game::PongParser::parse(packet, pong) || pong.sequence != pingSeq_) break;
+            latencyMs_ = static_cast<uint32_t>((nowUs() - lastPingUs_) / 1000u);
+            if (latencyMs_ == 0) latencyMs_ = 1;
+            if (++pongLogs_ <= 20)
+                PSP_LOGI(tag::Net, "pong seq=%u ms=%u", static_cast<unsigned>(pong.sequence),
+                         static_cast<unsigned>(latencyMs_));
             break;
         }
         // --- M10a: objects around the player -----------------------------

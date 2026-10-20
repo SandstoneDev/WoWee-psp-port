@@ -135,6 +135,9 @@ public:
     bool isWalking(uint64_t guid) const { return walking_.count(guid) != 0; }
     // SMSG_INIT_WORLD_STATES zone id (upstream GameHandler::getWorldStateZoneId).
     uint32_t worldStateZoneId() const { return worldStateZone_; }
+    // PSP: the last CMSG_PING -> SMSG_PONG round trip, ms (0 = no answer yet). A ping goes every 30 s in the world
+    // (the original's pace; AzerothCore kicks a client that pings faster), so the number is up to 30 s old.
+    uint32_t latencyMs() const { return latencyMs_; }
     // Our own player's update fields (the own object is not an entity here).
     // (the same store as the combat code's selfField - after the
     // batch 2 merge combatUpdateBlock took the own block first and the emote
@@ -210,6 +213,9 @@ private:
     uint64_t playerGuid_ = 0;
     uint64_t lastPingUs_ = 0;
     uint32_t pingSeq_ = 0;
+    uint32_t latencyMs_ = 0;  // SMSG_PONG
+    uint32_t pongLogs_ = 0;
+    uint32_t pingLatencyMs() const { return latencyMs_ ? latencyMs_ : 50u; }  // CMSG_PING's latency field
     uint32_t timeSyncs_ = 0;
 
     game::EntityManager entities_;

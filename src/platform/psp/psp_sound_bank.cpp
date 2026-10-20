@@ -71,13 +71,8 @@ bool SoundBank::open(const char* absPath, uint32_t budget, uint32_t mapId) {
                        e->size >= fmt::kSurfaceGridBytes) {
                 int x = 0, y = 0;
                 if (std::sscanf(e->name + gp, "%d_%d", &x, &y) != 2) continue;
-                void* g = pak.load(e);
-                if (!g) continue;
-                if (std::memcmp(g, "WSRF", 4) == 0) {
-                    auto& dst = grids_[static_cast<uint32_t>(x * 100 + y)];
-                    dst.assign(static_cast<const uint8_t*>(g), static_cast<const uint8_t*>(g) + fmt::kSurfaceGridBytes);
-                }
-                pakFree(g);
+                // PSP: only where it is - read when a tile is first asked for (surfaceGrid)
+                gridOffsets_[static_cast<uint32_t>(x * 100 + y)] = e->offset;
             }
         }
         pak.close();  // card open-file limit: no descriptor kept (the loader reopens on demand)
@@ -87,7 +82,7 @@ bool SoundBank::open(const char* absPath, uint32_t budget, uint32_t mapId) {
     stats_.clips = static_cast<uint32_t>(clips_.size());
     PSP_LOGI(tag::Sys, "sounds_pak entries=%u kb=%u paks=%d table_kb=%u grids=%u ms=%u",
              static_cast<unsigned>(stats_.clips), static_cast<unsigned>(dataBytes / 1024u), paks_,
-             static_cast<unsigned>(entriesSize_ / 1024u), static_cast<unsigned>(grids_.size()),
+             static_cast<unsigned>(entriesSize_ / 1024u), static_cast<unsigned>(gridOffsets_.size()),
              static_cast<unsigned>((sceKernelGetSystemTimeWide() - t0) / 1000u));
     if (clips_.empty()) {
         close();
@@ -139,7 +134,8 @@ void SoundBank::close() {
     for (Clip& c : clips_)
         if (c.block) std::free(c.block);
     clips_.clear();
-    grids_.clear();
+    gridOffsets_.clear();
+    for (GridSlot& s : gridCache_) s = GridSlot{};
     if (entries_) pakFree(entries_);
     entries_ = nullptr;
     entriesSize_ = 0;
@@ -160,8 +156,44 @@ int SoundBank::find(uint32_t pathHash) const {
 }
 
 const uint8_t* SoundBank::surfaceGrid(int tileX, int tileY) const {
-    auto it = grids_.find(static_cast<uint32_t>(tileX * 100 + tileY));
-    return it == grids_.end() ? nullptr : it->second.data();
+    const uint32_t key = static_cast<uint32_t>(tileX * 100 + tileY);
+    const uint64_t t0 = sceKernelGetSystemTimeWide();
+    const uint32_t nowMs = static_cast<uint32_t>(t0 / 1000u);
+    ++gridTick_;
+    GridSlot* lru = &gridCache_[0];
+    GridSlot* use = nullptr;
+    for (GridSlot& s : gridCache_) {
+        if (s.key == key) {
+            s.lastUse = gridTick_;
+            if (s.ok) return s.data.data();
+            if (nowMs - s.failMs < 2000u) return nullptr;  // a failed read (no free descriptor?) again after 2 s
+            use = &s;
+            break;
+        }
+        if (s.lastUse < lru->lastUse) lru = &s;
+    }
+    auto it = gridOffsets_.find(key);
+    if (it == gridOffsets_.end()) return nullptr;  // no grid baked for this tile
+    // One open + seek + read of sounds.pak (the loader thread keeps its own descriptor).
+    GridSlot& s = use ? *use : *lru;
+    s.key = key;
+    s.lastUse = gridTick_;
+    s.ok = false;
+    s.failMs = nowMs;
+    s.data.resize(fmt::kSurfaceGridBytes);
+    const SceUID fd = sceIoOpen(paths_[0], PSP_O_RDONLY, 0);
+    if (fd >= 0) {
+        if (sceIoLseek32(fd, static_cast<int>(it->second), PSP_SEEK_SET) == static_cast<int>(it->second))
+            s.ok = sceIoRead(fd, s.data.data(), fmt::kSurfaceGridBytes) == static_cast<int>(fmt::kSurfaceGridBytes) &&
+                   std::memcmp(s.data.data(), "WSRF", 4) == 0;
+        sceIoClose(fd);
+    }
+    ++gridReads_;
+    if (++gridLogs_ <= 40)
+        PSP_LOGI(tag::Sys, "sound_grid tile=%d_%d ok=%d fd=%08X ms=%u reads=%u", tileX, tileY, s.ok ? 1 : 0,
+                 static_cast<unsigned>(fd), static_cast<unsigned>((sceKernelGetSystemTimeWide() - t0) / 1000u),
+                 static_cast<unsigned>(gridReads_));
+    return s.ok ? s.data.data() : nullptr;
 }
 
 bool SoundBank::request(int index) {

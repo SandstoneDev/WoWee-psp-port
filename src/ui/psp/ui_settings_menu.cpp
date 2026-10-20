@@ -54,6 +54,8 @@ const Row kRows[] = {
     {{"playerview", "", SettingKind::Int, 30, 200, 10, "Graphics", "", "", "", 120, ""},
      &GraphicsSettings::playerview, PS::SET_PLAYERVIEW, kOwnLabel, PS::SET_PLAYERVIEW_TIP, kNoText, PS::SET_UNIT_YD,
      kNoText},
+    {{"playermax", "", SettingKind::Int, 5, 50, 5, "Graphics", "", "", "", 10, ""},
+     &GraphicsSettings::playermax, PS::SET_PLAYERMAX, kOwnLabel, PS::SET_PLAYERMAX_TIP, kNoText, kNoText, kNoText},
     {{"npcview", "", SettingKind::Int, 20, 150, 10, "Graphics", "", "", "", 70, ""},
      &GraphicsSettings::npcview, PS::SET_NPCVIEW, kOwnLabel, PS::SET_NPCVIEW_TIP, kNoText, PS::SET_UNIT_YD, kNoText},
     {{"npcmax", "", SettingKind::Int, 0, 64, 4, "Graphics", "", "", "", 24, ""},
@@ -71,6 +73,8 @@ const Row kRows[] = {
      kNoText},
     {{"remotepredict", "", SettingKind::Bool, 0, 1, 1, "Graphics", "Network", "", "", 1, ""},
      &GraphicsSettings::remotepredict, PS::SET_PREDICT, kOwnLabel, PS::SET_PREDICT_TIP, kNoText, kNoText, kNoText},
+    {{"perfhud", "", SettingKind::Bool, 0, 1, 1, "Graphics", "", "", "", 0, ""},
+     &GraphicsSettings::perfhud, PS::SET_PERFHUD, kOwnLabel, PS::SET_PERFHUD_TIP, kNoText, kNoText, kNoText},
     {{"afksit", "", SettingKind::Int, 0, 600, 60, "Graphics", "Character", "", "", 300, ""},
      &GraphicsSettings::afksit, PS::SET_AFKSIT, kOwnLabel, PS::SET_AFKSIT_TIP, kNoText, PS::SET_UNIT_SEC,
      PS::PORT_OFF_LC},
@@ -167,10 +171,10 @@ void SettingsMenu::load() {
         values_.*(r.field) = clampToRow(r, pp::configGetInt(r.desc.key, static_cast<int>(r.desc.defaultValue)));
     const GraphicsSettings& s = values_;
     PSP_LOGI(pp::tag::Gfx,
-             "settings_load m2view=%d playerview=%d npcview=%d npcmax=%d sharp=%d sharpdist=%d detail=%d fps=%d "
-             "predict=%d afk=%d",
-             s.m2view, s.playerview, s.npcview, s.npcmax, s.terrainsharp, s.sharpdist, s.terraindetail, s.framecap,
-             s.remotepredict, s.afksit);
+             "settings_load m2view=%d playerview=%d playermax=%d npcview=%d npcmax=%d sharp=%d sharpdist=%d detail=%d fps=%d "
+             "predict=%d perfhud=%d afk=%d",
+             s.m2view, s.playerview, s.playermax, s.npcview, s.npcmax, s.terrainsharp, s.sharpdist, s.terraindetail, s.framecap,
+             s.remotepredict, s.perfhud, s.afksit);
 }
 
 void SettingsMenu::open(const GraphicsSettings& live) {

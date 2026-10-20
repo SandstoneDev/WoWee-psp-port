@@ -129,6 +129,7 @@ set(WOWEE_PSP_PLATFORM_SOURCES
     ${WOWEE_ROOT}/src/platform/psp/psp_world_session_move.cpp  # Creature anim (SMSG_MONSTER_MOVE)
     ${WOWEE_ROOT}/src/platform/psp/psp_world_session_mount.cpp  # Mounts (mount field, speed changes)
     ${WOWEE_ROOT}/src/platform/psp/psp_osk.cpp
+    ${WOWEE_ROOT}/src/platform/psp/psp_netconf.cpp
     ${WOWEE_ROOT}/src/platform/psp/psp_login_store.cpp  # PSP (owner 14.10): the saved login outside the game folder
     ${WOWEE_ROOT}/src/platform/psp/psp_world_session_chat.cpp  # Chat
     ${WOWEE_ROOT}/src/platform/psp/psp_world_session_loot.cpp  # Loot

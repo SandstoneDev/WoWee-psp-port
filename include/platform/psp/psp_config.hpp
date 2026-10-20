@@ -1,6 +1,7 @@
 // wowee.cfg next to the EBOOT: plain "key=value" lines, '#' comments.
 // Settings the owner (or the deploy script) sets on the card without a
-// rebuild. Keys used today: server, port, account, password, netprofile.
+// rebuild. Keys used today: server, port, account, password, netprofile, netssid,
+// netdialog (1 = the system connection dialog at login, 0 = the saved profile).
 // The graphics settings menu writes its keys back (configSet + configSave).
 //
 // The password line is plain text on the memory stick: the first login that succeeds moves the account into

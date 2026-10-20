@@ -10,6 +10,7 @@
 #include "platform/psp/psp_login_store.hpp"  // PSP: the saved login outside the game folder
 #include "platform/psp/psp_osk.hpp"
 #include "platform/psp/psp_net.hpp"
+#include "platform/psp/psp_netconf.hpp"  // PSP: the system connection dialog
 #include "platform/psp/psp_pak.hpp"  // pakSetReadTick
 #include "platform/psp/psp_public_safe.hpp"  // PSP: the logon address decides the debug aids
 #include "platform/psp/psp_system.hpp"  // logMemory
@@ -142,6 +143,26 @@ void LoginScreen::start() {
         enterStage(Stage::ConnectPending);
         return;
     }
+    // PSP: already on an access point (apctl GOT_IP) - no dialog, no new connection.
+    if (pp::netApConnected()) {
+        pp::netAdoptConnection("apctl");
+        enterStage(Stage::ConnectPending);
+        return;
+    }
+    // PSP: the firmware's connection dialog lets the player pick the network (wowee.cfg netdialog=1, the
+    // default); the saved-profile connection below is netdialog=0 and the automated runs.
+    if (settings_.netDialog) {
+        if (!pp::netPrepare()) {
+            fail(pp::netState() == pp::NetState::NoSwitch ? OWN_STR(WIFI_SWITCH_OFF)
+                                                          : std::string("Wi-Fi: ") + pp::netStatus());
+            return;
+        }
+        if (pp::netconfBegin()) {
+            enterStage(Stage::NetDialog);
+            return;
+        }
+        PSP_LOGW(pp::tag::Net, "netconf_fallback profile=%d ssid=%s", settings_.netProfile, settings_.netSsid.c_str());
+    }
     enterStage(Stage::Wifi);
     if (!pp::netStart(settings_.netProfile, settings_.netSsid.c_str())) {
         switch (pp::netState()) {
@@ -169,6 +190,7 @@ std::string LoginScreen::wifiFailureText() const {
 const char* LoginScreen::stageText() const {
     switch (stage_) {
         case Stage::Idle: return "idle";
+        case Stage::NetDialog: return "netconf";
         case Stage::Wifi: return "wifi";
         case Stage::ConnectPending:
         case Stage::Connecting: return "connecting";
@@ -569,6 +591,26 @@ void LoginScreen::update(const pp::PadState& pad, float dtSec) {
         bool accepted = false;
         std::string typed;
         if (pp::oskFinished(accepted, typed)) fieldTyped(field, accepted, typed);
+        return;
+    }
+    // PSP: the system connection dialog owns the pad while it is open.
+    if (stage_ == Stage::NetDialog) {
+        int result = 0;
+        if (pp::netconfActive() || !pp::netconfFinished(result)) return;
+        const bool connected = pp::netApConnected();
+        PSP_LOGI(pp::tag::Net, "netconf_done result=%d connected=%d", result, connected ? 1 : 0);
+        if (connected) {
+            pp::netAdoptConnection("netconf");
+            PSP_LOGI(pp::tag::Net, "netconf_connected ip=%s ssid=%s", pp::netIp(), pp::netSsid());
+            enterStage(Stage::ConnectPending);
+        } else if (result == 1 || result == 2) {  // the player backed out (cancelled / aborted)
+            fail(OWN_STR(WIFI_NOT_CHOSEN));
+        } else {
+            char code[16];
+            std::snprintf(code, sizeof(code), "%d", result);
+            if (result < 0) std::snprintf(code, sizeof(code), "%08X", static_cast<unsigned>(result));
+            fail(OWN_FMT(WIFI_DIALOG_FAILED, std::string(code)));
+        }
         return;
     }
     // On the realm list UP / DOWN walk the rows (consumed here, before the focus ring).
@@ -1027,8 +1069,8 @@ void LoginScreen::drawLogin(UiRenderer& ui, const FrameStats& stats, FocusRing& 
     // (BOTTOMLEFT). PSP: the boxes take the system keyboard; the password shows as stars (8 for a
     // saved login).
     // PSP: no glueLogo - the background art (bg_login) carries the logo already.
-    const bool busy = stage_ == Stage::Wifi || stage_ == Stage::ConnectPending || stage_ == Stage::Connecting ||
-                      stage_ == Stage::Auth;
+    const bool busy = stage_ == Stage::NetDialog || stage_ == Stage::Wifi || stage_ == Stage::ConnectPending ||
+                      stage_ == Stage::Connecting || stage_ == Stage::Auth;
     const float cx = pp::kScreenW * 0.5f;
     auto box = [&](float y, const char* label, const std::string& text, uint32_t id) {
         ui.textShadow(fn, cx, y, label, kGlueGold, Align::Center);
@@ -1092,9 +1134,9 @@ void LoginScreen::draw(UiRenderer& ui, const FrameStats& stats) {
     ui.beginFrame();
     kit_.background(ui, false);
     art_.load();
-    if (pp::oskActive()) {
-        // PSP: the system keyboard draws over this frame - a plain dimmed backdrop under it (as the
-        // character screen does), not the login boxes.
+    if (pp::oskActive() || stage_ == Stage::NetDialog) {
+        // PSP: the system keyboard / connection dialog draws over this frame - a plain dimmed backdrop under
+        // it (as the character screen does), not the login boxes.
         ui.fill(Rect{0, 0, static_cast<float>(pp::kScreenW), static_cast<float>(pp::kScreenH)}, 0x80000000u);
         ui.endFrame();
         return;

@@ -36,6 +36,7 @@ struct FrameStats;
 struct GraphicsSettings {
     int m2view = 160;        // doodads/buildings view distance, yd (ModelRenderer::viewDistance)
     int playerview = 120;    // other players, yd
+    int playermax = 10;      // other players drawn with models: the nearest N (PSP, the crowd's memory and GE)
     int npcview = 70;        // creatures, yd (CreatureRenderer::viewDistance)
     int npcmax = 24;         // nearest creatures drawn
     int terrainsharp = 0;    // floor mips: 0 AUTO, 1 by distance (sharp)
@@ -43,6 +44,7 @@ struct GraphicsSettings {
     int terraindetail = 1;   // near detail pass
     int framecap = 60;       // 30 or 60 fps
     int remotepredict = 1;   // other players predicted from the last packet (PSP)
+    int perfhud = 0;         // fps and ping on screen, left of the minimap (PSP)
     int afksit = 300;        // s without input -> sit (0 = off)
     int targetall = 0;       // D-pad right cycles 0 = hostile units only (upstream Tab), 1 = every unit
     int autoloot = 0;        // AUTO_LOOT_DEFAULT_TEXT - loot without the window

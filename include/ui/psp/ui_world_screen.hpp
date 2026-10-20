@@ -119,7 +119,16 @@ private:
         float dist = 0.0f;               // yd from the player (the scan, then the drawn position)
         bool modelFailed = false;        // characters.pak has no model for wantLook: not tried again for it
         bool flySwim = false;            // flying: playing the swim set (swimming / flying)
+        bool inCap = true;               // playermax: among the nearest drawn (remoteCapTurn)
+        uint32_t outSinceMs = 0;         // left the nearest N then (its model goes 3 s later)
     };
+    // playermax (settings "Players drawn"): only the nearest N other players are drawn and keep a model.
+    void remoteCapTurn(uint32_t nowMs);
+    uint32_t remoteMax_ = 10;
+    uint32_t remoteCapMem_ = 10;  // the cap the heap allows now (<= remoteMax_): down under pressure, back up with room
+    uint32_t remoteMemWaits_ = 0;  // models not read for want of memory (the remote_cap log)
+    uint32_t remoteCapNextMs_ = 0, remoteCapLogMs_ = 0, remoteCapUnloads_ = 0;
+    std::vector<std::pair<float, uint64_t>> remoteCapRank_;
     // other players' equipment: the dress queue and attachcap's crowd turn (ui_world_screen.cpp).
     void dressRemoteQueue(uint32_t nowMs);
     void remoteCrowdTurn(uint32_t nowMs);
@@ -206,6 +215,7 @@ private:
     float animStrafe_ = 0.0f;  // <0 left, >0 right (R held, no forward/back)
     uint32_t animLogs_ = 0;
     bool remotePredict_ = true;
+    bool perfHud_ = false;  // settings "FPS and ping" (perfhud)
     // Sitting (upstream CameraController X key -> CMSG_STANDSTATECHANGE) and
     // the owner's AFK sit: no input for afkSec_ (wowee.cfg afksit, 0 = off).
     bool sitting_ = false;
@@ -827,6 +837,7 @@ private:
     void drawHudLayers(UiRenderer& ui, const FrameStats& stats);  // one fixed HUD/window order (until task A)
     void drawPlayerPlates(UiRenderer& ui);
     void drawHudLines(UiRenderer& ui, const FrameStats& stats);
+    void drawPerfHud(UiRenderer& ui, const FrameStats& stats);  // perfhud: fps + ping left of the minimap
     uint32_t reactionColor(uint64_t guid) const;
     // PSP (owner: "you cannot tell whom you selected"): the client's
     // selection circle on the ground under the target, in its reaction colour.

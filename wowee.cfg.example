@@ -1,15 +1,24 @@
 # WoWee PSP settings - copy to wowee.cfg next to EBOOT.PBP. key=value, '#' starts a comment.
 # The account and password are typed on the login screen (saved outside the game folder after the first login).
+# The settings menu in the game (START > Video) writes its own keys here; see the README's wowee.cfg reference.
 
-# realm list server (IP address or host name) and port
-server=127.0.0.1
+# realm list server (IP address or host name) and port - the address the server's website gives as its realmlist
+server=logon.therawow.com
 port=3724
 
-# Wi-Fi profile number of the PSP's network settings; 0 = pick one automatically
+# Wi-Fi: 1 = the PSP's network dialog at login (pick the network); 0 = connect to a saved network by itself
+netdialog=1
+# with netdialog=0: the number of the PSP's saved network; 0 = pick one automatically
 netprofile=0
 
 # frame limit: 60 or 30
 framecap=60
+
+# 1 = frames per second and the server ping next to the minimap
+perfhud=0
+
+# other players drawn with models: the nearest N (5-50); lower is smoother in crowded places
+playermax=10
 
 # private development servers that unlock the debug aids (public addresses are always ignored)
 #devhosts=127.0.0.1,localhost

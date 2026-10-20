@@ -1,5 +1,6 @@
 #include "platform/psp/psp_display.hpp"
 #include "platform/psp/psp_log.hpp"
+#include "platform/psp/psp_netconf.hpp"
 #include "platform/psp/psp_osk.hpp"
 #include "platform/psp/psp_prof.hpp"
 
@@ -158,6 +159,7 @@ void frameEnd(OverlayFn overlay, void* user) {
     prof::frameGeDone();
     // System dialogs draw here: after our list finished, before the swap.
     oskAfterGeSync();
+    netconfAfterGeSync();
     if (overlay) {
         pspDebugScreenSetBase(reinterpret_cast<u32*>(kVramUncached + reinterpret_cast<uintptr_t>(g_drawBuf)));
         overlay(user);

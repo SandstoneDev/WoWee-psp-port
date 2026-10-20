@@ -535,7 +535,7 @@ void WorldSession::handleNewWorld(network::Packet& packet) {
         transferSendArrival(glm::vec3(x, y, z), o);
         if (!resurrection) {  // upstream: "World transfer keepalive: sending immediate ping"
             lastPingUs_ = nowUs();
-            socket_->send(game::PingPacket::build(++pingSeq_, 50));
+            socket_->send(game::PingPacket::build(++pingSeq_, pingLatencyMs()));
         }
     }
     ++transfersDone_;

@@ -6,6 +6,8 @@ WOWEE_PS(WIFI_NOT_FOUND, "Wi-Fi: network %s not found nearby", "Wi-Fi: сеть 
 WOWEE_PS(WIFI_REJECTED, "Wi-Fi: %s refused the connection (password?)", "Wi-Fi: %s отклонила подключение (пароль?)")
 WOWEE_PS(WIFI_SIGNAL_LOST, "Wi-Fi: lost the signal of %s", "Wi-Fi: потерян сигнал %s")
 WOWEE_PS(WIFI_NO_IP, "Wi-Fi: %s gave no IP address (DHCP)", "Wi-Fi: %s не выдала IP (DHCP)")
+WOWEE_PS(WIFI_NOT_CHOSEN, "Wi-Fi: no connection was chosen", "Wi-Fi: подключение не выбрано")
+WOWEE_PS(WIFI_DIALOG_FAILED, "Wi-Fi: the connection was not made (code %s)", "Wi-Fi: подключение не установлено (код %s)")
 WOWEE_PS(AUTH_TIMEOUT, "Authentication timed out", "таймаут авторизации")
 WOWEE_PS(PSP_BUILD_LINE, "WoWee PSP, build %d", "WoWee PSP, сборка %d")
 WOWEE_PS(PSP_KEYBOARD_FAILED, "The keyboard did not open", "Клавиатура не открылась")

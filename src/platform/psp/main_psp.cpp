@@ -303,9 +303,22 @@ int main(int argc, char* argv[]) {
     login.netSsid = configGet("netssid");
     login.autoLogin = configGetInt("autologin", 0) != 0;
     login.autoOsk = configGetInt("autoosk", 0) != 0;
-    PSP_LOGI(tag::Fs, "config=%s server=%s port=%u account=%s netprofile=%d netssid=%s", cfgOk ? "ok" : "absent",
-             login.server.c_str(), static_cast<unsigned>(login.port), login.account.c_str(), login.netProfile,
-             login.netSsid.c_str());
+    // PSP: the login opens the system connection dialog (netdialog=1, the default); automated runs (the
+    // autopilot, autologin=1, an autopad script) have nobody to answer it - they keep the saved-profile
+    // connection (netprofile / netssid), the same rule as the splash.
+    login.netDialog = configGetInt("netdialog", 1) != 0;
+    {
+        const bool autotest = autotestActive();
+        const bool autopad = !configGet("autopad", "").empty();
+        if (login.netDialog && (autotest || login.autoLogin || autopad)) {
+            login.netDialog = false;
+            PSP_LOGI(tag::Net, "netconf skipped (automation) autotest=%d autologin=%d autopad=%d", autotest ? 1 : 0,
+                     login.autoLogin ? 1 : 0, autopad ? 1 : 0);
+        }
+    }
+    PSP_LOGI(tag::Fs, "config=%s server=%s port=%u account=%s netprofile=%d netssid=%s netdialog=%d",
+             cfgOk ? "ok" : "absent", login.server.c_str(), static_cast<unsigned>(login.port), login.account.c_str(),
+             login.netProfile, login.netSsid.c_str(), login.netDialog ? 1 : 0);
     // Frame limit for every screen (the world's settings menu changes it live).
     displaySetFrameInterval(configGetInt("framecap", 60) <= 30 ? 2 : 1);
     // Sound (M12): threads + channels once per session (psp_audio.hpp).

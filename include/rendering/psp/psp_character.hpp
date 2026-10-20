@@ -134,6 +134,14 @@ public:
     void setSheathState(uint8_t state);
     uint8_t sheathState() const { return sheathState_; }
     static bool sheathClient;
+    // PSP (crowds): the race / sex model blob of `look` - its size in `pak` (the animated "n_" when `animated` and
+    // the pak has it, else "c_"; 0 = none) and whether it is resident already (shared: a model of that look costs
+    // only its own state then).
+    static uint32_t raceBlobBytes(platform::psp::Pak& pak, const CharacterLook& look, bool animated);
+    static bool raceBlobResident(const platform::psp::Pak& pak, const CharacterLook& look, bool animated);
+    // How many race blobs are resident and their KB (the remote_cap log).
+    static uint32_t sharedBlobCount();
+    static uint32_t sharedBlobKb();
     static bool rangedOnBack;  // wowee.cfg rangedback (default 0 = the client: the ranged weapon only for a shot)
     // The weapons with a glow drawn this frame (psp_attachments.hpp WeaponGlow); returns how many (<= max).
     size_t weaponGlows(WeaponGlow* out, size_t max) const { return attach_.glows(out, max); }

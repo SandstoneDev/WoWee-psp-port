@@ -55,6 +55,8 @@ struct LoginSettings {
     std::string locale = "ruRU";
     int netProfile = 0;
     std::string netSsid;     // preferred saved Wi-Fi profile, by SSID
+    // PSP: the system connection dialog picks the network (wowee.cfg netdialog, default 1; off for automated runs).
+    bool netDialog = true;
     bool autoLogin = false;  // start on the first frame (emulator smoke tests)
     bool autoOsk = false;    // open the name keyboard on the character screen (smoke test)
 };
@@ -71,7 +73,7 @@ public:
     bool wantsExit() const { return wantsExit_; }
 
 private:
-    enum class Stage { Idle, Wifi, ConnectPending, Connecting, Auth, Realms, WorldPending, World, Failed };
+    enum class Stage { Idle, NetDialog, Wifi, ConnectPending, Connecting, Auth, Realms, WorldPending, World, Failed };
 
     void start();
     void fail(const std::string& reason);

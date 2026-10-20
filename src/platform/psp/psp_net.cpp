@@ -74,6 +74,18 @@ bool initLibs() {
     return true;
 }
 
+// a connection still under way (the login cancelled at the Wi-Fi stage) makes the next connect
+// fail with 80410A04 until it is dropped - drop it first, wait up to 1 s for "disconnected".
+void apctlReset() {
+    int st = 0;
+    if (sceNetApctlGetState(&st) == 0 && st != PSP_NET_APCTL_STATE_DISCONNECTED) {
+        PSP_LOGI(tag::Net, "apctl_reset state=%d", st);
+        sceNetApctlDisconnect();
+        for (int i = 0; i < 50 && sceNetApctlGetState(&st) == 0 && st != PSP_NET_APCTL_STATE_DISCONNECTED; ++i)
+            sceKernelDelayThread(20000);
+    }
+}
+
 // Logs every saved profile and picks one: the SSID match when asked for,
 // else the first valid profile. The first valid one is not necessarily the
 // network in range - a PSP-3000 run once picked an old "PLAYSTATION"
@@ -141,17 +153,7 @@ bool netStart(int profile, const char* ssid) {
     if (sceUtilityGetNetParam(g_profile, PSP_NETPARAM_SSID, &d) == 0) {
         std::snprintf(g_ssid, sizeof(g_ssid), "%.39s", d.asString);
     }
-    // a connection still under way (the login cancelled at the Wi-Fi stage) makes the next connect
-    // fail with 80410A04 until it is dropped - drop it first, wait up to 1 s for "disconnected".
-    {
-        int st = 0;
-        if (sceNetApctlGetState(&st) == 0 && st != PSP_NET_APCTL_STATE_DISCONNECTED) {
-            PSP_LOGI(tag::Net, "apctl_reset state=%d", st);
-            sceNetApctlDisconnect();
-            for (int i = 0; i < 50 && sceNetApctlGetState(&st) == 0 && st != PSP_NET_APCTL_STATE_DISCONNECTED; ++i)
-                sceKernelDelayThread(20000);
-        }
-    }
+    apctlReset();
     int r = sceNetApctlConnect(g_profile);
     PSP_LOGI(tag::Net, "apctl_connect profile=%d ssid=%s r=%08X", g_profile, g_ssid, static_cast<unsigned>(r));
     if (r < 0) {
@@ -197,6 +199,46 @@ void netPoll() {
         sceNetApctlDisconnect();
         g_state = NetState::Failed;
     }
+}
+
+bool netPrepare() {
+    g_lastApError = 0;
+    g_lastError = 0;
+    g_ssid[0] = g_ip[0] = '\0';
+    if (sceWlanGetSwitchState() == 0) {
+        g_state = NetState::NoSwitch;
+        setStatus("wlan_switch_off");
+        PSP_LOGW(tag::Net, "wlan_switch=off");
+        return false;
+    }
+    if (!loadModules() || !initLibs()) {
+        g_state = NetState::Failed;
+        setStatus("init_failed");
+        return false;
+    }
+    apctlReset();
+    g_state = NetState::Off;
+    setStatus("dialog");
+    return true;
+}
+
+bool netApConnected() {
+    if (!g_libsUp) return false;
+    int st = 0;
+    return sceNetApctlGetState(&st) == 0 && st == PSP_NET_APCTL_STATE_GOT_IP;
+}
+
+void netAdoptConnection(const char* via) {
+    union SceNetApctlInfo info;
+    g_ssid[0] = g_ip[0] = '\0';
+    if (sceNetApctlGetInfo(PSP_NET_APCTL_INFO_SSID, &info) == 0)  // ssid[32] need not end in a NUL
+        std::snprintf(g_ssid, sizeof(g_ssid), "%.32s", reinterpret_cast<const char*>(info.ssid));
+    if (sceNetApctlGetInfo(PSP_NET_APCTL_INFO_IP, &info) == 0) std::snprintf(g_ip, sizeof(g_ip), "%s", info.ip);
+    g_profile = 0;
+    g_lastError = 0;
+    g_state = NetState::Connected;
+    setStatus("got_ip");
+    PSP_LOGI(tag::Net, "connected ip=%s ssid=%s via=%s", g_ip, g_ssid, via ? via : "");
 }
 
 void netStop() {

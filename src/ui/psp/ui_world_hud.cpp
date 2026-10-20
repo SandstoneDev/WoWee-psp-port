@@ -90,6 +90,22 @@ void WorldScreen::drawPlayerPlates(UiRenderer& ui) {
     }
 }
 
+// PSP: the settings row "FPS and ping" (perfhud) - two short lines left of the minimap, under the
+// screen's top edge. Ping: the original's MainMenuBarPerformanceBar colours (PERFORMANCEBAR_LOW_LATENCY 300,
+// _MEDIUM_LATENCY 600: green / yellow / red); fps: green from 25, yellow from 15, red below.
+void WorldScreen::drawPerfHud(UiRenderer& ui, const FrameStats& stats) {
+    if (!perfHud_) return;
+    const Font& fs = kit_.font(kFontSmall);
+    constexpr float kRight = 372.0f;  // the minimap starts at x 376
+    const uint32_t fpsCol = stats.fps >= 25.0f ? kColGreen : stats.fps >= 15.0f ? kColGold : kColRed;
+    std::string line = OWN_FMT(HUD_PERF_FMT, static_cast<double>(stats.fps));
+    ui.textShadow(fs, kRight, 4, line.c_str(), fpsCol, Align::Right);
+    const uint32_t ms = session_.latencyMs();
+    const uint32_t pingCol = ms == 0 ? kColGrey : ms < 300u ? kColGreen : ms < 600u ? kColGold : kColRed;
+    line = ms ? OWN_FMT(HUD_PING_FMT, static_cast<unsigned>(ms)) : std::string(OWN_STR(HUD_PING_NONE));
+    ui.textShadow(fs, kRight, 16, line.c_str(), pingCol, Align::Right);
+}
+
 // The debug numbers (wowee.cfg hudlines=0 hides them), the refused-attack
 // line (upstream UIErrorsFrame), AFK and the load status - under the frames.
 void WorldScreen::drawHudLines(UiRenderer& ui, const FrameStats& stats) {
@@ -181,6 +197,7 @@ void WorldScreen::drawHudLayers(UiRenderer& ui, const FrameStats& stats) {
         PROF_GE_PASS("ui.windows");
         ui.beginFrame();
         drawHudLines(ui, stats);
+        if (hud) drawPerfHud(ui, stats);  // perfhud: fps + ping
         if (hud) drawTutorialAlert(ui);  // tutorials (alert button, under the windows)
         drawWindows(ui);  // stack (Debug on top), bar, cursor
         ui.endFrame();

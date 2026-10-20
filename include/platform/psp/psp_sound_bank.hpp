@@ -72,9 +72,11 @@ public:
         size = entriesSize_;
         return entries_;
     }
-    // Grid of ADT tile x_y (kSurfaceGridBytes, psp_sound_format.hpp) or nullptr.
+    // Grid of ADT tile x_y (kSurfaceGridBytes, psp_sound_format.hpp) or nullptr. PSP: read from sounds.pak when
+    // first asked (one ~9 KB read on a tile change) into a cache of kGridCache tiles - a full client's bake has a grid
+    // for every tile of the map (687 for one continent = 6.3 MB), and all of them in RAM ran the heap out at world entry.
     const uint8_t* surfaceGrid(int tileX, int tileY) const;
-    uint32_t gridCount() const { return static_cast<uint32_t>(grids_.size()); }
+    uint32_t gridCount() const { return static_cast<uint32_t>(gridOffsets_.size()); }
 
     uint32_t budgetKb = 1024;
     uint32_t lateMs = 250;
@@ -104,7 +106,17 @@ private:
     char paths_[kMaxPaks][128] = {};
     int paks_ = 0;
     std::vector<Clip> clips_;            // sorted by hash
-    std::unordered_map<uint32_t, std::vector<uint8_t>> grids_;  // tileX * 100 + tileY
+    std::unordered_map<uint32_t, uint32_t> gridOffsets_;  // tileX * 100 + tileY -> offset in sounds.pak
+    static constexpr int kGridCache = 6;  // the player's tile and its neighbours (a corner touches 4)
+    struct GridSlot {
+        uint32_t key = ~0u;
+        uint32_t lastUse = 0;
+        bool ok = false;      // false: the read failed
+        uint32_t failMs = 0;  // when it was tried (retried 2 s later)
+        std::vector<uint8_t> data;
+    };
+    mutable GridSlot gridCache_[kGridCache];
+    mutable uint32_t gridTick_ = 0, gridReads_ = 0, gridLogs_ = 0;
     void* entries_ = nullptr;
     uint32_t entriesSize_ = 0;
     uint32_t residentBytes_ = 0;
