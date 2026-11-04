@@ -7,6 +7,7 @@
 #include <psputility_osk.h>
 #include <psputility_sysparam.h>
 #include <pspsysmem.h>
+#include <pspkernel.h>
 
 #include <cstring>
 
@@ -30,6 +31,8 @@ bool g_shutdownSent = false;
 bool g_finished = false;
 bool g_accepted = false;
 std::string g_result;
+uint64_t g_startedUs=0;
+int g_lastStatus=-1;
 int g_owner = 0;  // 0 = the plain oskBegin / oskFinished
 
 // UTF-8 -> UTF-16 (BMP only, which covers Latin and Cyrillic).
@@ -103,19 +106,11 @@ bool oskBegin(const std::string& title, const std::string& initial, int maxChars
             g_data.inputtype = PSP_UTILITY_OSK_INPUTTYPE_LATIN_DIGIT;
             break;
         case OskCharset::Text:
-            // chat - a chat line needs '/', digits and punctuation
-            // too (Utility Overview p.40-41: SELECT cycles the input types).
-            g_data.language = PSP_UTILITY_OSK_LANGUAGE_RUSSIAN;
-            g_data.inputtype = PSP_UTILITY_OSK_INPUTTYPE_RUSSIAN_LOWERCASE | PSP_UTILITY_OSK_INPUTTYPE_RUSSIAN_UPPERCASE |
-                               PSP_UTILITY_OSK_INPUTTYPE_LATIN_LOWERCASE | PSP_UTILITY_OSK_INPUTTYPE_LATIN_UPPERCASE |
-                               PSP_UTILITY_OSK_INPUTTYPE_LATIN_DIGIT | PSP_UTILITY_OSK_INPUTTYPE_LATIN_SYMBOL;
-            break;
         default:
-            // Russian keyboard with Latin available on SELECT (Sony Utility
-            // Overview p.40-41); letters only, the way the game's character names are.
-            g_data.language = PSP_UTILITY_OSK_LANGUAGE_RUSSIAN;
-            g_data.inputtype = PSP_UTILITY_OSK_INPUTTYPE_RUSSIAN_LOWERCASE | PSP_UTILITY_OSK_INPUTTYPE_RUSSIAN_UPPERCASE |
-                               PSP_UTILITY_OSK_INPUTTYPE_LATIN_LOWERCASE | PSP_UTILITY_OSK_INPUTTYPE_LATIN_UPPERCASE;
+            // Let the firmware select its system-language keyboard and valid input types.
+            // Restricting this to Russian/Latin also prevented Japanese/Korean input.
+            g_data.language = PSP_UTILITY_OSK_LANGUAGE_DEFAULT;
+            g_data.inputtype = PSP_UTILITY_OSK_INPUTTYPE_ALL;
             break;
     }
     g_data.lines = 1;
@@ -128,6 +123,7 @@ bool oskBegin(const std::string& title, const std::string& initial, int maxChars
 
     std::memset(&g_params, 0, sizeof(g_params));
     g_params.base.size = sizeof(g_params);
+    g_params.base.language = PSP_SYSTEMPARAM_LANGUAGE_ENGLISH; // fallback if firmware query fails
     sceUtilityGetSystemParamInt(PSP_SYSTEMPARAM_ID_INT_LANGUAGE, &g_params.base.language);
     sceUtilityGetSystemParamInt(PSP_SYSTEMPARAM_ID_INT_BUTTON_SWAP, &g_params.base.buttonSwap);
     // Dialog threads (pspsdk sample values), all below our main thread (0x20).
@@ -142,6 +138,8 @@ bool oskBegin(const std::string& title, const std::string& initial, int maxChars
     // short memory shows up only as a dialog stuck in INIT. Record the headroom.
     const unsigned freeKb = static_cast<unsigned>(sceKernelTotalFreeMemSize() / 1024);
     const unsigned blockKb = static_cast<unsigned>(sceKernelMaxFreeMemSize() / 1024);
+    PSP_LOGI(tag::Sys,"osk_language system=%d keyboard=%d charset=%d",g_params.base.language,g_data.language,static_cast<int>(charset));
+    g_startedUs=sceKernelGetSystemTimeWide();g_lastStatus=-1;
     int r = sceUtilityOskInitStart(&g_params);
     PSP_LOGW(tag::Sys, "osk_init r=%08X max=%d charset=%d part_free_kb=%u part_block_kb=%u",
              static_cast<unsigned>(r), maxChars, static_cast<int>(charset), freeKb, blockKb);
@@ -168,6 +166,10 @@ void oskAfterGeSync() {
     // INIT may be skipped (NONE -> RUNNING); NONE before shutdown just means
     // the dialog has not come up yet.
     const int st = sceUtilityOskGetStatus();
+    if(st!=g_lastStatus) {
+        PSP_LOGI(tag::Sys,"osk_state status=%d elapsed_ms=%u",st,static_cast<unsigned>((sceKernelGetSystemTimeWide()-g_startedUs)/1000u));
+        g_lastStatus=st;
+    }
     switch (st) {
         case 2:
             sceUtilityOskUpdate(1);

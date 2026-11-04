@@ -1,3 +1,4 @@
+#include "game/spell_classification.hpp"
 // Using a game object: the port's rules, taken from upstream WoWee where it has them and from AzerothCore's
 // public handlers otherwise. Upstream's packet builders and parsers are used as they are (GameObjectUsePacket,
 // GameObjectQueryPacket / GameObjectQueryResponseParser, PageTextQueryPacket / PageTextQueryResponseParser,
@@ -621,9 +622,19 @@ void WorldSession::closeItemText() {
 
 uint64_t WorldSession::fishingBobber() const {
     const uint64_t ch = (static_cast<uint64_t>(selfField(static_cast<uint16_t>(kUnitChannelObject + 1))) << 32) | selfField(kUnitChannelObject);
-    if (ch == 0) return 0;
-    const GameObjectInfo* g = findGameObject(ch);
-    return g && g->type == rp::kGoFishingNode ? ch : 0;
+    const GameObjectInfo* g = ch ? findGameObject(ch) : nullptr;
+    const bool fishing=isChanneling() && game::spellclass::isFishingCast(currentCastSpellId());
+    if(g && (g->type==rp::kGoFishingNode || fishing))return ch;
+    // Channel-object and create updates can arrive separately. Use only the
+    // player's own fishing node while a fishing channel is active.
+    if(fishing) {
+        const GameObjectInfo* latest=nullptr;
+        for(const auto& node:gameObjects_)
+            if(node.type==rp::kGoFishingNode && node.createdBy==playerGuid_ &&
+               (!latest || node.seenMs>latest->seenMs))latest=&node;
+        if(latest)return latest->guid;
+    }
+    return 0;
 }
 
 void WorldSession::alterAppearance(uint32_t hairStyle, uint32_t hairColor, uint32_t facialHair) {
@@ -752,6 +763,7 @@ bool WorldSession::handleGameObjectPacket(LogicalOpcode op, network::Packet& pac
             if (goAnimEvents_.size() >= kMaxQueue) goAnimEvents_.pop_front();
             goAnimEvents_.push_back(GoAnimEvent{guid, 1, anim});
             if (guid != 0 && guid == fishingBobber()) {  // the bite: the bobber's Custom0
+                bobberSeen_ = guid;  // preserve an event arriving before the next object-use update
                 bobberBiteMs_ = logUptimeMs();
                 PSP_LOGI(tag::Net, "fish_bite bobber=%08X", lo32(guid));
             }

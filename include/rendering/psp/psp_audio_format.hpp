@@ -23,6 +23,16 @@ struct AudioZonesHeader {
     uint32_t tileOffset;      // AudioTile[tileCount]
 };
 
+// Optional "music_rules" and "music_tracks" entries preserve client ZoneMusic
+// day/night pools and silence intervals without changing the legacy zones blob.
+struct AudioMusicRule {
+    uint32_t areaId;
+    uint32_t soundId[2];
+    uint32_t silenceMinMs[2], silenceMaxMs[2];
+    uint32_t firstTrack[2], trackCount[2];
+};
+static_assert(sizeof(AudioMusicRule)==44,"AudioMusicRule is a 44-byte record");
+
 struct AudioZone {
     uint32_t zoneId;
     uint16_t firstTrack;      // into the zone-track list

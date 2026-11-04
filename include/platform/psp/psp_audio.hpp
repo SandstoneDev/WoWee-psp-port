@@ -22,7 +22,9 @@ namespace wowee::platform::psp {
 struct AudioStats {
     uint32_t underruns = 0;     // feeder blocks with no PCM ready
     uint32_t decodeErrors = 0;
+    uint32_t musicStarts = 0;  // tracks that produced at least one decoded frame
     uint32_t ringFill = 0;      // stereo frames buffered
+    uint32_t outputErrors = 0, sfxLateBlocks = 0, sfxMixMaxUs = 0;
     uint32_t sfxVoices = 0;     // voices playing
 };
 
@@ -42,11 +44,14 @@ bool musicActive();            // a track is decoding or still audible
 // Sound effects: PCM already in RAM (the caller keeps it alive while it
 // plays). Returns a voice id (>= 0) or -1 when every voice is busy with a
 // louder sound. gain 0..1, pan -1 (left) .. 1 (right).
-int sfxPlay(const int16_t* pcm, uint32_t frames, int channels, uint32_t rate, float gain, float pan, bool loop);
+int sfxPlay(const int16_t* pcm, uint32_t frames, int channels, uint32_t rate, float gain, float pan, bool loop, uint32_t tag = 0);
 void sfxStop(int voice);
+void sfxStopTag(uint32_t tag); // short fade; cancels a sound group without cutting other voices
 void sfxSetGain(int voice, float gain, float pan);
 void sfxSetVolume(float v);    // category volume
 bool sfxPlaying(int voice);
+bool sfxUsesPcm(const int16_t* pcm);
+bool sfxPlayingTag(int voice, uint32_t tag);
 // Sounds - stops every voice (the caller frees the PCM a block later).
 void sfxStopAll();
 

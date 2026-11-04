@@ -24,6 +24,13 @@
 namespace wowee::rendering::psp {
 
 constexpr uint16_t kSoundFormatVersion = 1;
+// Optional sounds.pak "voices": authored playable race/sex sound profiles.
+struct CharacterVoice {
+    uint32_t race, sex;
+    uint32_t attack, wound, critical, jump, land, death;
+};
+static_assert(sizeof(CharacterVoice)==32,"CharacterVoice is a 32-byte record");
+
 
 // FNV-1a over the path lowercased with '/' for '\\' (the extracted tree's
 // spelling, conv_common.hpp lower()). Same function on both sides.
@@ -137,3 +144,13 @@ inline SurfaceCell surfaceCellAt(float x, float y) {
 }
 
 } // namespace wowee::rendering::psp
+
+namespace wowee::rendering::psp {
+struct AreaAmbience { uint32_t area, parent, day, night; };
+static_assert(sizeof(AreaAmbience)==16);
+}
+
+namespace wowee::rendering::psp {
+struct NpcVoiceRecord { uint32_t display, sound[4]; };
+static_assert(sizeof(NpcVoiceRecord)==20);
+}

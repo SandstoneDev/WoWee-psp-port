@@ -25,7 +25,7 @@ enum UiTex {
     kTexIconHeal, kTexIconPotion, kTexIconHearth, kTexIconMount, kTexIconBorder, kTexCount
 };
 // kFontTiny (FRIZQT 8 px) for the dense blocks of the framed windows (PaperDoll stats: 13-unit rows).
-enum UiFont { kFontSmall, kFontNormal, kFontTitle, kFontTiny, kFontCount };
+enum UiFont { kFontSmall, kFontNormal, kFontTitle, kFontTiny, kFontCombatCrit, kFontCount };
 // PSP button glyphs (ui.pak "pad_*", Kenney Input Prompts, CC0).
 enum PadGlyph {
     kPadSquare, kPadTriangle, kPadCircle, kPadCross, kPadUp, kPadDown, kPadLeft, kPadRight, kPadDpad,
@@ -43,8 +43,9 @@ public:
     const platform::psp::Texture& tex(UiTex t) const { return tex_[t]; }
     bool has(UiTex t) const { return tex_[t].pixels != nullptr; }
     // A font missing from an old ui.pak falls back to the small one (font_tiny).
-    const Font& font(UiFont f) const { return font_[f].texture().pixels ? font_[f] : font_[kFontSmall]; }
+    const Font& font(UiFont f) const { return font_[f].texture().pixels ? font_[f] : font_[f==kFontCombatCrit?kFontNormal:kFontSmall]; }
     uint32_t loadedBytes() const { return loadedBytes_; }
+    uint32_t fontRevision() const { return fontRevision_; }
     int missing() const { return missing_; }
 
     // Widgets. `focus` receives the stop; returns true when focused.
@@ -63,18 +64,24 @@ public:
     // glyph() keeps the old look (the button fills the middle 3/4 of r, as the
     // Kenney margins did), glyphFill() fills r - for glyphs inline in text.
     bool glyphFill(UiRenderer& ui, PadGlyph g, const Rect& r, uint32_t abgr = 0xFFFFFFFFu) const;
-    // PSP (owner: the icons are too small to read): L, R, SELECT and START are written as
-    // text (the small font, gold, centred in r - wider than r for SELECT / START); null for the rest.
+    // Names used only when the corresponding button art is unavailable.
     static const char* padLabel(PadGlyph g);
+    const char* glyphLabel(PadGlyph g) const;
     // The width a glyph takes in a line of text: px for an icon, the label's width for a label.
     float glyphWidth(PadGlyph g, float px) const;
-    bool hasGlyph(PadGlyph g) const { return padLabel(g) != nullptr || pad_[g].pixels != nullptr; }
+    bool hasGlyph(PadGlyph g) const { return (g>=kPadSquare && g<=kPadCross) || padLabel(g)!=nullptr || (g>=0 && g<kPadCount && pad_[g].pixels!=nullptr); }
+    // Inline {cross}, {circle}, {l}, etc. reuse the existing ui.pak button art.
+    // Text and glyphs share alignment; missing art falls back to a readable name.
+    float controlHintWidth(const Font& font,const char* text) const;
+    void controlHint(UiRenderer& ui,const Font& font,float x,float y,const char* text,
+                     uint32_t abgr,Align align=Align::Left) const;
 
 private:
     platform::psp::Texture tex_[kTexCount];
     Font font_[kFontCount];
     platform::psp::Texture pad_[kPadCount];
     uint32_t loadedBytes_ = 0;
+    uint32_t fontRevision_=0;
     int missing_ = 0;
 };
 

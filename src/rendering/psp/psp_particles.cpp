@@ -868,12 +868,11 @@ ParticleEngine& particleEngine() {
 
 bool ParticleEngine::acquireShared() {
     if (refs_++ > 0) return pool_ != nullptr;
-    // One pool, one allocation, both shares (wowee.cfg read once here).
-    const bool spells = pp::configGetInt("spellfx", 0) != 0;
-    const bool world = pp::configGetInt("particles", 1) != 0;
+    // Reserve both shares once so settings can enable spells/world emitters live.
+    // Disabled renderers emit nothing; their caches are released independently.
     FxPoolConfig cfg;
-    cfg.spellShare = spells ? std::clamp(pp::configGetInt("spellfxsprites", 96), 0, 256) : 0;
-    cfg.worldShare = world ? std::clamp(pp::configGetInt("particlesprites", 256), 0, 1024) : 0;
+    cfg.spellShare = std::clamp(pp::configGetInt("spellfxsprites", 96), 0, 256);
+    cfg.worldShare = std::clamp(pp::configGetInt("particlesprites", 256), 0, 1024);
     // the weapons' glows (enchantfx=0: none).
     // A glowing weapon (5 effects) keeps ~10 particles an effect alive at the full rate: 96 = the own two weapons.
     cfg.weaponShare =
@@ -1459,7 +1458,7 @@ void WorldParticles::frame(const TerrainCamera& cam, float dtSec) {
         if (d2 > 225.0f && fr.sphereOutside(d, c.reach)) continue;
         picks_.push_back(Pick{d2, ci});
     }
-    const size_t k = std::min(picks_.size(), static_cast<size_t>(cfg_.maxInstances));
+    const size_t k = std::min(picks_.size(),static_cast<size_t>(std::max(1,static_cast<int>(cfg_.maxInstances*performanceScale))));
     std::partial_sort(picks_.begin(), picks_.begin() + static_cast<std::ptrdiff_t>(k), picks_.end(),
                       [](const Pick& a, const Pick& b) { return a.d2 < b.d2; });
     // Keep the slots still picked, free the others, give new picks a free slot (one effect read a frame).
@@ -1545,13 +1544,13 @@ void WorldParticles::frame(const TerrainCamera& cam, float dtSec) {
         // PSP LOD: full density inside particlelod, down to 1/4 at particledist.
         const float d = std::sqrt(s.d2);
         const float w = d <= cfg_.lodDistance ? 1.0f : std::max(0.25f, 1.0f - 0.75f * (d - cfg_.lodDistance) / span);
-        in.rate = cfg_.density * w;
+        in.rate = cfg_.density * w * performanceScale;
         in.camDist = d;  // RT-WORLD-3: the camera's distance to the model origin (the level-3 emission throttle)
         // PSP: an emitter's share - particleemit, and particlemodel split over the model's emitters (the
         // inn's chandelier: 12 candles, each still a flame).
         const int emitters = std::max(1, s.fx->view.h->emitterCount + ((s.fx->view.cls & kPtcSmoke) ? 1 : 0));
         const int perEmitter = std::min(cfg_.emitterCap, std::max(2, cfg_.modelCap / emitters));
-        in.cap = std::max(2, static_cast<int>(static_cast<float>(perEmitter) * w + 0.5f));
+        in.cap = std::max(2, static_cast<int>(static_cast<float>(perEmitter) * w * performanceScale + 0.5f));
         in.tex = &WorldParticles::texFn;
         in.texUser = &s;
         frameList_.push_back(in);
@@ -1559,7 +1558,7 @@ void WorldParticles::frame(const TerrainCamera& cam, float dtSec) {
     FxFrameStats st;
     ParticleEngine& eng = particleEngine();
     const int n = static_cast<int>(frameList_.size());
-    eng.step(frameList_.data(), n, kWorldOwnerBase, kWorldOwnerEnd, eng.worldShare(), dt, st);
+    eng.step(frameList_.data(), n, kWorldOwnerBase, kWorldOwnerEnd, static_cast<int>(eng.worldShare()*performanceScale), dt, st);
     PROF_GE_PASS("particles");
     eng.draw(frameList_.data(), n, kWorldOwnerBase, kWorldOwnerEnd, cam, cfg_.maxPx, st);
     PROF_GE_PASS("char");  // what follows (spell effects set their own; the target portrait) is a character render
@@ -1669,7 +1668,7 @@ void WeatherFx::frame(const TerrainCamera& cam, float dtSec, uint32_t& usOut) {
     PROF_SCOPE("weather");
     const uint32_t t0 = sceKernelGetSystemTimeLow();
     const float dt = std::clamp(dtSec, 0.0f, 0.25f);
-    const int target = std::min(capacity_, static_cast<int>(static_cast<float>(capacity_) * intensity_));
+    const int target = std::min(capacity_, static_cast<int>(static_cast<float>(capacity_) * intensity_ * performanceScale));
     if (count_ == 0)  // upstream resetParticles: the box filled at once
         while (count_ < target) spawn(drops_[count_++], cam.pos, true);
     while (count_ < target) spawn(drops_[count_++], cam.pos, false);

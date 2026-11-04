@@ -17,6 +17,16 @@
 
 namespace wowee::rendering::psp {
 
+// Include nodes, pointer arrays, render/collision grids and transient rebuild
+// space even when the mesh itself was already loaded or prefetched.
+constexpr uint32_t kPlacementBudgetBytes=192;
+constexpr uint32_t kPlacementReserveBytes=3u*1024u*1024u;
+inline uint32_t tilePlacementHeadroom(uint32_t reserveKb, uint32_t placementBytes, bool parked) {
+    const uint32_t reserve = std::max<uint32_t>(reserveKb * 1024u, kPlacementReserveBytes);
+    const uint32_t scratch = std::min<uint32_t>(512u * 1024u, placementBytes / 2u);
+    return reserve + scratch + (parked ? 0u : placementBytes);
+}
+
 struct TileBudgetMeter {
     uint32_t reserveBytes = 0;     // 0 = no budget (everything admitted)
     uint32_t stepBytes = 512u * 1024u;

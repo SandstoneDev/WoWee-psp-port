@@ -18,6 +18,7 @@
 #include "rendering/psp/psp_models.hpp"
 #include "rendering/psp/psp_cpu_fast.hpp"
 #include "rendering/psp/psp_impostor_math.hpp"
+#include "rendering/psp/psp_lighting_ge.hpp"
 
 #include "platform/psp/psp_config.hpp"
 #include "platform/psp/psp_log.hpp"
@@ -76,6 +77,9 @@ void ModelRenderer::loadForestConfig() {
     g_cpuFastMode = std::clamp(pp::configGetInt("cpufast", 1), 0, 2);
     g_cpuFast = g_cpuFastMode != 0;
     g_cpuStats = CpuFastStats{};
+    PSP_LOGI(pp::tag::Gfx,"col_candidates hits=%u builds=%u",
+             static_cast<unsigned>(collisionCandidates_.hits),static_cast<unsigned>(collisionCandidates_.builds));
+    collisionCandidates_.hits=collisionCandidates_.builds=0;
     PSP_LOGI(pp::tag::Gfx, "cpu_fast_cfg mode=%d", g_cpuFastMode);
     guardLod = std::clamp(pp::configGetInt("guardlod", guardLod), 0, 1);
     PSP_LOGI(pp::tag::Gfx, "guard_lod_cfg on=%d", guardLod);
@@ -256,14 +260,26 @@ void ModelRenderer::drawImpostors(const TerrainCamera& cam) {
                 *v++ = br;
             }
         }
-        const int count = static_cast<int>(n * perQuad);
-        sceGuDrawArray(sprites ? GU_SPRITES : GU_TRIANGLES, kImpVertexType, count, nullptr, out);
-        ++stats_.impostorDraws;
-        ++stats_.batches;
-        stats_.triangles += static_cast<uint32_t>(n * 2);
-        prof::count(prof::kDraws, 1);
-        prof::count(prof::kVertices, static_cast<uint32_t>(count));
-        prof::count(prof::kTriangles, static_cast<uint32_t>(n * 2));
+        // Keep the normal atlas batch intact. Only trees in the fade shell
+        // (or newly streamed) need an individual fog value and draw.
+        const float baseFog=lightFogRange(cam).start;
+        auto submit=[&](size_t first,size_t last,float fog) {
+            if(first==last)return;
+            lightObjectFog(fog);
+            const uint32_t trees=static_cast<uint32_t>(last-first);
+            const int count=static_cast<int>(trees*perQuad);
+            sceGuDrawArray(sprites ? GU_SPRITES : GU_TRIANGLES,kImpVertexType,count,nullptr,out+(first-g)*perQuad);
+            ++stats_.impostorDraws;++stats_.batches;stats_.triangles+=trees*2;
+            prof::count(prof::kDraws,1);prof::count(prof::kVertices,static_cast<uint32_t>(count));prof::count(prof::kTriangles,trees*2);
+        };
+        size_t run=g;
+        for(size_t k=g;k<end;++k){
+            const Inst& in=*impostorList_[k];
+            const glm::vec3 c(in.x-cam.pos.x,in.y-cam.pos.y,in.z-cam.pos.z);
+            const float fog=instanceFogStart(in,cam,std::max(0.f,std::sqrt(glm::dot(c,c))-in.r));
+            if(fog!=baseFog){submit(run,k,baseFog);submit(k,k+1,fog);run=k+1;}
+        }
+        submit(run,end,baseFog);
         g = end;
     }
     sceGuDisable(GU_ALPHA_TEST);

@@ -8,13 +8,12 @@
 // Here the same update runs over data/light.pak (read at world entry, pak
 // closed: the card's open-file limit), and its result goes to the GE
 // (psp_lighting_ge): fog colour and range, a tint over the baked vertex
-// light, the sky gradient, optional glow. wowee.cfg keys (read at world entry;
+// light, the sky gradient, screen tint. wowee.cfg keys (read at world entry;
 // the "Light" window changes them live and can save them):
 //   lighting     1   0 = today's fixed look (no tint, legacy fog, flat sky)
 //   sky          1   band gradient sky (0 = the flat colour)
 //   fogbands     1   fog colour + range from the bands (0 = legacy 0.55..0.98 far)
 //   lighttint    1   1 GE ambient over the vertex colour, 2 screen multiply, 0 off
-//   glow         0   glow strength % (0 = off; reserves 18 KB of eDRAM at entry)
 //   timeofday   -1   -1 = the realm clock, 0..23 = fixed hour (tests)
 //   lightgain  100   % on the tint (the baked light is brighter than upstream's noon)
 //   fogstrength 40   % upstream fogStrength (0.4: its default thinning)
@@ -27,6 +26,8 @@
 //   skybench     0   1..3 = 4 extra whole-screen passes per frame in the GE pass
 //                    "sky.bench" (1 the skyfast sky, 2 the old frame clear, 3 a fast clear)
 #include "ui/psp/ui_world_screen.hpp"
+#include "rendering/psp/psp_fog_policy.hpp"
+#include "rendering/psp/psp_outdoor_light.hpp"
 
 #include "core/local_time.hpp"
 #include "platform/psp/psp_config.hpp"
@@ -98,7 +99,6 @@ void WorldScreen::initLighting() {
     L.sky = pp::configGetInt("sky", 1);
     L.fogBands = pp::configGetInt("fogbands", 1);
     L.tint = std::clamp(pp::configGetInt("lighttint", 1), 0, 2);
-    L.glow = std::clamp(pp::configGetInt("glow", 0), 0, 100);
     L.timeOfDay = std::clamp(pp::configGetInt("timeofday", -1), -1, 23);
     L.gain = std::clamp(pp::configGetInt("lightgain", 100), 50, 200);
     L.fogStrength = std::clamp(pp::configGetInt("fogstrength", 40), 0, 200);
@@ -114,12 +114,7 @@ void WorldScreen::initLighting() {
     L.skyBench = std::clamp(pp::configGetInt("skybench", 0), 0, 3);
     rp::setDither3d(pp::configGetInt("dither3d", 0) != 0);  // GE dither on the lit 3D passes
     PSP_LOGI(pp::tag::Gfx, "dither3d on=%d", rp::dither3d() ? 1 : 0);
-    initPortrait();  // the portrait's VRAM, with the glow's, before the models
-    // Glow: its buffer comes off the top of eDRAM, so before the models fill it.
-    if (L.glow > 0 && !rp::glowReserve()) {
-        PSP_LOGW(pp::tag::Gfx, "glow_vram_missing (glow off)");
-        L.glow = 0;
-    }
+    initPortrait();  // portrait VRAM before the models
     char path[256];
     pp::fsPath(path, sizeof(path), "data/light.pak");
     const uint64_t t0 = sceKernelGetSystemTimeWide();
@@ -142,8 +137,8 @@ void WorldScreen::initLighting() {
         pak.close();  // MFILE rule: nothing stays open
     }
     PSP_LOGI(pp::tag::Gfx,
-             "light_cfg on=%d sky=%d fog=%d tint=%d glow=%d tod=%d gain=%d fogk=%d zero=%d mapdef=%d adv=%d moon=%d",
-             L.on, L.sky, L.fogBands, L.tint, L.glow, L.timeOfDay, L.gain, L.fogStrength, L.zero, L.mapDefault,
+             "light_cfg on=%d sky=%d fog=%d tint=%d tod=%d gain=%d fogk=%d zero=%d mapdef=%d adv=%d moon=%d",
+             L.on, L.sky, L.fogBands, L.tint, L.timeOfDay, L.gain, L.fogStrength, L.zero, L.mapDefault,
              L.advance, L.moon);
     // the sky's A/B keys.
     PSP_LOGI(pp::tag::Gfx, "sky_cfg fast=%d bench=%d bench_passes=%d", L.skyFast, L.skyBench,
@@ -165,6 +160,7 @@ void WorldScreen::updateLighting(float dtSec) {
     LightingUi& L = light_;
     rp::FrameLight& f = rp::frameLight();
     f = rp::FrameLight{};  // today's look unless the bands take over below
+    f.adaptiveFog=settings_.values().adaptive30!=0;
     // skyfast is fixed here for the frame (the "Light" window may flip it
     // later in it): the sky drawn in draw() lays every pixel's colour and depth, so frameBegin (right
     // after this update) skips its clear. Not with the fill test (its 1x1 scissor would leave the
@@ -196,7 +192,9 @@ void WorldScreen::updateLighting(float dtSec) {
     }
 
     rp::Lighting& lt = L.light;
-    lt.fogStrength = static_cast<float>(L.fogStrength) / 100.0f;
+    lt.fogStrength = settings_.values().classicfog ? 1.f : static_cast<float>(L.fogStrength) / 100.0f;
+    lt.preferAuthoredColors = true;
+    lt.fogSkyBlend = 0.0f;
     lt.zeroBlend = L.zero != 0;
     lt.useMapDefault = L.mapDefault != 0;
     // PSP: no WMO interior test, weather or swimming yet - outdoor, clear, dry.
@@ -218,7 +216,7 @@ void WorldScreen::updateLighting(float dtSec) {
     // (lightdefault=1) the night colours are right, but the moon at full |z| (~0.95 at 3:00)
     // outshone upstream's low noon sun (z ~0.5): tint 0.57 at night, 0.58 at noon (emulator).
     // The moon gives moonlight % of it (60: ~0.42 at night by the same numbers).
-    const float nDotL = toSun.z >= 0.0f ? toSun.z : -toSun.z * static_cast<float>(L.moon) / 100.0f;
+    const float nDotL = rp::outdoorDiffuseWeight(zoneId_, toSun.z, static_cast<float>(L.moon) / 100.0f);
     glm::vec3 tint = (p.ambientColor + p.diffuseColor * nDotL) * (static_cast<float>(L.gain) / 100.0f / kBakedFlat);
     tint = glm::max(tint, glm::vec3(0.0f));
     L.tintLevel = (tint.r + tint.g + tint.b) / 3.0f;
@@ -231,20 +229,16 @@ void WorldScreen::updateLighting(float dtSec) {
         f.screenABGR = rp::abgrFrom(tint);
     }
 
-    if (L.fogBands) {
-        // PSP: the bands' fog is fitted inside our far plane (450 yd; the
-        // PC draws much further): the end at most 0.98 far, the start keeps
-        // its share of the end. A start past the end would invert the fog.
-        const float farEnd = rendering::psp::TerrainCamera{}.farZ * 0.98f;
-        // Finite checks first: a NaN compare traps on the Allegrex FPU.
-        float end = p.fogEnd, start = p.fogStart;
-        if (!std::isfinite(end) || end <= 1.0f) end = farEnd;
-        if (!std::isfinite(start)) start = end * 0.55f;
-        const float share = std::clamp(start / end, 0.0f, 0.95f);
-        end = std::min(end, farEnd);
+    if (L.fogBands || settings_.values().classicfog) {
+        // Fit authored fog inside the actual world projection, including the
+        // classic low-distance preset, and retain the zone's start/end ratio.
+        const float farClip=rp::worldFarClip(settings_.values().classicfog!=0);
+        auto range=rp::fitFogRange(p.fogStart,p.fogEnd,farClip);
+        // fitFogRange keeps a broad gradient. Static objects additionally
+        // reveal through local fog at their own shorter rendering boundary.
         f.fogBands = true;
-        f.fogEnd = end;
-        f.fogStart = end * share;
+        f.fogEnd = range.end;
+        f.fogStart = range.start;
         glm::vec3 fog = p.fogColor;
         // Screen tint multiplies the fogged pixels too: pre-divide.
         if (f.tint == rp::kTintScreen) fog = fog / glm::max(tint, glm::vec3(0.05f));
@@ -317,11 +311,10 @@ void WorldScreen::drawLightingSky(const rendering::psp::TerrainCamera& cam, uint
 
 void WorldScreen::drawLightingPost() {
     const bool tintPass = rp::frameLight().tint == rp::kTintScreen;
-    const int glow = light_.on ? light_.glow : 0;
-    if (!tintPass && glow <= 0) return;
-    PROF_GE_PASS("glow");
+    if (!tintPass) return;
+    PROF_GE_PASS("light.tint");
     PROF_SCOPE("light");
-    rp::drawPost(glow);
+    rp::drawPost();
 }
 
 // --- "Light" window (Debug -> Light) ------------------------------------------
@@ -361,14 +354,6 @@ bool WorldScreen::lightingWindowAction(uint32_t act) {
             L.light.snapNext();
             logSet("timeofday", L.timeOfDay);
             break;
-        case kIdLightGlow:
-            L.glow = L.glow <= 0 ? 20 : L.glow < 40 ? L.glow + 10 : 0;
-            if (L.glow > 0 && !rp::glowAvailable() && !rp::glowReserve()) {
-                PSP_LOGW(pp::tag::Gfx, "glow_vram_missing (set glow=20 in wowee.cfg and re-enter the world)");
-                L.glow = 0;
-            }
-            logSet("glow", L.glow);
-            break;
         case kIdLightGain:
             L.gain = L.gain >= 150 ? 70 : L.gain + 10;
             logSet("lightgain", L.gain);
@@ -395,7 +380,7 @@ bool WorldScreen::lightingWindowAction(uint32_t act) {
                 const char* key;
                 int value;
             } keys[] = {{"lighting", L.on},        {"sky", L.sky},           {"fogbands", L.fogBands},
-                        {"lighttint", L.tint},     {"glow", L.glow},         {"timeofday", L.timeOfDay},
+                        {"lighttint", L.tint},     {"timeofday", L.timeOfDay},
                         {"lightgain", L.gain},     {"fogstrength", L.fogStrength}, {"lightzero", L.zero},
                         {"skyfast", L.skyFast}};  // skybench: a test, never saved
             for (const auto& k : keys) pp::configSet(k.key, std::to_string(k.value));
@@ -433,9 +418,6 @@ bool WorldScreen::drawLightingWindow(UiRenderer& ui, uint8_t w) {
     if (L.timeOfDay < 0) line = OWN_STR(LIGHT_TIME_SERVER);
     else line = OWN_FMT(LIGHT_TIME_FMT, L.timeOfDay);
     kit_.button(ui, winFocus_, kIdLightTime, Rect{c0, y, bw, bh}, line.c_str());
-    if (L.glow > 0) line = OWN_FMT(LIGHT_GLOW_FMT, L.glow);
-    else line = OWN_STR(LIGHT_GLOW_OFF);
-    kit_.button(ui, winFocus_, kIdLightGlow, Rect{c1, y, bw, bh}, line.c_str());
     y += 26;
     line = OWN_FMT(LIGHT_GAIN_FMT, L.gain);
     kit_.button(ui, winFocus_, kIdLightGain, Rect{c0, y, bw, bh}, line.c_str());

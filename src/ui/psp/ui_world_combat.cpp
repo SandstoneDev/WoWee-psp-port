@@ -1,5 +1,6 @@
 // Melee combat, floating combat text, NPC names and the player's
 // death on the world screen.
+#include "rendering/psp/psp_world_effect_policy.hpp"
 //
 // Controls (free D-pad slots): L + D-pad right = auto-attack on/off
 // (upstream CombatHandler::startAutoAttack / stopAutoAttack), D-pad right =
@@ -127,18 +128,21 @@ void WorldScreen::combatFrameInput(rendering::CharacterAnimator::FrameInput& in,
     if (meleeDurPending_ && meleeSwingTimer_ > 0.0f && in.haveAnimState &&
         animator_.getCombat().getState() == rendering::CombatFSM::State::MELEE_SWING &&
         in.currentAnimId == lastAnimRequest_ && in.currentAnimDuration > 1.0f) {
-        const float dur = std::clamp(in.currentAnimDuration / 1000.0f, 0.25f, 1.0f);
+        const float dur = std::clamp(in.currentAnimDuration / 1000.0f, 0.15f, 2.5f);
         meleeSwingTimer_ = std::max(0.0f, dur - in.currentAnimTime / 1000.0f);
         meleeDurPending_ = false;
     }
     in.meleeSwingTimer = meleeSwingTimer_;
+    in.specialAttackAnimId = meleeSwingTimer_ > 0 ? specialMeleeAnim_ : 0;
 }
 
 // upstream AnimationController::triggerMeleeSwing.
 void WorldScreen::triggerMeleeSwing() {
     if (!player_.animated() || meleeSwingCooldown_ > 0.0f) return;
     if (animator_.getActivity().isEmoteActive()) animator_.cancelEmote();
+    specialMeleeAnim_ = 0;
     meleeSwingCooldown_ = 0.1f;
+    lastAnimRequest_ = ~uint32_t{0}; // A second strike must restart even the same sequence.
     meleeSwingTimer_ = 0.6f;  // until the sequence's own length is seen (combatFrameInput)
     meleeDurPending_ = true;
 }
@@ -218,6 +222,8 @@ void WorldScreen::toggleAutoAttack() {
 }
 
 void WorldScreen::addCombatText(uint8_t type, int32_t amount, bool outgoing, uint64_t dst) {
+    if(type==game::CombatTextEntry::ABSORB)return;
+
     if (!combatTextOn_) return;
     if (combatText_.size() >= kMaxCombatText) combatText_.erase(combatText_.begin());
     CombatText c;
@@ -430,6 +436,7 @@ void WorldScreen::drawNpcNames(UiRenderer& ui) {
     size_t count = 0;
     for (const auto& [guid, e] : session_.entities().getEntities()) {
         if (e->getType() != game::ObjectType::UNIT) continue;
+        if(rendering::psp::isHallowsFireHelper(e->getField(game::fieldIndex(game::UF::OBJECT_FIELD_ENTRY))))continue;
         const glm::vec3 p = core::coords::canonicalToServer(glm::vec3(e->getX(), e->getY(), e->getZ()));
         const glm::vec3 d(p.x - playerX_, p.y - playerY_, p.z - playerZ_);
         const float distSq = glm::dot(d, d);
@@ -450,7 +457,15 @@ void WorldScreen::drawNpcNames(UiRenderer& ui) {
         glm::vec3 pos;
         float h = 0.0f, sx = 0.0f, sy = 0.0f;
         if (!unitView(guid, u) || !unitPosition(guid, pos, h)) continue;
-        if (!projectHud(pos + glm::vec3(0, 0, h + 0.4f), sx, sy)) continue;
+        const glm::vec3 anchor=pos+glm::vec3(0,0,h+.4f);
+        if (!projectHud(anchor,sx,sy)) continue;
+        if(!npcHudVisibility_.visible(guid,camPosForHud_,anchor,pp::logUptimeMs(),
+            [&](const glm::vec3& origin,const glm::vec3& dir,float distance){
+                float hit=models_.raycastBuildings(origin,dir,distance);
+                hit=bigWmoRay(origin,dir,hit);
+                hit=transportCameraRay(origin,dir,hit);
+                return hit<distance;
+            }))continue;
         auto e = session_.entities().getEntity(guid);
         uint32_t col = 0xFF00FFFFu;  // yellow
         if (u.dead) col = kColGrey;
@@ -613,7 +628,7 @@ void WorldScreen::drawCombatUnder(UiRenderer& ui) {
                 break;
         }
         const bool crit = c.type == CT::CRIT_DAMAGE;
-        ui.textShadow(kit_.font(crit ? kFontTitle : kFontNormal), bx + c.xSeed * 20.0f, by, text, col, Align::Center);
+        ui.textShadow(kit_.font(crit ? kFontCombatCrit : kFontNormal), bx + c.xSeed * 20.0f, by, text, col, Align::Center);
     }
     // layers - the refused-attack line moved to the HUD lines
     // (drawHudLines, over the frames and chat); the controls hint is gone

@@ -29,7 +29,8 @@ constexpr uint16_t kModelFormatVersion = 1;
 
 enum ModelFlags : uint16_t {
     kModelFoliage = 1u << 0,       // tree/bush: drawn farther, alpha-tested leaves
-    kModelGroundDetail = 1u << 1,  // grass/clutter: drawn close only
+    kModelGrassPatch = 1u << 6,   // legacy grass patch; excluded by the PSP runtime
+    kModelGroundDetail = 1u << 1,  // legacy grass/clutter: excluded by the PSP runtime
     kModelBuilding = 1u << 2,      // WMO group (M8): placed like a doodad, drawn far
     kModelNearSplit = 1u << 4,     // LOD 0 = big triangles split (drawn only near the camera),
                                    // LOD 1 = the original mesh

@@ -155,6 +155,21 @@ void WorldScreen::updateNpc(const pp::PadState& pad, float dtSec) {
     if ((pad.held & PSP_CTRL_LTRIGGER) && !(pad.held & PSP_CTRL_RTRIGGER) && (pad.pressed & PSP_CTRL_UP))
         interactTarget();
     syncNpcWindows();
+    if(npcVoiceGuid_) {
+        bool service=false;
+        for(uint8_t w:{kWinGossip,kWinVendor,kWinQuestDetails,kWinQuestProgress,kWinQuestReward,kWinBank,kWinTrainer})service=service||windowOpen(w);
+        if(service)npcVoiceSeenWindow_=true;
+        else if(npcVoiceSeenWindow_) {
+            if(auto e=session_.entities().getEntity(npcVoiceGuid_)) {
+                const glm::vec3 pos=core::coords::canonicalToServer(glm::vec3(e->getX(),e->getY(),e->getZ()));
+                sounds_.playNpcVoice(e->getField(game::fieldIndex(game::UF::UNIT_FIELD_DISPLAYID)),1,pos);
+            }
+            npcVoiceGuid_=0;npcVoiceSeenWindow_=false;
+        } else if(pp::logUptimeMs()-npcVoiceAtMs_>10000)npcVoiceGuid_=0;
+    }
+    const uint8_t cachedWindows[]={kWinGossip,kWinQuestDetails,kWinQuestProgress,kWinQuestReward};
+    for(size_t i=0;i<npcLayouts_.size();++i)
+        if(npcLayouts_[i].valid && !windowOpen(cachedWindows[i]))npcLayouts_[i]=NpcFrameLayout{};
     updateMerchant();  // MerchantFrame (backpack with it, error line)
     updateBankMail(dtSec);  // BankFrame / MailFrame (session events, windows, keyboard)
     updateAuction();  // AuctionFrame (session events, windows, keyboard)
@@ -291,6 +306,12 @@ void WorldScreen::interactTarget() {
             session_.interactWithNpc(guid);  // trainers, innkeepers...: the server's gossip
             how = "gossip";
         }
+    }
+    if(flags && !session_.isHostileUnit(guid) && how && std::strcmp(how,"far")!=0 && std::strcmp(how,"none")!=0 &&
+       (npcVoiceGuid_!=guid || nowMs-npcVoiceAtMs_>2000)) {
+        const glm::vec3 pos=core::coords::canonicalToServer(glm::vec3(e->getX(),e->getY(),e->getZ()));
+        sounds_.playNpcVoice(e->getField(game::fieldIndex(game::UF::UNIT_FIELD_DISPLAYID)),0,pos);
+        npcVoiceGuid_=guid;npcVoiceAtMs_=nowMs;npcVoiceSeenWindow_=false;
     }
     if (++npc_.logs <= 60)
         PSP_LOGI(pp::tag::Net, "npc_interact guid=%08X flags=%X how=%s dist=%.1f",
@@ -625,7 +646,6 @@ bool WorldScreen::drawNpcWindow(UiRenderer& ui, uint8_t w) {
         title(r, npcName(v.vendorGuid));
         const std::string cash = std::string(CLIENT_STR(MONEY_COLON)) + " " + money(session_.selfField(game::fieldIndex(game::UF::PLAYER_FIELD_COINAGE)));
         ui.textShadow(fs, r.x + r.w - 14, r.y + 28, cash.c_str(), kColWhite, Align::Right);
-        ui.textShadow(fs, r.x + 14, r.y + 28, OWN_STR(NPC_VENDOR_BUY_HINT), kColGrey);
         float y = r.y + 44;
         const int total = static_cast<int>(v.items.size());
         for (int i = 0; i < kRowsVendor; ++i) {
@@ -782,8 +802,20 @@ void WorldScreen::drawQuestMarkers(UiRenderer& ui) {
             if (glm::dot(d, d) > maxDist * maxDist) continue;
             UnitView u;
             if (unitView(guid, u) && u.dead) continue;
-            if (!projectHud(pos + glm::vec3(0, 0, h + 0.4f), sx, sy)) continue;
-            ui.textShadow(kit_.font(kFontTitle), sx, sy - 34, m.symbol, m.dim ? kColGrey : kColGold, Align::Center);
+            const glm::vec3 anchor=pos+glm::vec3(0,0,h+.4f);
+            if (!projectHud(anchor,sx,sy)) continue;
+            if(!npcHudVisibility_.visible(guid,camPosForHud_,anchor,pp::logUptimeMs(),
+                [&](const glm::vec3& origin,const glm::vec3& dir,float distance){
+                    float hit=models_.raycastBuildings(origin,dir,distance);
+                    hit=bigWmoRay(origin,dir,hit);
+                    hit=transportCameraRay(origin,dir,hit);
+                    return hit<distance;
+                }))continue;
+            loadNpcArt(false);
+            const int icon=*m.symbol=='!'?11:(m.dim?13:12);
+            const auto& marker=npcArt_.icons[icon];
+            if(marker.pixels)ui.image(marker,Rect{sx-9,sy-28,18,24},m.dim?kColGrey:kColWhite);
+            else ui.textShadow(kit_.font(kFontNormal),sx,sy-28,m.symbol,m.dim?kColGrey:kColGold,Align::Center);
             ++drawn;
         }
     }

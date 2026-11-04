@@ -30,11 +30,17 @@ Work in progress; playable on a private AzerothCore server.
 
 - **World:** streamed terrain, doodads and WMOs for all four continents, the dungeon and raid maps, map transfers
   with loading screens, transports (ships, zeppelins, lifts), sky and lighting, weather and particles.
-- **NPCs and players:** creature and character models with animation and equipment; mounts; flying and swimming.
+- **NPCs and players:** creature and character models with animation and equipment; mounts; flying and swimming;
+  a cached player portrait with your character's appearance and equipment, and a basic player shadow.
 - **Gameplay:** combat and spells, targeting, loot, inventory and bags, vendors, trainers, talents, quests, mail,
   auction house, trade, groups and raids, battleground queue, dungeon finder, calendar, achievements, guild bank.
 - **Interface:** drawn from your client's own art and strings (converted by Kiln), laid out for 480x272 and the
-  PSP's buttons; minimap, world map, tutorials, cinematics.
+  PSP's buttons; D-pad navigation, switchable windows, item moving and destruction, minimap, world map, tutorials
+  and cinematics. Settings are grouped by category, with button hints beside the relevant controls.
+- **Audio:** zone music and ambience, weather, spell and combat sounds, and NPC greetings and farewells selected
+  from your client's sound tables. Music files are separate from the audio packs.
+- **Rendering:** a 30 or 60 fps target with adaptive detail on or off; nearest-first NPC preparation, lower-detail
+  distant animation, terrain water and fog. Adaptive detail can restore world detail as frame time allows and keeps spell and rain settings intact.
 - **Languages:** your client's locale (enUS and ruRU tested). With several locales converted, the language is
   chosen on the login screen or in the settings menu.
 - **Login:** typed on the login screen with the PSP keyboard. The first successful login is saved outside the game
@@ -43,9 +49,20 @@ Work in progress; playable on a private AzerothCore server.
 - **Safety on public servers:** every debug and automation aid works only when the connected server is a private
   address listed in `devhosts=`; no configuration key unlocks them on a public address.
 
-Known gaps: no water rendering yet; a few world-map views of dungeons show a placeholder.
+Terrain water renders with masked surfaces, animated ripples and fog. Basic and Fancy spell effects use the converted
+client kits and missiles; Basic omits precast/caster decorations and uses fewer sprites. Generated grass and ground
+decoration are omitted on PSP. See [water and collision notes](docs/PSP_WATER_COLLISION.md),
+[spell visual notes](docs/PSP_SPELL_EFFECTS.md) and [settings notes](docs/PSP_SETTINGS_AND_GRASS.md).
 
-On a PSP-3000 the port runs at about 28 fps (median, loading included) with about 41 MB of heap for the game.
+Known gaps: WMO-only liquids and distinct magma/slime materials; a few world-map views of dungeons show a placeholder.
+Settings combines graphical options under Graphics and uses the client control art; see [settings and movement notes](docs/PSP_SETTINGS_MOVEMENT_FOLLOWUP.md).
+Northshire wolf and duskbat size reports are still under investigation. Build 123 ran on hardware. The latest
+streaming changes passed host regressions and PSP source syntax checks. Stormwind hearthstone landings, floor
+collision and frame times still need a hardware retest. See [follow-up notes](docs/PSP_UI_WORLD_FOLLOWUP.md).
+
+The frame target defaults to 30 fps; 60 fps can be selected separately from adaptive rendering. These are targets,
+not guaranteed minimums: crowded towns and complex interiors can fall below them. The original PSP-3000 figures
+(about 28 fps median and 41 MB of game heap) are earlier measurements, not a benchmark of this revision.
 
 ## Controls
 
@@ -59,12 +76,14 @@ in the player frame, button glyphs on the action bar and a short yellow line.
 | Button | Action |
 |---|---|
 | Analog stick | move relative to the camera (slight tilt walks, full tilt runs) |
-| R (hold) + stick | turn the camera; release and it returns behind the character |
+| R (hold) + stick | turn the camera; camera follow resumes while moving when enabled |
 | R + Up / Down | zoom |
 | Down | draw / sheathe weapons (switch mode) |
 | Left / Right | previous / next target (Combat: enemies only) |
 | Up | interact: talk, loot, open |
-| L + R | auto-run on / off |
+| L + R | auto-run on / off (outside interface mode) |
+| L + Left / Right | previous / next action bar (outside interface mode) |
+| START | open / close the game menu, including during combat and with windows open |
 | SELECT | cursor and windows (interface mode) |
 | HOME | quit (or Menu -> Exit) |
 
@@ -86,19 +105,40 @@ in the player frame, button glyphs on the action bar and a short yellow line.
 | □ △ ○ ✕ | action buttons 1-4 |
 | L + □ △ ○ ✕ | action buttons 5-8 |
 | R + □ △ ○ ✕ | action buttons 9-12 |
-| START | jump |
+| START | game menu |
+
+Settings categories are **Graphics, Sound, Controls, Camera, Interface, Network, and Languages**. Graphics keeps display, preset, texture, environment, unit-detail and effect options together.
+
+Graphics presets are **Low, Medium, High, Ultra, Custom, and Adaptive**. Adaptive is the default and locks individual graphics controls except target FPS. Editing a graphics option in another preset selects Custom. FPS, audio and controls are preserved when selecting a preset.
 
 ### Windows (after SELECT)
 
+Open the spellbook from **START -> Spellbook**. SELECT toggles interface focus.
+
 | Button | Action |
 |---|---|
-| ✕ | left click: press, pick up / put down an item |
-| ○ | right click: equip, use, sell / buy |
-| □ | pick up / put down an item; on a spell, take it to the cursor |
-| START | close the top window (no window: the game menu) |
-| R + stick | move a window |
-| L (hold) + △ on an item | dress-up preview |
+| D-pad | select controls and items (Enhanced navigation) |
+| ✕ | left click: select, pick up / put down an item |
+| ○ | close the selected bag; elsewhere, right click or cancel as shown |
+| L + ○ in bags | equip, use or sell the selected item |
+| □ on a carried item | ask to destroy it; confirm in the dialog |
+| □ on a spell / action button | take it to the cursor |
+| △ in bags | switch bags |
+| △ in loot | take all; a full inventory stops the batch and leaves the remaining items |
+| L + □ on a stack | split the stack |
+| L + △ on an item | dress-up preview |
+| L + R | switch to the next open window |
+| L + Left / Right | previous / next open window |
+| L (hold) + stick | move a movable window; bags stay pinned bottom right |
+| START | open / close the game menu; closing it returns to the previous window |
 | SELECT | leave interface mode |
+
+Opening Bags places its containers and bag buttons at the bottom right. Closing the last container hides them. Other window title buttons close, move,
+reset and switch windows. A confirmation dialog keeps the controls until it
+is answered. Button hints show the action for the selected item or control; L, R and START are written as text.
+
+**Logout** returns to character selection; **Exit Game** leaves the port. The server decides whether logout is
+immediate or delayed. A delayed logout shows the countdown and **Cancel**; Exit Game also offers **Exit Now**.
 
 ## Setup, step by step
 
@@ -111,7 +151,8 @@ You need about an hour of your own time and a few hours of the PC's (the convers
   `WOWEEPSP/` with `EBOOT.PBP`, `sdbg.prx` (writes a crash report if the game crashes), `Data/` (protocol tables)
   and `wowee.cfg.example`.
 - **The converter:** `Kiln-<version>-win64.zip` from [Kiln's Releases page](https://github.com/SandstoneDev/Kiln).
-  Unpack it anywhere; it needs no installation and brings its own Python.
+  Unpack it anywhere; it needs no installation and brings its own Python. These source changes also need the
+  matching updated Kiln bakers; an older Kiln executable does not gain the changes just by rebuilding the EBOOT.
 
 ### 2. Convert your client with Kiln
 
@@ -152,6 +193,11 @@ ms0:/PSP/GAME/WOWEEPSP/
   the client through it, and without it such a server stops answering (players show as `?`, NPC names as dots).
 - `data` and the zip's `Data` are the same folder (the memory stick does not tell upper and lower case apart):
   their contents simply go together.
+- `data/music/` holds the separate MP3 files, with their category folders, for example
+  `data/music/gluescreenmusic/wotlk_main_title.mp3`. Copy the whole folder; `audio.pak` alone is not the music.
+- `sounds.pak` and any `sounds_N.pak` parts hold sound effects and voices. Keep all parts from the same bake.
+- When updating an existing installation, merge the data folders. Do not replace the whole folder with only the
+  changed files. Rebuilt `doodads_<map>.pak` files and their `bigwmo/` companions must come from the same bake.
 - The memory stick is FAT32: no file over 4 GB. Kiln already splits what would be bigger.
 - Copying 17 GB over the PSP's USB takes 30-40 minutes. The PSP drops the USB connection when it goes to sleep:
   plug in the charger and set *Settings > Power Save Settings > Auto Sleep* to *Off* before you start. A card reader
@@ -185,29 +231,46 @@ another account, type it over the saved one; to forget it, delete `ms0:/WOWEE/ac
 
 ## Settings menu
 
-In the world: **START** (in Travel mode) opens the game menu; its first button (*Video*) opens the settings. Up / Down picks
-a row, Left / Right or ✕ changes it, the hint under the rows says what it does, **Close** saves to `wowee.cfg`.
+In the world: **START** opens the game menu; **Settings** opens the settings. The categories on the left are
+**Graphics**, **Advanced**, **Controls**, **Gameplay**, **Audio**, **Effects** and **Languages**. Up / Down picks a
+category or row; Right or ✕ enters a category, Left / Right changes a value, □ returns to the category list, and
+L / R changes category. **Close** or ○ saves to `wowee.cfg`. A language change needs a restart.
 
 | Row | `wowee.cfg` key | Values (default) | What it does |
 |---|---|---|---|
+| Brightness | `brightness` | 50-150 % (100) | adjusts the world image, not the LCD backlight |
+| Classic fog | `classicfog` | on / off (on) | uses the shorter, zone-coloured fog horizon |
 | Model distance | `m2view` | 40-240 yd (160) | trees, buildings and props farther away are not drawn |
 | Player distance | `playerview` | 30-200 yd (120) | other players farther away are not drawn |
-| Players drawn | `playermax` | 5-50 (10) | only the nearest players are drawn; lower is smoother in cities |
 | NPC distance | `npcview` | 20-150 yd (70) | creatures farther away are not drawn |
-| NPC count | `npcmax` | 0-64 (24) | how many of the nearest creatures are drawn |
+| Frame limit | `framecap` | 30 / 60 (30) | target frame rate; not a guaranteed minimum |
+| Graphics preset | `graphicspreset` | Low / Medium / High / Ultra / Custom / Adaptive (Adaptive) | Adaptive adjusts detail and locks manual graphics options except target FPS |
+| FPS and ping | `perfhud` | on / off (off) | frame rate and server ping next to the minimap; enables frame-cost logging |
+| Players drawn | `playermax` | 5-50 (10) | nearest players drawn; adaptive rendering can reduce the crowd budget |
+| NPC count | `npcmax` | 0-64 (24) | fixed-detail NPC budget; adaptive rendering prioritizes nearby visible NPCs |
 | Ground | `terrainsharp` | AUTO / Sharp (AUTO) | ground texture filtering; AUTO is cheaper |
 | Sharp ground distance | `sharpdist` | 30-240 yd (120) | how far the ground stays sharp (Sharp only) |
 | Ground detail | `terraindetail` | on / off (on) | detail texture on the ground up close |
-| Frame limit | `framecap` | 30 / 60 (60) | 30 gives an even pace instead of jumping between 60 and 30 |
-| Player prediction | `remotepredict` | on / off (on) | smoother movement of other players over Wi-Fi |
-| FPS and ping | `perfhud` | on / off (off) | frames per second and the server ping next to the minimap |
+| Camera follow | `camfollow` | on / off (on) | follows behind the character while moving |
+| Camera system | `camsmartfollow` | Old / Smart (Smart) | chooses the camera-follow system |
+| Targets (Right) | `targetall` | Enemies only / All (Enemies only) | the targeting preference |
+| UI navigation | `uinavigation` | Basic / Enhanced (Enhanced) | cursor or D-pad navigation |
+| Spell assignment | `barassignment` | Cursor / Slot picker (Slot picker) | how spells are placed on the action bar |
 | AFK: sit after | `afksit` | off-600 s (300) | the character sits down after this long without input |
-| Targets (Right) | `targetall` | Enemies only / All | what Left / Right cycle through |
-| Auto Loot | `autoloot` | on / off (off) | looting takes everything at once |
-| Music / Sound | `musicvol` / `sfxvol` | 0-100 % (30 / 100) | volumes |
+| Auto Loot | `autoloot` | on / off (off) | takes items one at a time; stops on an inventory error |
+| Player prediction | `remotepredict` | on / off (on) | smoother movement of other players over Wi-Fi |
+| Music / Sound | `musicvol` / `sfxvol` | 0-100 % (30 / 100) | music and sound-effect volumes |
+| Ambience / Weather sound | `ambientvol` / `weathervol` | 0-100 % (35 / 35) | zone ambience and weather volumes |
+| Spells | `spellfx` | Off / You + pet / Everyone (You + pet) | whose spell effects are drawn |
+| Spell quality | `spellfxreal` | Basic / Fancy (Fancy) | both use `spellfx.pak`; Basic keeps essential client effects, Fancy adds caster decorations |
+| Level-up effects | `levelupfx` | on / off (on) | level-up visuals |
+| Water | `water` | on / off (on) | terrain water surfaces |
+| Particles | `particles` | on / off (on) | world particles |
+| Weather | `weather` | on / off (on) | rain and other weather visuals |
 | Language | `locale` | the converted languages | needs a restart |
 
-In crowded places (a capital, a starting zone of a busy server) lower **Players drawn** and **NPC count** first.
+In crowded places try the **Adaptive** preset with a **30 fps** target first. To adjust individual distances or crowd limits, choose **Custom** or a fixed preset. Adaptive does not turn down spell or rain density. Visible NPCs are prepared nearest first, with distant animation detail reduced before nearby
+animation. See [follow-up notes](docs/PSP_UI_WORLD_FOLLOWUP.md) for the current testing limits.
 
 ## wowee.cfg reference
 
@@ -221,7 +284,11 @@ writes its own keys there; you only need to edit the file for the keys below.
 | `netdialog=` | `1` | `1`: the PSP's network dialog at login (pick the Wi-Fi network). `0`: connect to a saved network by itself (`netprofile=`) |
 | `netprofile=` | `0` | with `netdialog=0`: the number of the PSP's saved network; `0` picks one automatically |
 | `locale=` | from Kiln | language, e.g. `enUS`; normally set in the settings menu |
-| `framecap=` | `60` | `60` or `30` |
+| `framecap=` | `30` | `30` or `60`; independent of adaptive rendering |
+| `graphicspreset=` | `5` | 0 Low, 1 Medium, 2 High, 3 Ultra, 4 Custom, 5 Adaptive |
+| `adaptive30=` | `1` | legacy compatibility value; now derived from the selected preset |
+| `musiccontinuous=` | `0` | `0`: use the client zone-music pauses; `1`: continuous music |
+| `playershadow=` | `1` | basic player contact shadow; `0` disables it |
 | `perfhud=` | `0` | `1` shows fps and ping next to the minimap |
 | `playermax=` | `10` | other players drawn (5-50) |
 | `devhosts=` | `127.0.0.1,localhost` | private test servers that unlock the debug aids; public addresses are always ignored |
@@ -240,6 +307,14 @@ character) or the `data/` folder.
   and *NPC count*. Send `PSP/GAME/WOWEEPSP/session.log` and `CRASH.TXT` (if there is one) to the Discord.
 - **Missing art, a black window or "pak" errors in `session.log`** - a file did not reach the stick whole. Run
   Kiln's *Check integrity*, then *Repair*.
+- **Music is missing but effects play** - check Music volume and that the entire `data/music/` folder was copied,
+  including `gluescreenmusic/`. Keep its relative paths; the music is not inside `audio.pak`.
+- **NPC greetings are missing** - rebuild `sounds.pak` with the matching updated Kiln and copy every generated
+  sound-pack part. Rebuilding the EBOOT alone does not add voice clips.
+- **Grass is sparse or tree trunks are invisible** - check Ground clutter and Grass density, then rebuild the
+  affected world's doodads and matching big-WMO companion packs with the updated Kiln.
+- **Critical-hit text still uses the old font** - rebuild `ui.pak`; older packs use the normal combat font as a
+  fallback. The player portrait and basic player shadow do not need an asset rebake.
 - **The menu icon looks generic** - you used the EBOOT from the zip; use the one from Kiln's `xmb\` folder.
 
 ## Servers
@@ -258,12 +333,19 @@ The EBOOT is built with [pspdev](https://github.com/pspdev/pspdev) (GCC 15.2) un
 
 ```bash
 bash tools/psp/cloud_setup.sh          # once, on a Linux box without pspdev: installs it into ~/pspdev
-bash tools/psp/build_psp.sh --no-bump  # from Git Bash (re-runs itself in WSL) or from Linux
+bash tools/psp/build_psp.sh            # from WSL or Linux
 ```
 
 The script builds a clean copy under `$HOME`, fails on any `stubs out of order`, and writes `EBOOT.PBP` and
 `wowee_psp.debug.elf` to `psp/bin/`. `MEMSIZE 1` is set in `psp/CMakeLists.txt`. The start-up community screen
 can be left out with `-DWOWEE_PSP_SPLASH=OFF`.
+
+The matching Kiln source must also be rebuilt for converter changes. Rebuild `ui.pak` for the critical-hit font,
+`sounds.pak` and its parts for NPC speech, and each affected world's doodads plus big-WMO companions for terrain and
+opaque tree materials. Rebuild `characters.pak`, `creatures.pak` and `spellfx.pak` for the current authored spell
+and loot animation changes. Music remains under `data/music/`. Ghost ambience uses a separately prepared
+`data/music/ambience/ghoststate.mp3`. See [death audio setup](docs/PSP_FISHING_CHARGE_DEATH_AUDIO.md). See [follow-up notes](docs/PSP_UI_WORLD_FOLLOWUP.md) for
+build and copy requirements. Asset changes and EBOOT changes are separate; keep their versions matched.
 
 ## Credits and licence
 

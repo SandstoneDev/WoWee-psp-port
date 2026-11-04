@@ -215,6 +215,7 @@ uint32_t CharacterModel::sharedBlobKb() {
 }
 
 void CharacterModel::clear() {
+    ++portraitRevision_;  // a new model must never reuse the previous character's cached face
     for (auto& t : textures_)
         if (t.block) pp::textureRelease(t);
     textures_.clear();
@@ -362,6 +363,23 @@ bool CharacterModel::load(pp::Pak& pak, const CharacterLook& look, bool animated
         PSP_LOGW(pp::tag::Gfx, "char_no_appearance %s", name);
     }
     if (app) pp::pakFree(app);
+    for (auto& id:faceDetail_) id=kNoLayer;
+    std::snprintf(name,sizeof(name),"f_%u_%u",look.race,look.sex);
+    const pp::PakEntry* fe=pak.find(name);
+    auto* detail=fe && fe->size>=8 && fe->size<=16384 ? static_cast<uint8_t*>(pak.load(fe)) : nullptr;
+    if (detail && std::memcmp(detail,"WAFL",4)==0 && detail[4] && detail[5] && detail[6]) {
+        const uint32_t color=std::min<uint32_t>(look.hairColor,detail[6]-1);
+        const uint32_t facial=std::min<uint32_t>(look.facial,detail[4]-1);
+        const uint32_t style=std::min<uint32_t>(look.hairStyle,detail[5]-1);
+        const uint32_t a=8+(facial*detail[6]+color)*4;
+        const uint32_t b=8+((detail[4]+style)*detail[6]+color)*4;
+        if (a+4<=fe->size && b+4<=fe->size) {
+            faceDetail_[0]=rd<uint16_t>(detail+a); faceDetail_[1]=rd<uint16_t>(detail+a+2);
+            faceDetail_[2]=rd<uint16_t>(detail+b); faceDetail_[3]=rd<uint16_t>(detail+b+2);
+        }
+    }
+    if (detail) pp::pakFree(detail);
+
 
     dress(pak, items);
     // The attachment points (older paks have none: nothing attached).
@@ -397,6 +415,7 @@ bool CharacterModel::load(pp::Pak& pak, const CharacterLook& look, bool animated
 // the body rules (psp_body_rules.hpp, psp_equipment_dress.cpp), for what is shown (shownEquipment: Show Helm /
 // Show Cloak).
 void CharacterModel::dress(pp::Pak& pak, ItemBank* items) {
+    ++portraitRevision_;
     PROF_SCOPE("char.dress");
     const uint64_t dressT0 = sceKernelGetSystemTimeWide();  // char_equip ms= (records/layers read on demand)
     const uint32_t reads0 = pp::pakReadCount();             // reads= (card reads of this dress)
@@ -553,6 +572,13 @@ uint32_t CharacterModel::composeBody(pp::Pak& pak, ItemBank* items, const body::
             if (underwearShown(i)) blitLayer(canvas, lb, size, i == 0);
             pp::pakFree(lb);
         }
+        for (uint16_t id:faceDetail_) {
+            if (id==kNoLayer) continue;
+            char name[16]; std::snprintf(name,sizeof(name),"l_%u",static_cast<unsigned>(id));
+            const auto* entry=pak.find(name);
+            auto* data=entry ? static_cast<uint8_t*>(pak.load(entry)) : nullptr;
+            if (data) { blitLayer(canvas,data,entry->size,false); pp::pakFree(data); }
+        }
     } else {
         unswizzle(static_cast<const uint8_t*>(bodyPixels_), reinterpret_cast<uint8_t*>(canvas), kBodyTexSize * 4,
                   kBodyTexSize);
@@ -627,6 +653,7 @@ bool CharacterModel::loadView(const CharacterModel& base, pp::Pak& pak, const Eq
     geo_ = base.geo_;
     look_ = base.look_;
     std::memcpy(bodyLayers_, base.bodyLayers_, sizeof(bodyLayers_));
+    std::memcpy(faceDetail_, base.faceDetail_, sizeof(faceDetail_));
     hairTexture_ = base.hairTexture_;
     hairScalp_ = base.hairScalp_;
     std::memcpy(facial_, base.facial_, sizeof(facial_));
@@ -1325,7 +1352,10 @@ void CharacterModel::draw(const TerrainCamera& cam, const glm::vec3& pos, float 
 // attachcap's crowd policy (psp_character.hpp) - what is worn attached again, with
 // the policy of this moment (WorldScreen::syncRemotePlayers decides when), and what the last attach left off.
 void CharacterModel::refreshAttachments() {
-    if (loaded()) attachEquipment(attachItems_);
+    if (loaded()) {
+        attachEquipment(attachItems_);
+        ++portraitRevision_;
+    }
 }
 
 uint32_t CharacterModel::attachmentsCapped() const { return attachCapSkipped(attach_); }

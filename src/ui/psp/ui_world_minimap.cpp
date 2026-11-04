@@ -85,8 +85,8 @@
 // CPU (minimap 1.07 ms a frame on the PSP-3000, builds 99-101), the look unchanged: the unit circle and the
 // backdrop fan are made once; the disc is clipped against the tiles only when the player, the zoom or the
 // bearing changed (MapUi::Disc - standing still costs no clipping); which unit gets which blip (fields,
-// hostility, quest objectives, quest giver status) is decided every 8 frames or when the units change
-// (MapUi::blipList), the positions every frame; the cluster's texts are made when they change.
+// hostility, quest objectives, quest giver status) and unit positions refresh at 10 Hz.
+// Cached positions reproject with live player/camera movement; the arrow remains per-frame.
 // minimap_frame (every 10 s) gives the parts: disc_us / blip_us / ui_us and the rebuilds.
 #include "ui/psp/ui_world_map.hpp"
 
@@ -795,11 +795,19 @@ void WorldScreen::drawMinimap(UiRenderer& ui) {
     }
     const uint32_t tDisc = sceKernelGetSystemTimeLow();
 
-    // 3. Blips (upstream renderMinimapMarkers order). The list every 8 frames (or when the
-    // units / the zoom changed), the positions every frame.
-    if (m.blipFrame == 0 || m.frame - m.blipFrame >= 8 || session_.entityVersion() != m.blipEntityVersion ||
-        m.blipZoom != m.viewR)
-        refreshMinimapBlips();
+    // Classification and world-position snapshots at 10 Hz, independently of
+    // frame rate. Zoom, target and font changes refresh immediately. Camera /
+    // player movement still reprojects these positions on every drawn frame.
+    const bool snapshot=m.blipFrame==0 || now-m.blipSnapshotMs>=100u ||
+        m.blipZoom!=m.viewR || m.blipTarget!=session_.target() || m.blipFontRevision!=kit_.fontRevision();
+    if(snapshot) {
+        refreshMinimapBlips();m.blipSnapshotMs=now;m.blipTarget=session_.target();
+        m.blipFontRevision=kit_.fontRevision();m.blipProjectionValid=false;
+        for(auto& b:m.blipList) {
+            float height=0;b.located=unitPosition(b.guid,b.position,height);
+            b.symbolWidth=b.symbol?static_cast<float>(kit_.font(kFontSmall).measure(b.symbol)):0.f;
+        }
+    }
     auto project = [&](const glm::vec3& pos, float& sx, float& sy) {
         float ox = 0, oy = 0;
         fmt::minimapDeltaToOffset(pos.x - playerX_, pos.y - playerY_, v, ox, oy);
@@ -813,15 +821,21 @@ void WorldScreen::drawMinimap(UiRenderer& ui) {
         else ui.fill(Rect{sx - r, sy - r, 2 * r, 2 * r}, col);
     };
     const Font& small = kit_.font(kFontSmall);
-    m.blips = 0;
-    for (const MapUi::Blip& b : m.blipList) {
-        glm::vec3 pos;
-        float h = 0.0f, sx = 0.0f, sy = 0.0f;
-        if (!unitPosition(b.guid, pos, h) || !project(pos, sx, sy)) continue;
-        if (b.outer) dot(sx, sy, b.ro, b.outer);
-        dot(sx, sy, b.ri, b.inner);
-        if (b.symbol) ui.text(small, sx, sy - 6.0f, b.symbol, 0xFF000000u, Align::Center);
-        if (b.counted) ++m.blips;
+    if(!m.blipProjectionValid || m.blipX!=playerX_ || m.blipY!=playerY_ ||
+       m.blipSin!=v.sinBearing || m.blipCos!=v.cosBearing) {
+        m.blips=0;
+        for(auto& b:m.blipList) {
+            b.projected=b.located && project(b.position,b.sx,b.sy);
+            if(b.projected && b.counted)++m.blips;
+        }
+        m.blipX=playerX_;m.blipY=playerY_;m.blipSin=v.sinBearing;m.blipCos=v.cosBearing;
+        m.blipProjectionValid=true;++m.blipProjections;
+    }
+    for(const auto& b:m.blipList) {
+        if(!b.projected)continue;
+        if(b.outer)dot(b.sx,b.sy,b.ro,b.outer);
+        dot(b.sx,b.sy,b.ri,b.inner);
+        if(b.symbol)ui.text(small,b.sx-b.symbolWidth/(2.f*ui.scale()),b.sy-6.f,b.symbol,0xFF000000u);
     }
     ui.endFrame();
     const uint32_t tBlip = sceKernelGetSystemTimeLow();
@@ -881,6 +895,9 @@ void WorldScreen::drawMinimap(UiRenderer& ui) {
                      static_cast<unsigned>(m.discBuilds), static_cast<unsigned>(m.blipBuilds),
                      static_cast<unsigned>(m.blipList.size()));
         }
+        PSP_LOGI(pp::tag::Gfx,"minimap_cache snapshots=%u projections=%u arrow=live",
+                 static_cast<unsigned>(m.blipBuilds),static_cast<unsigned>(m.blipProjections));
+        m.blipProjections=0;
         m.cpuSumUs = m.cpuMaxUs = m.cpuFrames = 0;
         m.discUsSum = m.blipUsSum = m.clusterUsSum = m.discBuilds = m.blipBuilds = 0;
         m.nextLogMs = now + 10000;
@@ -1114,7 +1131,7 @@ void WorldScreen::refreshMinimapBlips() {
     const uint16_t fNpcFlags = game::fieldIndex(game::UF::UNIT_NPC_FLAGS);
     const uint16_t fEntry = game::fieldIndex(game::UF::OBJECT_FIELD_ENTRY);
     const uint16_t fDyn = game::fieldIndex(game::UF::UNIT_DYNAMIC_FLAGS);
-    // Units beyond 1.5 x the view radius are left out (as before); 8 frames cannot bring one onto the disc.
+// Units beyond 1.5 x the view radius are left out; the snapshot refreshes every 100 ms.
     const float reach = m.viewR * 1.5f;
     for (const auto& [guid, e] : session_.entities().getEntities()) {
         if (!e || guid == session_.playerGuid()) continue;

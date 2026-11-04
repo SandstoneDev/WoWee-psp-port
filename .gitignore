@@ -18,3 +18,15 @@ session.log
 !psp/sandstone-debug/lib/
 !psp/sandstone-debug/lib/Makefile
 !psp/sandstone-debug/prx/Makefile
+
+# Personal XMB art generated from the local client by Kiln
+/psp/xmb/*.PNG
+
+# Extracted Blizzard client content is local input, never source for a PR.
+/Data/expansions/*/*
+!/Data/expansions/*/*.json
+/logs/
+__pycache__/
+*.py[cod]
+
+/Data/expansions/*/manifest.json

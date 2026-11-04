@@ -439,7 +439,7 @@ bool WorldScreen::petBarShown() const {
     return session_.petHasActionBar() && !fxHides(kFxHideBar) && !fullMapOpen();
 }
 
-float WorldScreen::petChatLift() const { return petBarShown() ? std::round(35.0f * kBarS) : 0.0f; }
+float WorldScreen::petChatLift() const { return petBarShown()?std::round(35.f*kBarS):0.f; }
 
 // --- PetFrame ------------------------------------------------------------------------------------------------------
 
@@ -582,13 +582,13 @@ void WorldScreen::renderPetPortrait(const rendering::psp::TerrainCamera& cam) {
 namespace {
 
 // PetActionButton n (1-based) at the bar's BOTTOMLEFT 36,2, each LEFT of the last RIGHT +8 (+7 for the 7th), 30 x 30.
-Rect petButtonRect(int i, float shift = 0.0f) {  // + shift (PETACTIONBAR_XPOS)
+Rect petButtonRect(int i,float shift=0.f) {  // + shift (PETACTIONBAR_XPOS)
     const float barTop = kMmbBottom - 97.0f * kBarS;
     const float left = kMmbLeft + 36.0f * kBarS + shift;
     float x = left + 36.0f * kBarS;
     for (int k = 0; k < i; ++k) x += (30.0f + (k == 5 ? 7.0f : 8.0f)) * kBarS;
     const float bottom = barTop + 43.0f * kBarS - 2.0f * kBarS;
-    return Rect{std::floor(x), std::floor(bottom - 30.0f * kBarS), 30.0f * kBarS, 30.0f * kBarS};
+    return Rect{std::floor(x),std::floor(bottom-30.0f*kBarS),30.0f*kBarS,30.0f*kBarS};
 }
 
 // AutoCastShine_OnUpdate's four timers (speeds 2, 4, 6, 8 s; each sparkle runs the edge in `speed`, the whole
@@ -626,8 +626,8 @@ void WorldScreen::drawPetActionBar(UiRenderer& ui) {
     const bool clickable = uiMode_ && !settings_.isOpen();
     // SlidingActionBarTexture0 / 1 (UI-PetBar: 256 x 44 + 184 x 44 of the two rows, baked one above the other).
     // PetActionBar_UpdatePositionValues - right of the shapeshift / multicast bar, the leave button.
-    const float petShift = classBarPetShift();
-    const float barTop = kMmbBottom - 97.0f * kBarS, barLeft = kMmbLeft + 36.0f * kBarS + petShift;
+    const float petShift=classBarPetShift();
+    const float barTop=kMmbBottom-97.f*kBarS,barLeft=kMmbLeft+36.f*kBarS+petShift;
     if (p.bar.pixels) {
         const float rowH = static_cast<float>(p.bar.uh) * 0.5f;
         ui.image(p.bar, Rect{barLeft, barTop, 256.0f * kBarS, 44.0f * kBarS},
@@ -640,7 +640,7 @@ void WorldScreen::drawPetActionBar(UiRenderer& ui) {
     p.tipButton = -1;
     for (int i = 0; i < pp::WorldSession::kPetSlots; ++i) {
         const uint32_t s = session_.petActionSlot(i);
-        const Rect r = petButtonRect(i, petShift);
+        const Rect r = petButtonRect(i,petShift);
         const float fs = r.w * 54.0f / 30.0f;  // NormalTexture UI-Quickslot2 54 around the 30 icon (0,-1)
         const Rect frame{r.x + (r.w - fs) * 0.5f, r.y + (r.h - fs) * 0.5f + 0.5f, fs, fs};
         const uint8_t type = pa::type(s);
@@ -1004,7 +1004,7 @@ bool WorldScreen::drawPetWindow(UiRenderer& ui, uint8_t w) {
         const Rect pr = FR(7, 6, 60, 60);
         const game::Character* me = session_.activeCharacter();
         const int race = me ? static_cast<int>(me->race) : 0, sex = me && me->gender == game::Gender::FEMALE ? 1 : 0;
-        if (race > 0 && race < 12 && ufArt_.portrait[race][sex].pixels) ui.imageCircle(ufArt_.portrait[race][sex], pr);
+        if (race > 0 && race < 12 && ownPortrait(race,sex).pixels) ui.imageCircle(ownPortrait(race,sex), pr);
         else ui.fillCircle(pr, 0xFF101010u);
     }
     if (p.stableFrame.pixels) ui.image(p.stableFrame, FR(0, 0, 350, 437));
@@ -1326,7 +1326,7 @@ void WorldScreen::drawTalentSpecTabs(UiRenderer& ui, bool top, const Rect& specT
         if (k == 0) {
             const game::Character* me = session_.activeCharacter();
             const int race = me ? static_cast<int>(me->race) : 0, sex = me && me->gender == game::Gender::FEMALE ? 1 : 0;
-            if (race > 0 && race < 12 && ufArt_.portrait[race][sex].pixels) ui.image(ufArt_.portrait[race][sex], r);
+            if (race > 0 && race < 12 && ownPortrait(race,sex).pixels) ui.image(ownPortrait(race,sex), r);
             else ui.fill(r, 0xFF202020u);
         } else if (p.portraitOk && petPortraitTex_.pixels) {
             ui.image(petPortraitTex_, r);
@@ -1361,7 +1361,7 @@ bool WorldScreen::drawPetPaperDoll(UiRenderer& ui, bool focusable) {
         const Rect pr = FR(7, 6, 60, 60);
         const game::Character* me = session_.activeCharacter();
         const int race = me ? static_cast<int>(me->race) : 0, sex = me && me->gender == game::Gender::FEMALE ? 1 : 0;
-        if (race > 0 && race < 12 && ufArt_.portrait[race][sex].pixels) ui.imageCircle(ufArt_.portrait[race][sex], pr);
+        if (race > 0 && race < 12 && ownPortrait(race,sex).pixels) ui.imageCircle(ownPortrait(race,sex), pr);
     }
     if (p.pdFrame.pixels) ui.image(p.pdFrame, FR(0, 0, 352, 482));
     else kit_.panel(ui, FR(8, 8, 336, 466));

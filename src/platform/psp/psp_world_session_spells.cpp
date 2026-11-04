@@ -100,12 +100,13 @@ const SpellInfo* WorldSession::spellInfo(uint32_t spellId) const {
 }
 
 void WorldSession::pushCastAnim(uint64_t guid, bool start, bool isChannel, game::SpellCastType type,
-                                uint32_t spellId) {
+                                uint32_t spellId, bool release) {
     if (castAnims_.size() >= kMaxQueue) castAnims_.pop_front();
     CastAnim a;
     a.guid = guid;
     a.start = start;
     a.isChannel = isChannel;
+    a.release = release;
     a.castType = type;
     a.spellId = spellId;
     castAnims_.push_back(a);
@@ -453,7 +454,10 @@ void WorldSession::handleCastFailed(network::Packet& packet) {
         code = psf(PS::SPELL_ERROR_CODE, static_cast<unsigned>(data.result));
         t = code.c_str();
     }
-    spellError(t);
+    if(data.result==28 || data.result==29)spellError(ps(PS::SPELL_EQUIPMENT_REQUIRED));
+    else if(data.result==30)spellError(ps(PS::SPELL_MAINHAND_REQUIRED));
+    else if(data.result==31)spellError(ps(PS::SPELL_OFFHAND_REQUIRED));
+    else spellError(t);
     if (++spellLogs_ <= 200)
         PSP_LOGI(tag::Net, "cast_failed id=%u result=%u routine=%d", static_cast<unsigned>(data.spellId),
                  static_cast<unsigned>(data.result), isRoutineCastRejection(data.result) ? 1 : 0);
@@ -532,7 +536,7 @@ void WorldSession::handleSpellGo(network::Packet& packet) {
         castTimeRemaining_ = 0.0f;
         castTimeTotal_ = 0.0f;
         if (!ranged && !meleeAbility && (wasInTimedCast || data.spellId == requestedSpellId_))
-            pushCastAnim(playerGuid_, false, false, game::SpellCastType::OMNI, data.spellId);
+            pushCastAnim(playerGuid_, false, false, game::SpellCastType::OMNI, data.spellId, true);
         if (craftQueueSpellGo(data.spellId)) {
             // upstream - the craft queue re-casts first (the spell queue waits)
         } else if (queuedSpellId_ != 0) {
@@ -545,7 +549,7 @@ void WorldSession::handleSpellGo(network::Packet& packet) {
     } else {
         const bool tracked = unitCastStates_.count(data.casterUnit) != 0;
         if (!tracked && !ranged) pushCastAnim(data.casterUnit, true, false, goType(), data.spellId);
-        if (!ranged) pushCastAnim(data.casterUnit, false, false, game::SpellCastType::OMNI, data.spellId);
+        if (!ranged) pushCastAnim(data.casterUnit, false, false, game::SpellCastType::OMNI, data.spellId, true);
     }
     unitCastStates_.erase(data.casterUnit);
     if (!data.missTargets.empty()) {
@@ -556,7 +560,8 @@ void WorldSession::handleSpellGo(network::Packet& packet) {
             pushSpellText(missText(m.missType), 0, data.spellId, mine, caster, m.targetGuid);
         }
     }
-    spellFxGo(data.casterUnit, data.spellId, data.hitTargets);  // cast kit + triggerImpactVisual
+    spellFxGo(data.casterUnit, data.spellId, data.hitTargets,
+              data.hasDestination && !data.destinationTransport ? data.destination : nullptr);  // cast kit + triggerImpactVisual
 }
 
 void WorldSession::handleSpellCooldown(network::Packet& packet) {
@@ -596,14 +601,21 @@ void WorldSession::handleAuraUpdate(network::Packet& packet, bool isAll) {
     if (!game::AuraUpdateParser::parse(packet, data, isAll)) return;
     if (data.guid == 0) return;
     std::vector<game::AuraSlot>& list = data.guid == playerGuid_ ? playerAuras_ : unitAuras_[data.guid];
-    if (isAll) list.clear();
+    if (isAll) {
+        for (const auto& old : list) if (old.spellId) spellFxAura(data.guid, old.spellId, old.casterGuid, 0);
+        list.clear();
+    }
     const uint64_t now = auraNowMs();
     size_t maxSlot = 0;
     for (const auto& u : data.updates) maxSlot = std::max<size_t>(maxSlot, u.first);
     if (!data.updates.empty() && list.size() <= maxSlot) list.resize(maxSlot + 1);
     for (auto [slot, aura] : data.updates) {
         if (aura.durationMs >= 0) aura.receivedAtMs = now;
+        const auto& old = list[slot];
+        if (old.spellId && (old.spellId != aura.spellId || old.casterGuid != aura.casterGuid))
+            spellFxAura(data.guid, old.spellId, old.casterGuid, 0);
         list[slot] = aura;
+        if (aura.spellId) spellFxAura(data.guid, aura.spellId, aura.casterGuid, aura.durationMs);
     }
     if (data.guid == playerGuid_ && spellDb_) {
         std::vector<uint32_t> ids;
@@ -622,6 +634,9 @@ void WorldSession::handleSpellFailure(network::Packet& packet) {
         if (guid == playerGuid_ && reason != 0) {
             const char* t = spellDb_ ? spellDb_->castFailText(reason) : nullptr;
             if (!t) t = game::getSpellCastResultString(reason);
+            if(reason==28 || reason==29)t=ps(PS::SPELL_EQUIPMENT_REQUIRED);
+            else if(reason==30)t=ps(PS::SPELL_MAINHAND_REQUIRED);
+            else if(reason==31)t=ps(PS::SPELL_OFFHAND_REQUIRED);
             if (t) {
                 const std::string& name = spellDb_ ? spellDb_->name(spellId) : std::string();
                 const std::string full = name.empty() ? std::string(t) : name + ": " + t;
@@ -641,6 +656,7 @@ void WorldSession::handleSpellFailure(network::Packet& packet) {
     } else {
         unitCastStates_.erase(guid);
         pushCastAnim(guid, false, false, game::SpellCastType::OMNI, 0);
+        spellFxCancel(guid);
     }
 }
 
@@ -667,12 +683,14 @@ void WorldSession::handleChannelStart(network::Packet& packet) {
     const game::SpellCastType type = (caster == playerGuid_ && targetGuid_ != 0) ? game::SpellCastType::DIRECTED
                                                                                  : game::SpellCastType::OMNI;
     pushCastAnim(caster, true, true, type, spellId);
+    spellFxChannel(caster, totalMs);
 }
 
 void WorldSession::handleChannelUpdate(network::Packet& packet) {
     const uint64_t caster = packet.readPackedGuid();
     if (!packet.hasRemaining(4)) return;
     const uint32_t remainMs = packet.readUInt32();
+    spellFxChannel(caster, remainMs);
     if (caster == playerGuid_) {
         castTimeRemaining_ = remainMs / 1000.0f;
         if (remainMs == 0) {
@@ -800,6 +818,18 @@ bool WorldSession::handleSpellPacket(game::LogicalOpcode op, network::Packet& pa
         }
         case LogicalOpcode::MSG_CHANNEL_START: handleChannelStart(packet); return true;
         case LogicalOpcode::MSG_CHANNEL_UPDATE: handleChannelUpdate(packet); return true;
+        case LogicalOpcode::SMSG_ENVIRONMENTAL_DAMAGE_LOG: {
+            if(!packet.hasRemaining(21))return true;
+            const uint64_t victim=packet.readUInt64();const uint8_t type=packet.readUInt8();
+            const uint32_t damage=packet.readUInt32(),absorbed=packet.readUInt32(),resisted=packet.readUInt32();
+            if(victim==playerGuid_){
+                using CT=game::CombatTextEntry;
+                if(damage){pushSpellText(CT::ENVIRONMENTAL,static_cast<int32_t>(damage),0,false,0,victim);spellTexts_.back().environment=type;}
+                if(absorbed)pushSpellText(CT::ABSORB,static_cast<int32_t>(absorbed),0,false,0,victim);
+                if(resisted)pushSpellText(CT::RESIST,static_cast<int32_t>(resisted),0,false,0,victim);
+            }
+            return true;
+        }
         case LogicalOpcode::SMSG_SPELLNONMELEEDAMAGELOG: {
             game::SpellDamageLogData d;
             if (!game::SpellDamageLogParser::parse(packet, d)) return true;

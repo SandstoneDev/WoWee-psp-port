@@ -554,7 +554,8 @@ bool WorldScreen::drawTradeDuelWindow(UiRenderer& ui, uint8_t w) {
     auto portrait = [&](uint64_t guid, float ux) {
         const Rect pr{PX(ux), PY(6), 60 * kSX, 60 * kSY};
         UnitView u;
-        if (unitView(guid, u) && u.race < 12 && u.sex < 2 && ufArt_.portrait[u.race][u.sex].pixels)
+        if (const auto* live=portraitOf(guid)) ui.imageCircle(*live,pr);
+        else if (unitView(guid, u) && u.race < 12 && u.sex < 2 && ufArt_.portrait[u.race][u.sex].pixels)
             ui.imageCircle(ufArt_.portrait[u.race][u.sex], pr);
         else
             ui.fillCircle(Rect{pr.x + 2, pr.y + 2, pr.w - 4, pr.h - 4}, 0xFF101010u);

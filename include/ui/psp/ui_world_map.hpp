@@ -158,18 +158,25 @@ struct WorldScreen::MapUi {
         rendering::psp::MinimapVert verts[kMaxVerts] = {};
     } disc;
     // The blips: which unit gets which dot (type, flags, health, hostility, quest objectives, quest giver
-    // status) is decided every few frames or when the units change (entityVersion, the zoom); their
-    // positions are taken every frame, so the dots move as before.
+    // status) and unit positions refresh at 10 Hz. Live player/camera movement
+    // reprojects cached positions every frame; the player arrow is never throttled.
     struct Blip {
         uint64_t guid;
         uint32_t outer, inner;  // ABGR; outer = 0: one dot (inner)
         float ro, ri;
         const char* symbol;     // quest giver ! / ? (null: none)
         bool counted;           // counts in `blips` (the summary)
+        glm::vec3 position{0.f};
+        float sx=0,sy=0,symbolWidth=0;
+        bool located=false,projected=false;
     };
     std::vector<Blip> blipList;
     uint32_t blipFrame = 0, blipEntityVersion = ~0u;
     float blipZoom = 0.0f;
+    uint32_t blipSnapshotMs=0,blipFontRevision=0,blipProjections=0;
+    uint64_t blipTarget=0;
+    float blipX=0,blipY=0,blipSin=0,blipCos=0;
+    bool blipProjectionValid=false;
 
     // minimap: MinimapCluster (Minimap.xml, GameTime.xml, the TimeManager addon).
     struct Cluster {

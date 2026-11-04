@@ -11,8 +11,22 @@ netdialog=1
 # with netdialog=0: the number of the PSP's saved network; 0 = pick one automatically
 netprofile=0
 
-# frame limit: 60 or 30
-framecap=60
+# Music pauses follow the client ZoneMusic intervals; 1 forces continuous music.
+musiccontinuous=0
+
+# Classic low-distance fog preset (Graphics toggle); 0 restores the 450-yard horizon.
+classicfog=1
+
+# Adaptive rendering: 1 adjusts detail for the selected FPS target, 0 uses fixed detail.
+# Graphics preset: 0 Low, 1 Medium, 2 High, 3 Ultra, 4 Custom, 5 Adaptive (default).
+# Adaptive automatically adjusts detail for the target FPS and locks manual graphics options.
+# Editing an individual graphics option in the menu selects Custom; FPS stays independent.
+# With named presets, the preset owns the graphics values below; use Custom for hand-edited values.
+graphicspreset=5
+# Compatibility key, synchronized by Settings; the preset owns adaptive mode.
+adaptive30=1
+# FPS target: 30 or 60. Presets preserve this choice; it is not a guaranteed minimum.
+framecap=30
 
 # 1 = frames per second and the server ping next to the minimap
 perfhud=0
@@ -22,3 +36,32 @@ playermax=10
 
 # private development servers that unlock the debug aids (public addresses are always ignored)
 #devhosts=127.0.0.1,localhost
+
+# Terrain water (also works with sfx=0); lower waterview to reduce GPU work.
+water=1
+waterview=200
+
+# Spell effects: 0 off, 1 you and your pet, 2 all casters. Built-in fallback spell visuals need no new assets.
+spellfx=1
+# Spell quality in Settings: 1 = fancy baked kits/missiles (needs spellfx.pak); 0 = basic built-in visuals.
+spellfxreal=1
+
+# Smart follow camera (controls=2): swings behind your character as movement begins.
+# R + stick still orbits freely; the view stays put while idle.
+camfollow=1
+camsmartfollow=1
+
+# Extra in-game Settings options (also editable here).
+# Brightness is a software world adjustment: 50..150, 100 neutral; not the LCD backlight.
+brightness=100
+uinavigation=1
+barassignment=1
+levelupfx=1
+particles=1
+weather=1
+
+# Full-Screen Glow (FFX Glow), controlled by graphics presets; Custom allows manual On/Off.
+ffxglow=1
+# Optional strength for the GE glow pass. Positive legacy values retain their tuning.
+# The Settings toggle now controls Off; legacy glow=0 uses the normal 20% strength when On.
+glow=20

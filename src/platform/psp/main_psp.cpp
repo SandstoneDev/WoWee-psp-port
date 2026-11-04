@@ -11,6 +11,7 @@
 #include "platform/psp/psp_public_safe.hpp"  // PSP: the debug aids only on a dev server
 #include "platform/psp/psp_bigheap.hpp"
 #include "platform/psp/psp_display.hpp"
+#include "platform/psp/psp_frame_budget.hpp"
 #include "platform/psp/psp_prof.hpp"
 #include "ui/psp/ui_prof_overlay.hpp"
 #include "ui/psp/ui_autotest_overlay.hpp"  // the autopilot's band and summary
@@ -152,7 +153,11 @@ int main(int argc, char* argv[]) {
     bool logOk = logOpen(path);
     logSetSync(true);  // boot: every line reaches the card before the next step
 
-    // Crash catcher (SandstoneDebug): a kernel
+    // Read config before deciding whether to load optional kernel diagnostics.
+    fsPath(path, sizeof(path), "wowee.cfg");
+    const bool cfgOk = configLoad(path);
+
+    // Crash catcher (SandstoneDebug): an opt-in kernel
     // module catches CPU exceptions on the device and writes CRASH.TXT (+
     // ARMED.TXT) next to the EBOOT - registers, the main thread's stack chain
     // and the tail of this log. Map the addresses with
@@ -166,9 +171,12 @@ int main(int argc, char* argv[]) {
         cfg.prx_path = prxPath;
         cfg.report_path = reportPath;
         cfg.build = WOWEE_PSP_BUILD;
-        cfg.enable = 1;
+        // Keep kernel exception hooks out of normal PSP/Adrenaline sessions.
+        // The catcher's unload handshake is not validated on Vita; a stale
+        // hook can affect the emulator beyond this game's process lifetime.
+        cfg.enable = configGetInt("crashcatcher", 0) != 0;
         const int armed = sdbg_init(&cfg);
-        PSP_LOGI(tag::Boot, "sdbg armed=%d prx=%s report=%s", armed, prxPath, reportPath);
+        PSP_LOGI(tag::Boot, "sdbg enabled=%d armed=%d prx=%s report=%s", cfg.enable, armed, prxPath, reportPath);
     }
 
     const SystemInfo& si = systemProbe();
@@ -207,9 +215,7 @@ int main(int argc, char* argv[]) {
     prof::init();
     PSP_LOGI(tag::Gfx, "psm=5551 fb=2x480x272 depth=16 list_kb=256");
 
-    // Settings on the card (server, account, Wi-Fi profile).
-    fsPath(path, sizeof(path), "wowee.cfg");
-    const bool cfgOk = configLoad(path);
+    // Settings on the card were loaded before optional kernel diagnostics.
     // autotest.txt next to the EBOOT - the autopilot; its "set" lines are this run's cfg values
     // (before anything reads a key). Without the file: one failed open, nothing else.
     autotestBoot();
@@ -320,7 +326,7 @@ int main(int argc, char* argv[]) {
              cfgOk ? "ok" : "absent", login.server.c_str(), static_cast<unsigned>(login.port), login.account.c_str(),
              login.netProfile, login.netSsid.c_str(), login.netDialog ? 1 : 0);
     // Frame limit for every screen (the world's settings menu changes it live).
-    displaySetFrameInterval(configGetInt("framecap", 60) <= 30 ? 2 : 1);
+    displaySetFrameInterval(frameIntervalForTarget(configGetInt("framecap", 30)));
     // Sound (M12): threads + channels once per session (psp_audio.hpp).
     if (configGetInt("audio", 1)) audioInit();
 
@@ -368,6 +374,9 @@ int main(int argc, char* argv[]) {
     } else {
         PSP_LOGW(tag::Gfx, "ui_pak=absent fallback=m1_test_screen");
     }
+    {
+    // Screens own loader threads, sockets, textures and PCM banks. Destroy them
+    // while graphics and networking are still available, before firmware exit.
     wowee::ui::psp::LoginScreen screen(kit, login);
     struct mallinfo mi = mallinfo();
     PSP_LOGI(tag::Mem, "heap_arena_kb=%u heap_used_kb=%u", static_cast<unsigned>(mi.arena / 1024),
@@ -411,6 +420,7 @@ int main(int argc, char* argv[]) {
                 PSP_LOGI(tag::Exit, "reason=ui_exit_button");
                 systemRequestExit();
             }
+            if (!systemRunning()) break; // Exit Now / completed logout also request exit directly
             wowee::ui::psp::FrameStats fs;
             fs.fps = st.fps;
             fs.frameUs = st.frameUs;
@@ -445,11 +455,24 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    PSP_LOGI(tag::Exit, "shutdown stage=audio");
+    logFlush();
+    audioShutdown(); // join readers before the screen's sound banks free their PCM
+    PSP_LOGI(tag::Exit, "shutdown stage=screens");
+    logFlush();
+    } // LoginScreen and its world/character screens stop their loaders and close sockets here
+
     memWatchSummary();  // the session's peak heap use / smallest free block
     PSP_LOGI(tag::Exit, "frames=%u", static_cast<unsigned>(st.frame));
     netStop();
+    PSP_LOGI(tag::Exit, "shutdown stage=ui");
+    logFlush();
     kit.release();
+    PSP_LOGI(tag::Exit, "shutdown stage=display");
+    logFlush();
     displayShutdown();
+    PSP_LOGI(tag::Exit, "shutdown stage=complete");
+    logFlush();
     // The restart button after a language change - the EBOOT once more, after the same teardown as an
     // exit (wowee.cfg relaunch=0: straight to the XMB). A refusal comes back at once: one line, then the XMB.
     if (localeRestartRequested() && configGetInt("relaunch", 1) != 0 && argc > 0 && argv[0]) {

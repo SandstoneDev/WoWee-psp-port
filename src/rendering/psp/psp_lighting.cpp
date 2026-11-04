@@ -256,7 +256,7 @@ LightingParams Lighting::target(const glm::vec3& playerPos, uint32_t mapId, uint
         }
     }
 
-    if (!indoors) applyZoneAmbienceOverride(zoneId, newParams);
+    if (!indoors && (!preferAuthoredColors || scratch_.empty())) applyZoneAmbienceOverride(zoneId, newParams);
 
     // Fog toward the sky's horizon colour (upstream fogSkyBlend_).
     newParams.fogColor = glm::mix(newParams.fogColor, newParams.skyMiddleColor, glm::clamp(fogSkyBlend, 0.0f, 1.0f));

@@ -281,7 +281,7 @@ void WorldScreen::updateGameObjectUse(float dtSec) {
             if (ev.kind != 1) continue;
             const GoInfo* g = session_.findGameObject(ev.guid);
             if (!g) continue;
-            if (goAnimatedDisplay(g->displayId)) {  // Custom0..3 / Despawn once (after the next draw)
+            if (goAnimatedDisplay(g->displayId) && ev.guid!=session_.fishingBobber()) {  // own bobber uses explicit dip
                 auto it = s.animGos.find(ev.guid);
                 if (it != s.animGos.end()) {
                     it->second.pendingShot = ev.kind == 2 ? 157u : (ev.kind == 1 ? 153u + std::min<uint32_t>(ev.arg, 3u) : 0u);
@@ -691,7 +691,7 @@ void WorldScreen::appendGameObjectUnits(std::vector<rendering::psp::CreatureUnit
         u.displayId = rp::kGoAnimDisplayBase + g.displayId;
         u.x = g.pos.x;
         u.y = g.pos.y;
-        u.z = g.pos.z;
+        u.z = g.pos.z+(g.guid==session_.fishingBobber()?fishingBobberVisualOffset():0.f);
         u.orientation = g.orientation;
         u.scale = g.scale;
         u.emoteAnim = a.loopAnim;

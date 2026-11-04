@@ -8,15 +8,16 @@
 //   Bags        the backpack or one worn bag at a time (tabs: BACKPACK_TOOLTIP, 1..4 -
 //               the tabs are the worn bag slots 19..22 as well), money.
 // Buttons: SELECT -> the menu -> CHARACTER / Bags. In a window:
-//   Cross   what a right click does upstream: a worn item -> unequipToBackpack,
+//   Circle  what a right click does upstream: a worn item -> unequipToBackpack,
 //           an item in a bag -> UseContainerItem's order (readable / equippable
 //           -> autoEquipItemBySlot|InBag, CMSG_AUTOEQUIP_ITEM: the server picks
 //           the slot and swaps / openable / starts a quest / use), a bag tab
 //           -> show that bag;
-//   Square  pick up / put down (upstream's cursor item: PickupContainerItem /
+//   Cross   pick up / put down (upstream's cursor item: PickupContainerItem /
 //           PickupInventoryItem, PutItemInBackpack / PutItemInBag): the drop
 //           sends CMSG_SWAP_ITEM, the server validates and merges stacks;
-//   Circle  closes the top window (the bind-on-equip prompt = cancel).
+//   Square  delete the highlighted carried item after confirmation.
+//   Triangle switches bags; L+Square splits half a stack; START cancels a move.
 // A focused item shows GameTooltip (ui_world_tooltip.cpp, the client's order).
 //
 // Own equipment (requirement: "change of equipment - on the model at
@@ -173,7 +174,7 @@ void WorldScreen::updateInventory(float dtSec) {
     if (session_.pendingEquip().active && !confirmOpen) session_.cancelPendingEquip();
     if (confirmOpen && !session_.pendingEquip().active) closeWindow(kWinBindConfirm);
     deleteItemTick();  // DELETE_ITEM closed by START = ClearCursor
-    if (!windowOpen(kWinCharacter) && !windowOpen(kWinBags) && !windowOpen(kWinDeleteItem)) invHeld_ = InvHeld{};
+    if (!windowOpen(kWinCharacter) && !windowOpen(kWinBags) && !windowOpen(kWinBank) && !windowOpen(kWinDeleteItem)) invHeld_ = InvHeld{};
     syncOwnEquipment();
 }
 
@@ -201,7 +202,7 @@ bool WorldScreen::resolveOwnEquipment(rendering::psp::Equipment& want, int& unre
                 continue;
             }
             const auto* info = session_.getItemInfo(entry);
-            if (!info) {
+            if (!info || !info->valid) {
                 session_.ensureItemInfo(entry);
                 ++unresolved;
                 continue;
@@ -231,7 +232,7 @@ bool WorldScreen::resolveOwnEquipment(rendering::psp::Equipment& want, int& unre
         uint8_t invType = slot.item.inventoryType;
         if (display == 0) {
             const auto* info = session_.getItemInfo(slot.item.itemId);
-            if (!info) {
+            if (!info || !info->valid) {
                 ++unresolved;
                 continue;
             }
@@ -269,8 +270,8 @@ void WorldScreen::applyOwnLoadout() {
     rendering::WeaponLoadout lo;
     const auto& mh = inv.getEquipSlot(game::EquipSlot::MAIN_HAND);
     const auto& oh = inv.getEquipSlot(game::EquipSlot::OFF_HAND);
-    const uint8_t mhType = mh.empty() ? eq.invType[15] : mh.item.inventoryType;
-    const uint8_t ohType = oh.empty() ? eq.invType[16] : oh.item.inventoryType;
+    const uint8_t mhType = mh.empty() || !mh.item.inventoryType ? eq.invType[15] : mh.item.inventoryType;
+    const uint8_t ohType = oh.empty() || !oh.item.inventoryType ? eq.invType[16] : oh.item.inventoryType;
     lo.inventoryType = eq.displayId[15] ? mhType : 0;
     if (!mh.empty()) {
         lo.is2HLoose = mh.item.subclassName == "Polearm" || mh.item.subclassName == "Staff";
@@ -283,9 +284,18 @@ void WorldScreen::applyOwnLoadout() {
         lo.offHandIsFist = oh.item.subclassName == "Fist Weapon";
         lo.offHandIsDagger = oh.item.subclassName == "Dagger";
     }
+    if (!mh.empty()) if (const auto* info = session_.getItemInfo(mh.item.itemId); info && info->valid && info->itemClass == 2) {
+        lo.is2HLoose = info->subClass == 6 || info->subClass == 10;
+        lo.isFist = info->subClass == 13;
+        lo.isDagger = info->subClass == 15;
+    }
+    if (!oh.empty()) if (const auto* info = session_.getItemInfo(oh.item.itemId); info && info->valid && info->itemClass == 2) {
+        lo.offHandIsFist = info->subClass == 13;
+        lo.offHandIsDagger = info->subClass == 15;
+    }
     animator_.setEquippedWeaponType(lo);
     const auto& rs = inv.getEquipSlot(game::EquipSlot::RANGED);
-    const uint8_t rType = rs.empty() ? eq.invType[17] : rs.item.inventoryType;
+    const uint8_t rType = rs.empty() || !rs.item.inventoryType ? eq.invType[17] : rs.item.inventoryType;
     rendering::RangedWeaponType ranged = rendering::RangedWeaponType::NONE;
     if (eq.displayId[17]) {
         if (rType == game::InvType::RANGED_BOW)
@@ -315,10 +325,8 @@ void WorldScreen::syncOwnEquipment() {
     fillGuildEmblem(session_.guildId(), worn, want);  // the guild tabard's emblem (our guild's query)
     if (want == worn) {
         ownEquipChangeMs_ = 0;
-        if (invLoadoutDirty_) {
-            invLoadoutDirty_ = false;
-            applyOwnLoadout();
-        }
+        invLoadoutDirty_ = false;
+        applyOwnLoadout();  // Item metadata can arrive without a visual change.
         return;
     }
     if (!ownEquipChangeMs_) ownEquipChangeMs_ = nowMs ? nowMs : 1u;
@@ -335,6 +343,7 @@ void WorldScreen::syncOwnEquipment() {
                  want.hideCloak ? 1 : 0);
     const uint64_t t0 = sceKernelGetSystemTimeWide();
     const uint32_t reads0 = pp::pakReadCount();  // reads= (card reads of the re-dress)
+    ownPortraitOk_=false;  // redraw the static portrait after equipment changes
     player_.setEquipment(charPak_, want, &items_);  // geosets, body texture, cloak, attachments
     ownEquipChangeMs_ = 0;
     invLoadoutDirty_ = false;
@@ -400,11 +409,35 @@ const game::ItemDef* WorldScreen::inventoryItemAt(uint32_t id) const {
     return s && !s->empty() ? &s->item : nullptr;
 }
 
-// Square: pick up, then put down (upstream's cursor item and its drop rules).
+// Triangle cycles containers; L+Square splits a stack. Cross moves through the click handler.
 void WorldScreen::inventoryWindowPad(const pp::PadState& pad) {
-    if (!(pad.pressed & PSP_CTRL_SQUARE)) return;
     if (!windowOpen(kWinCharacter) && !windowOpen(kWinBags)) return;
-    inventoryPickPut(winFocus_.focused());
+    if (!windows_.empty() && isPopupWindow(windows_.back())) return;
+    const uint32_t id = winFocus_.focused();
+    uint8_t bag = 0, slot = 0;
+    if ((pad.held & PSP_CTRL_LTRIGGER) && (pad.pressed & PSP_CTRL_SQUARE)) {
+        if (invHeld_.active || !inventoryIdToWire(id, bag, slot) || bankMailItemLocked(bag, slot) ||
+            auctionItemLocked(bag, slot) || session_.tradeItemLocked(bag, slot)) return;
+        const auto* item = inventoryItemAt(id);
+        if (item && item->stackCount > 1)
+            session_.splitItem(bag, slot, static_cast<uint8_t>(std::min<uint32_t>(127, item->stackCount / 2)));
+        return;
+    }
+    if (!(pad.pressed & PSP_CTRL_TRIANGLE)) return;
+    int current = invBag_, index = 0;
+    if (!bagSlotId(id, current, index) && !isSlotId(id) &&
+        (windows_.empty() || windows_.back() != kWinBags)) return;
+    const auto& inv = session_.getInventory();
+    for (int step = 1; step <= 5; ++step) {
+        const int next = (current + step) % 5;
+        if (next != 0 && inv.getBagSize(next - 1) == 0) continue;
+        invBag_ = next;
+        std::fill(bagOpen_, bagOpen_ + 5, false);
+        bagOpen_[next] = true;
+        if (!windowOpen(kWinBags)) openWindow(kWinBags);
+        winFocus_.setFocus(kIdBagSlot0 + static_cast<uint32_t>(next * 36));
+        return;
+    }
 }
 
 // The right click (Circle) on a slot: a bag item -> UseContainerItem (equip, use, sell at a
@@ -418,7 +451,7 @@ bool WorldScreen::inventoryAltAction(uint32_t id) {
     return true;
 }
 
-// The left click / Square on a slot: pick it up, or put the held item there.
+// Cross on a slot: pick it up, or put the held item there.
 void WorldScreen::inventoryPickPut(uint32_t id) {
     if (itemUseTargetClick(id)) return;  // SpellTargetItem - the left click on the target item
     const auto& inv = session_.getInventory();
@@ -430,12 +463,15 @@ void WorldScreen::inventoryPickPut(uint32_t id) {
         uint8_t bag = 0, slot = 0;
         const game::ItemDef* item = inventoryItemAt(id);
         if (!item || !inventoryIdToWire(id, bag, slot)) return;
+        if (bankMailItemLocked(bag,slot) || auctionItemLocked(bag,slot) || session_.tradeItemLocked(bag,slot)) return;
         invHeld_ = InvHeld{true, bag, slot};
         say(OWN_FMT(INV_PICKED_UP, item->name));
         return;
     }
     const InvHeld held = invHeld_;
-    invHeld_ = InvHeld{};
+    if (bankMailItemLocked(held.bag,held.slot) || auctionItemLocked(held.bag,held.slot) ||
+        session_.tradeItemLocked(held.bag,held.slot)) return;
+    // Keep the item held until a valid destination is chosen.
     // upstream PutItemInBackpack: onto the backpack tab = the first free slot.
     if (id == kIdInvBackpackTab) {
         const int free = inv.findFreeBackpackSlot();
@@ -443,6 +479,7 @@ void WorldScreen::inventoryPickPut(uint32_t id) {
             say(OWN_STR(INV_BACKPACK_FULL));
             return;
         }
+        invHeld_ = InvHeld{};
         session_.swapContainerItems(held.bag, held.slot, game::slots::kNoContainer,
                                     static_cast<uint8_t>(game::slots::backpackWireSlot(free)));
         say(OWN_STR(INV_MOVED_TO_BACKPACK));
@@ -451,6 +488,7 @@ void WorldScreen::inventoryPickPut(uint32_t id) {
     uint8_t bag = 0, slot = 0;
     if (!inventoryIdToWire(id, bag, slot)) return;
     if (bag == held.bag && slot == held.slot) {
+        invHeld_ = InvHeld{};
         say(OWN_STR(INV_PUT_BACK));
         return;
     }
@@ -463,18 +501,21 @@ void WorldScreen::inventoryPickPut(uint32_t id) {
         const bool heldWornBag = held.bag == game::slots::kNoContainer && held.slot >= bagSlotFirst &&
                                  held.slot < bagSlotFirst + game::slots::kWornBagCount;
         if (heldWornBag) {  // two worn bags change places
+            invHeld_ = InvHeld{};
             session_.swapBagSlots(held.slot - bagSlotFirst, dstIndex);
             say(OWN_STR(INV_BAGS_SWAPPED));
             return;
         }
         const int size = inv.getBagSize(dstIndex);
         if (size == 0) {  // an empty bag slot: equip the held bag there
+            invHeld_ = InvHeld{};
             session_.swapContainerItems(held.bag, held.slot, game::slots::kNoContainer, slot);
             say(OWN_STR(INV_BAG_EQUIPPED));
             return;
         }
         for (int i = 0; i < size; ++i) {
             if (!inv.getBagSlot(dstIndex, i).empty()) continue;
+            invHeld_ = InvHeld{};
             session_.swapContainerItems(held.bag, held.slot, static_cast<uint8_t>(game::slots::wornBagContainer(dstIndex)),
                                         static_cast<uint8_t>(i));
             say(OWN_STR(INV_MOVED_TO_BAG));
@@ -485,6 +526,7 @@ void WorldScreen::inventoryPickPut(uint32_t id) {
     }
     // Anywhere else: CMSG_SWAP_ITEM (onto a worn slot = equip it there; the
     // server says no with SMSG_INVENTORY_CHANGE_FAILURE if it does not fit).
+    invHeld_ = InvHeld{};
     session_.swapContainerItems(held.bag, held.slot, bag, slot);
     say(OWN_STR(INV_MOVED));
 }
@@ -504,11 +546,12 @@ bool WorldScreen::inventoryActivateSlot(uint32_t id) {
     if (itemUseTargetClick(id)) return true;  // SpellTargetItem (an item spell waits for an item)
     if (id == kIdInvBackpackTab) {
         if (windowOpen(kWinBags) && bagArt_.backpack.pixels) {  // the bag bar toggles the backpack
-            bagOpen_[0] = !bagOpen_[0];
-            if (!bagOpen_[0] && std::none_of(bagOpen_, bagOpen_ + 5, [](bool b) { return b; })) closeWindow(kWinBags);
+            if(bagOpen_[0])closeBag(0);
+            else {bagOpen_[0]=true;invBag_=0;winFocus_.setFocus(kIdBagSlot0);}
             return true;
         }
         invBag_ = 0;
+        bagOpen_[0]=true;openWindow(kWinBags);winFocus_.setFocus(kIdBagSlot0);
         return true;
     }
     if (isEquipId(id)) {
@@ -517,9 +560,11 @@ bool WorldScreen::inventoryActivateSlot(uint32_t id) {
             invBag_ = s - game::Inventory::FIRST_BAG_EQUIP_SLOT + 1;
             if (session_.getInventory().getBagSize(invBag_ - 1) == 0) {
                 say(OWN_STR(INV_NO_BAG_IN_SLOT));
-            } else if (windowOpen(kWinBags) && bagArt_.backpack.pixels) {  // ToggleBag
-                bagOpen_[invBag_] = !bagOpen_[invBag_];
-                if (std::none_of(bagOpen_, bagOpen_ + 5, [](bool b) { return b; })) closeWindow(kWinBags);
+            } else if (windowOpen(kWinBags) && bagOpen_[invBag_]) {
+                closeBag(invBag_);
+            } else {
+                bagOpen_[invBag_]=true;openWindow(kWinBags);
+                winFocus_.setFocus(kIdBagSlot0+static_cast<uint32_t>(invBag_*36));
             }
             return true;
         }
@@ -551,12 +596,15 @@ bool WorldScreen::inventoryActivateSlot(uint32_t id) {
 bool WorldScreen::inventoryWindowAction(uint32_t act) {
     // The ContainerFrame ids (slots, close buttons).
     if (act >= kIdBagClose0 && act < kIdBagClose0 + 5) {
-        bagOpen_[act - kIdBagClose0] = false;
-        if (std::none_of(bagOpen_, bagOpen_ + 5, [](bool b) { return b; })) closeWindow(kWinBags);
+        closeBag(static_cast<int>(act-kIdBagClose0));
         return true;
     }
     if (act >= kIdBagSlot0 && act < kIdBagSlot0 + 5 * 36) {
         inventoryPickPut(act);  // the left click picks up / puts down
+        return true;
+    }
+    if (isSlotId(act)) {
+        inventoryPickPut(act);
         return true;
     }
     if (act < 0x6000 || act > 0x60FF) return false;
@@ -731,8 +779,9 @@ bool WorldScreen::drawInventoryWindow(UiRenderer& ui, uint8_t w) {
         drawStatus(r.x + 8, r.y + r.h - 14);
     } else if ((loadBagArt(), bagArt_.backpack.pixels != nullptr)) {  // ContainerFrame
         drawContainerFrames(ui, focusable);
+        drawBagBar(ui, focusable);  // Only while Bags is open; shares its bottom-right anchor and focus group.
     } else {  // kWinBags
-        const Rect r{246, 4, 230, 218};
+        const Rect r{246, 22, 230, 218};
         kit_.panel(ui, r);
         const int bagSize = invBag_ == 0 ? game::Inventory::BACKPACK_SLOTS : inv.getBagSize(invBag_ - 1);
         if (invBag_ == 0) {
@@ -743,7 +792,7 @@ bool WorldScreen::drawInventoryWindow(UiRenderer& ui, uint8_t w) {
         }
         ui.textShadow(fn, r.x + r.w * 0.5f, r.y + 8, line, kColGold, Align::Center);
         // Tabs: the backpack, then the four worn bag slots (these are the
-        // equipment slots 19..22 too: Square moves bags, Cross opens one).
+        // equipment slots 19..22 too: Cross places a held bag or opens one).
         float tx = r.x + 8;
         const float ty = r.y + 26;
         if (focusable) {

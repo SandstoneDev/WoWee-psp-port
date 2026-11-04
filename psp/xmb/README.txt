@@ -1,0 +1,1 @@
+Personal XMB artwork: copy ICON0.PNG (144x80) and PIC1.PNG (480x272) from Kiln output/xmb here. The PSP build detects them automatically. These client-derived PNGs are intentionally ignored by Git. WOWEE_PSP_XMB can point at another Kiln xmb folder.

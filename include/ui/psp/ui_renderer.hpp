@@ -66,7 +66,7 @@ public:
     // Text in a box: centered when it fits; otherwise clipped to the box and
     // scrolled like a ticker (1.5 s pause, ~25 px/s to the end, pause, again)
     // - long names in the unit frames (owner's request).
-    void textMarquee(const Font& f, const Rect& box, const char* utf8, uint32_t abgr);
+    void textMarquee(const Font& f, const Rect& box, const char* utf8, uint32_t abgr,float measuredWidth=-1.f);
 
     void pushClip(const Rect& r);
     void popClip();

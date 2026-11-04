@@ -158,6 +158,7 @@ CachedModel* acquireModel(ItemBank& items, uint16_t id, bool& loaded) {
         void* blob = items.loadModel(id, size);
         if (!blob || !itemModelValid(blob, size)) {
             if (blob) pp::pakFree(blob);
+            if(items.npcDeferred()) return nullptr;
             cache().missingModels.insert(id);
             if (++g_logged <= 60) PSP_LOGW(pp::tag::Gfx, "attach_model_bad model=a_%u", static_cast<unsigned>(id));
             return nullptr;
@@ -184,6 +185,7 @@ CachedTexture* acquireTexture(ItemBank& items, uint16_t id) {
         CachedTexture t;
         if (!blob || !pp::textureFromBlob(blob, size, t.tex, true)) {
             if (blob) pp::pakFree(blob);
+            if(items.npcDeferred()) return nullptr;
             cache().missingTextures.insert(id);
             return nullptr;
         }
@@ -247,6 +249,37 @@ void mul(const BoneMatrix& a, const BoneMatrix& b, BoneMatrix& out) {
 // the frame number the weapons with a glow are stamped with.
 namespace {
 uint32_t g_attachFrame = 1;
+}
+
+bool prepareNpcAttachments(ItemBank& items,const std::vector<AttachPick>& picks) {
+    if(!items.npcStreaming()) return true;
+    bool ready=true;
+    for(const auto& pick:picks) {
+        if(pick.model==kNoItemModel || cache().missingModels.count(pick.model)) continue;
+        const void* blob=nullptr;uint32_t size=0;
+        auto cached=cache().models.find(pick.model);
+        if(cached!=cache().models.end()) {blob=cached->second.blob;size=cached->second.bytes;}
+        else {
+            if(!items.prepareNpcEntry('a',pick.model)) {ready=false;continue;}
+            blob=items.peekNpcEntry('a',pick.model,size);
+        }
+        // Confirmed absent/malformed models retain the existing fallback behavior.
+        if(!blob || !itemModelValid(blob,size)) continue;
+        auto texture=[&](uint16_t id) {
+            if(id==kNoItemLayer || cache().textures.count(id) || cache().missingTextures.count(id)) return;
+            if(!items.prepareNpcEntry('t',id)) ready=false;
+        };
+        const auto* header=static_cast<const ModelHeader*>(blob);
+        const auto* batches=reinterpret_cast<const ModelBatch*>(static_cast<const uint8_t*>(blob)+header->batchOffset);
+        std::vector<uint16_t> textures;
+        for(uint32_t i=0;i<header->batchCount[0];++i)
+            if(batches[i].texture!=kNoTexture && batches[i].texture<kTexSlot) textures.push_back(batches[i].texture);
+        // Preparing another entry may evict a warm raw blob. Copy dependencies
+        // before that, rather than retaining a pointer into the warm cache.
+        texture(pick.texture);
+        for(uint16_t id:textures) texture(id);
+    }
+    return ready;
 }
 
 uint32_t attachmentFrame() { return g_attachFrame; }
@@ -388,7 +421,7 @@ void CharacterAttachments::set(const std::vector<AttachPick>& picks, const std::
         e.model = cm->blob;
         // a glowing weapon's visual points (an older items.pak: none - all at the origin, as
         // upstream for a model without the attachment).
-        if (p.itemVisual && !itemVisualPoints(cm->blob, cm->bytes, e.points)) e.points = ItemVisualPoints{};
+        if ((p.itemVisual || p.slot==15) && !itemVisualPoints(cm->blob, cm->bytes, e.points)) e.points = ItemVisualPoints{};
         CachedTexture* skin = acquireTexture(items, p.texture);
         e.skin = skin ? &skin->tex : nullptr;
         if (skin) e.held.push_back(&skin->tex);
@@ -480,6 +513,25 @@ size_t CharacterAttachments::glows(WeaponGlow* out, size_t max) const {
     return n;
 }
 
+bool CharacterAttachments::weaponTip(uint8_t slot,float out[3]) const {
+    for(const auto& e:entries_) {
+        if(e.pick.slot!=slot || e.drawnFrame!=attachmentFrame() || !e.model)continue;
+        float point[3]={0,0,0};
+        if(e.points.found&1u)std::memcpy(point,e.points.position[0],sizeof(point));
+        else {
+            // Older items.pak without attachment metadata: the far end of the
+            // longest model axis, relative to its hand-held origin.
+            ModelHeader h;std::memcpy(&h,e.model,sizeof(h));
+            int axis=0;for(int a=1;a<3;++a)if(h.half[a]>h.half[axis])axis=a;
+            for(int a=0;a<3;++a)point[a]=h.center[a];
+            point[axis]+=h.center[axis]>=0.f?h.half[axis]:-h.half[axis];
+        }
+        for(int a=0;a<3;++a)out[a]=e.world[9+a]+e.world[a]*point[0]+e.world[3+a]*point[1]+e.world[6+a]*point[2];
+        return true;
+    }
+    return false;
+}
+
 void CharacterAttachments::draw(const BoneMatrix& charModel, const BoneMatrix* pose, uint32_t poseCount,
                                 float alpha, const float camPos[3]) {
     if (entries_.empty() || !attachmentsEnabled()) return;
@@ -518,7 +570,7 @@ void CharacterAttachments::draw(const BoneMatrix& charModel, const BoneMatrix* p
             b = a;
         }
         // a glowing weapon keeps its world matrix of this frame (glows()).
-        if (camPos && e.pick.itemVisual) {
+        if (camPos && (e.pick.itemVisual || e.pick.slot==15)) {
             Entry& w = entries_[k];
             std::memcpy(w.world, b.m, sizeof(w.world));
             for (int r = 0; r < 3; ++r) w.world[9 + r] += camPos[r];

@@ -119,6 +119,7 @@ public:
     // their particles / ribbons / meshes, the GE pass.
     void frame(const TerrainCamera& cam, float dtSec);
     uint32_t indexBytes() const;
+    float performanceScale = 1.f; // frame budget: instance count, emission and particle share
 
 private:
     struct File {
@@ -211,6 +212,7 @@ public:
     WeatherKind kind() const { return kind_; }
     float intensity() const { return intensity_; }
     int drops() const { return count_; }
+    float performanceScale = 1.f; // density only; server weather state remains unchanged
     uint32_t memoryBytes() const { return static_cast<uint32_t>(capacity_) * sizeof(Drop); }
     // upstream Weather::update + render, per frame after the other 3D draws.
     void frame(const TerrainCamera& cam, float dtSec, uint32_t& usOut);

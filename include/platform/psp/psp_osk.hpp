@@ -18,10 +18,10 @@
 namespace wowee::platform::psp {
 
 enum class OskCharset : uint8_t {
-    Any,          // Latin + Cyrillic + digits (SELECT switches)
+    Any,          // console system-language keyboard, firmware-supported input types
     LatinLetters,
     Cyrillic,
-    Text,         // Chat - Cyrillic + Latin + digits + symbols ('/', '.', punctuation)
+    Text,         // console-language chat/mail, including digits and punctuation
     Digits,       // the money boxes (MoneyInputFrame: numeric)
 };
 

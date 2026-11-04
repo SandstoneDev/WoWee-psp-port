@@ -8,6 +8,7 @@
 // mirrors GameHandler::handleAuthChallenge / sendAuthSession /
 // handleAuthResponse / requestCharacterList / handleCharEnum.
 #pragma once
+#include "platform/psp/psp_loot_requests.hpp"
 
 #include "game/character.hpp"
 #include "game/entity.hpp"
@@ -93,6 +94,13 @@ public:
     void deleteCharacter(uint64_t characterGuid);
     // Milestone 5: log the character into the world.
     void enterWorld(uint64_t characterGuid);
+    void requestLogout(bool exitGame = false);
+    void cancelLogout();
+    bool logoutPending() const { return logoutPending_; }
+    bool logoutExitsGame() const { return logoutExitGame_; }
+    bool logoutCountdownVisible() const { return logoutPending_ && logoutResponseReceived_ && !logoutInstant_; }
+    uint32_t logoutSecondsRemaining() const;
+    bool takeLogoutComplete() { const bool done=logoutComplete_; logoutComplete_=false; return done; }
     // In world: sends a MSG_MOVE_* for the player (upstream MovementPacket;
     // server coordinates, time = client ms as in the time-sync replies).
     void sendMovement(game::Opcode opcode, game::MovementInfo info);
@@ -218,6 +226,9 @@ private:
     uint32_t pingLatencyMs() const { return latencyMs_ ? latencyMs_ : 50u; }  // CMSG_PING's latency field
     uint32_t timeSyncs_ = 0;
 
+    bool logoutPending_ = false, logoutComplete_ = false;
+    bool logoutExitGame_ = false, logoutInstant_ = false, logoutResponseReceived_ = false;
+    uint64_t logoutRequestedUs_ = 0;
     game::EntityManager entities_;
     uint32_t entityVersion_ = 0;
     std::unordered_map<uint64_t, std::string> names_;
@@ -414,6 +425,7 @@ public:
     bool unitWalkAnim(uint64_t guid) const;
     // PSP: npc-walk - FlyForward / FlyIdle: FLYING / CAN_FLY or a MoveSplineFlag::Flying spline (see the .cpp).
     bool unitFlyAnim(uint64_t guid) const;
+    bool takeForcedMovement(glm::vec3& position,float& facing,bool& moving);
 
 private:
     void handleNpcMove(game::LogicalOpcode op, network::Packet& packet);
@@ -424,6 +436,8 @@ private:
     void noteSplineGait(const game::MonsterMoveData& d);
     std::unordered_map<uint64_t, uint32_t> unitMoveFlags_;
     std::unordered_map<uint64_t, uint8_t> splineGait_;  // PSP: npc-walk - gait of the unit's last spline
+    std::shared_ptr<game::Entity> ownForcedEntity_;
+    bool ownForcedMove_=false;
     uint32_t monsterMoves_ = 0, monsterMoveLogs_ = 0, monsterMoveFails_ = 0;
 
     // Spells (psp_world_session_spells.cpp): upstream SpellHandler's cast
@@ -435,13 +449,14 @@ public:
     static constexpr int kActionBarSlots = 144;  // upstream GameHandler::ACTION_BAR_SLOTS (12 x 12)
     struct CastAnim {  // one upstream spellCastAnimCallback call
         uint64_t guid = 0;
-        bool start = false, isChannel = false;
+        bool start = false, isChannel = false, release = false;
         game::SpellCastType castType = game::SpellCastType::OMNI;
         uint32_t spellId = 0;
         bool melee = false;  // upstream meleeSwingCallback (an instant melee ability)
     };
     struct SpellText {  // upstream addCombatText from the spell logs / SPELL_GO misses
         uint8_t type = 0;  // CombatTextEntry::Type
+        uint8_t environment = 255; // environmental damage type; 2 = actual fall damage
         int32_t amount = 0;
         uint32_t spellId = 0;
         bool outgoing = false;
@@ -498,7 +513,7 @@ private:
     void handleActionButtons(network::Packet& packet);
     void seedCooldownFromSpellInfo(uint32_t spellId);
     void clearOwnCast();
-    void pushCastAnim(uint64_t guid, bool start, bool isChannel, game::SpellCastType type, uint32_t spellId);
+    void pushCastAnim(uint64_t guid, bool start, bool isChannel, game::SpellCastType type, uint32_t spellId, bool release=false);
     void pushSpellText(uint8_t type, int32_t amount, uint32_t spellId, bool outgoing, uint64_t src, uint64_t dst);
     void spellError(const std::string& text);
     const SpellInfo* spellInfo(uint32_t spellId) const;
@@ -547,6 +562,8 @@ public:
     void lootMoney();                                            // CMSG_LOOT_MONEY
     void closeLoot();                                            // CMSG_LOOT_RELEASE
     bool isLootWindowOpen() const { return lootWindowOpen_; }
+    bool lootNeedsManual() const { return lootRequests_.manual(); }
+    void lootAll();
     const game::LootResponseData& getCurrentLoot() const { return currentLoot_; }
     const std::vector<game::LootItem>& getLootItems() const { return currentLoot_.items; }
     uint32_t getLootMoney() const { return currentLoot_.goldLeft() ? currentLoot_.gold : 0u; }
@@ -578,6 +595,7 @@ private:
         bool moneyTaken = false;
         bool itemAutoLootSent = false;
     };
+    LootRequests lootRequests_;
     game::LootResponseData currentLoot_;
     bool lootWindowOpen_ = false, autoLoot_ = false, pendingLootActive_ = false;
     uint8_t pendingLootSlot_ = 0;
@@ -603,6 +621,7 @@ public:
     const std::vector<game::GossipOption>& getGossipOptions() const { return currentGossip_.options; }
     const std::string& getNpcText(uint32_t textId) const;
     const std::string& getQuestGreeting() const { return questGreeting_; }
+    uint32_t npcDialogVersion() const { return npcDialogVersion_; }
     void selectGossipOption(uint32_t optionId, const std::string& code = "");
     void selectGossipQuest(uint32_t questId);
     void closeGossip();
@@ -669,6 +688,7 @@ private:
     void addQuestToLocalLogIfMissing(uint32_t questId, const std::string& title, const std::string& objectives);
     bool resyncQuestLogFromServerSlots(bool forceQueryMetadata);
     void applyQuestStateFromFields();
+    void syncQuestItemCountsFromInventory();
     void applyPackedKillCountsFromFields(QuestLogEntry& quest);
     void clearPendingQuestAccept(uint32_t questId);
     void triggerQuestAcceptResync(uint32_t questId, uint64_t npcGuid, const char* reason);
@@ -678,6 +698,7 @@ private:
     bool gossipWindowOpen_ = false, questDetailsOpen_ = false, questRequestItemsOpen_ = false;
     bool questOfferRewardOpen_ = false, vendorWindowOpen_ = false;
     game::GossipMessageData currentGossip_;
+    uint32_t npcDialogVersion_=0;
     std::string questGreeting_;
     game::QuestDetailsData currentQuestDetails_;
     game::QuestRequestItemsData currentQuestRequestItems_;
@@ -942,9 +963,15 @@ public:
         soundQueue_.erase(soundQueue_.begin());
         return true;
     }
+    struct ServerSound { uint32_t id=0;uint64_t source=0; };
+    bool takeServerSound(ServerSound& out) {
+        if(serverSounds_.empty())return false;
+        out=serverSounds_.front();serverSounds_.pop_front();return true;
+    }
 
 private:
     std::vector<SessionSound> soundQueue_;
+    std::deque<ServerSound> serverSounds_;
 
     // Trainers, talents, spell book tabs - upstream InventoryHandler's
     // trainer half, SpellHandler's talent half and getSpellBookTabs without

@@ -19,16 +19,15 @@ namespace pp = wowee::platform::psp;
 namespace {
 
 FrameLight g_frame;
+FogRange g_objectFog{};
+float g_objectFogStart=0.f;
+uint32_t g_objectFogColor=0;
 bool g_dither3d = false;  // cfg dither3d
 // the sky's 4 x 4 matrix (kSkyDither below) for the lit 3D passes.
 const ScePspIMatrix4 kWorldDither = {{-4, 0, -3, 1}, {2, -2, 3, -1}, {-3, 1, -4, 0}, {3, -1, 2, -2}};
 bool g_lit = false;       // GU_LIGHTING on between lightBegin and lightEnd
 bool g_unlitNow = false;  // lightBatch(true) in effect
 
-// Glow buffer: 120 x 68 (a quarter of 480 x 272 each way) in a 128-wide
-// 5551 block at the top of eDRAM; 72 rows so bilinear reads stay inside.
-constexpr int kGlowW = 120, kGlowH = 68, kGlowStride = 128, kGlowRows = 72;
-uint32_t g_glowOff = 0;   // VRAM-relative, 0 = none
 
 struct SkyVert {
     uint32_t color;
@@ -66,13 +65,20 @@ FrameLight& frameLight() { return g_frame; }
 void setDither3d(bool on) { g_dither3d = on; }
 bool dither3d() { return g_dither3d; }
 
+FogRange lightFogRange(const TerrainCamera& cam) {
+    const FogRange fog=g_frame.fogBands ? fitFogRange(g_frame.fogStart,g_frame.fogEnd,cam.farZ)
+                                       : fitFogRange(cam.farZ*.55f,cam.farZ*.98f,cam.farZ);
+    return adaptiveFogRange(fog,g_frame.adaptiveFog);
+}
+void lightObjectFog(float start) {
+    if(start==g_objectFogStart)return;
+    g_objectFogStart=start;sceGuFog(start,g_objectFog.end,g_objectFogColor);
+}
 void lightBegin(const TerrainCamera& cam, uint32_t fogColorABGR) {
     const FrameLight& f = g_frame;
-    if (f.fogBands) {
-        sceGuFog(f.fogStart, f.fogEnd, f.fogABGR);
-    } else {
-        sceGuFog(cam.farZ * 0.55f, cam.farZ * 0.98f, fogColorABGR);
-    }
+    g_objectFog=lightFogRange(cam);g_objectFogStart=g_objectFog.start;
+    g_objectFogColor=f.fogBands?f.fogABGR:fogColorABGR;
+    sceGuFog(g_objectFog.start,g_objectFog.end,g_objectFogColor);
     sceGuEnable(GU_FOG);
     if (g_dither3d) {  // dither3d
         sceGuSetDither(&kWorldDither);
@@ -253,17 +259,9 @@ SkyCacheStats skyCacheStatsTake() {
     return s;
 }
 
-// --- Post: screen tint, glow --------------------------------------------------
+// --- Post: screen tint --------------------------------------------------
 
-bool glowReserve() {
-    if (g_glowOff) return true;
-    g_glowOff = pp::vramReserveTop(kGlowStride * kGlowRows * 2);
-    return g_glowOff != 0;
-}
-
-bool glowAvailable() { return g_glowOff != 0; }
-
-void drawPost(int glowPercent) {
+void drawPost() {
     const FrameLight& f = g_frame;
     pp::textureResetBinding();
     sceGuDisable(GU_FOG);
@@ -287,63 +285,6 @@ void drawPost(int glowPercent) {
         sceGuDepthMask(GU_FALSE);
         sceGuDisable(GU_BLEND);
     }
-    if (glowPercent <= 0 || !g_glowOff) return;
-    // Glow: the frame at a quarter of its size (bilinear), then stretched
-    // back over it as "screen" (dst + src x (1 - dst): no clipping to white)
-    // at glowPercent. Upstream: no bloom pass (tonemap shoulder, FXAA, sun
-    // shafts); the 3.3.5a client's "full screen glow" blurs the frame and adds it.
-    uint8_t* vram = static_cast<uint8_t*>(sceGeEdramGetAddr());
-    void* frame = pp::displayDrawBuffer();
-    sceGuDisable(GU_DEPTH_TEST);
-    sceGuDepthMask(GU_TRUE);
-    sceGuDisable(GU_BLEND);
-    sceGuEnable(GU_TEXTURE_2D);
-    sceGuTexFilter(GU_LINEAR, GU_LINEAR);
-    sceGuTexWrap(GU_CLAMP, GU_CLAMP);
-    sceGuTexLevelMode(GU_TEXTURE_AUTO, 0.0f);
-    // A: frame -> glow buffer.
-    sceGuDrawBufferList(GU_PSM_5551, reinterpret_cast<void*>(static_cast<uintptr_t>(g_glowOff)), kGlowStride);
-    sceGuScissor(0, 0, kGlowW, kGlowH);
-    sceGuTexMode(GU_PSM_5551, 0, 0, 0);
-    sceGuTexImage(0, 512, 512, 512, vram + reinterpret_cast<uintptr_t>(frame));
-    sceGuTexFunc(GU_TFX_REPLACE, GU_TCC_RGB);
-    sceGuTexFlush();
-    // the frame was drawn just now - texture reads wait for the drawing to finish (CMD_TSYNC,
-    // GE Users Manual §13.8 "recursive drawing"; the flush only empties the 8 KB texture cache, which the GE's
-    // own drawing never updates).
-    sceGuTexSync();
-    for (int x = 0; x < kGlowW; x += 8) {
-        auto* v = static_cast<TexVert*>(sceGuGetMemory(2 * sizeof(TexVert)));
-        const int x1 = std::min(x + 8, kGlowW);
-        v[0] = {static_cast<int16_t>(x * 4), 0, static_cast<int16_t>(x), 0, 0};
-        v[1] = {static_cast<int16_t>(x1 * 4), static_cast<int16_t>(pp::kScreenH), static_cast<int16_t>(x1),
-                static_cast<int16_t>(kGlowH), 0};
-        sceGuDrawArray(GU_SPRITES, GU_TEXTURE_16BIT | GU_VERTEX_16BIT | GU_TRANSFORM_2D, 2, nullptr, v);
-    }
-    // B: glow buffer -> frame, screen blend at glowPercent (vertex-less colour).
-    sceGuDrawBufferList(GU_PSM_5551, frame, 512);
-    sceGuScissor(0, 0, pp::kScreenW, pp::kScreenH);
-    sceGuTexImage(0, kGlowStride, 128, kGlowStride, vram + g_glowOff);
-    sceGuTexFunc(GU_TFX_MODULATE, GU_TCC_RGB);
-    sceGuTexFlush();
-    sceGuTexSync();  // the glow buffer was drawn just now (as above)
-    const float k =std::clamp(static_cast<float>(glowPercent) / 100.0f, 0.0f, 1.0f);
-    sceGuColor(abgrFrom(glm::vec3(k)));
-    sceGuEnable(GU_BLEND);
-    sceGuBlendFunc(GU_ADD, GU_ONE_MINUS_OTHER_COLOR, GU_FIX, 0, 0xFFFFFFFFu);
-    for (int x = 0; x < pp::kScreenW; x += 32) {
-        auto* v = static_cast<TexVert*>(sceGuGetMemory(2 * sizeof(TexVert)));
-        const int x1 = std::min(x + 32, pp::kScreenW);
-        v[0] = {static_cast<int16_t>(x / 4), 0, static_cast<int16_t>(x), 0, 0};
-        v[1] = {static_cast<int16_t>(x1 / 4), static_cast<int16_t>(kGlowH), static_cast<int16_t>(x1),
-                static_cast<int16_t>(pp::kScreenH), 0};
-        sceGuDrawArray(GU_SPRITES, GU_TEXTURE_16BIT | GU_VERTEX_16BIT | GU_TRANSFORM_2D, 2, nullptr, v);
-    }
-    sceGuDisable(GU_BLEND);
-    sceGuTexFunc(GU_TFX_MODULATE, GU_TCC_RGBA);
-    sceGuDepthMask(GU_FALSE);
-    sceGuEnable(GU_DEPTH_TEST);
-    pp::textureResetBinding();
 }
 
 } // namespace wowee::rendering::psp

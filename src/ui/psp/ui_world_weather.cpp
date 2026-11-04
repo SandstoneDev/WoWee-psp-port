@@ -202,6 +202,7 @@ void WorldScreen::drawWeather(const rendering::psp::TerrainCamera& cam) {
     if (!fxWorld_ || !fxWorld_->weatherOn) return;
     FxWorldUi& u = *fxWorld_;
     uint32_t us = 0;
+    u.weather.performanceScale=1.0f;  // preserve rain/weather density in adaptive mode
     u.weather.frame(cam, lastDt_, us);
     u.usLast = us;
     u.usMax = std::max(u.usMax, us);
@@ -216,6 +217,26 @@ void WorldScreen::drawWeather(const rendering::psp::TerrainCamera& cam) {
 }
 
 // upstream GameHandler::isRaining (the server's rain, intensity > 0.05) -> the light's rain profile.
+void WorldScreen::updateEnvironmentAudio() {
+    if(session_.life()!=pp::WorldSession::Life::Alive) {
+        sounds_.environment(0,false,true,0,0.f,0,0); // fade normal zone/weather beds while dead
+        return;
+    }
+    const auto decoded=decodeWeather(session_.getWeatherType(),fxWorld_ ? fxWorld_->weatherMap : 1);
+    const auto kind=fxWorld_ && fxWorld_->weatherOn ? fxWorld_->kind : decoded.kind;
+    const float intensity=fxWorld_ && fxWorld_->weatherOn ? fxWorld_->intensity : session_.getWeatherIntensity();
+    const int weather=(kind==rp::WeatherKind::Rain || kind==rp::WeatherKind::Storm) ? 1 : kind==rp::WeatherKind::Snow ? 2 : kind==rp::WeatherKind::None ? 0 : 3;
+    float hour=session_.getGameTime();
+    if (hour>=0) hour=std::fmod(hour+static_cast<float>(pp::logUptimeMs()-session_.gameTimeReceivedMs())/3600000.f,24.f);
+    uint32_t area=zoneId_;
+    // Prefer the subzone's authored ambience when its area grid is available.
+    int tx=0,ty=0,chunk=0;
+    const uint32_t gridArea=terrain_.chunkAt(playerX_,playerY_,tx,ty,chunk) ? zoneMusic_.areaAt(tx,ty,chunk) : 0;
+    if (gridArea) area=gridArea;
+    sounds_.environment(area,hour>=0 && (hour<6 || hour>=18),(fxWorld_ && fxWorld_->indoors),
+                        weather,intensity,settings_.values().ambientvol,settings_.values().weathervol);
+}
+
 bool WorldScreen::weatherRaining() const {
     const int map = fxWorld_ ? fxWorld_->weatherMap : 1;
     return decodeWeather(session_.getWeatherType(), map).rain && session_.getWeatherIntensity() > 0.05f;

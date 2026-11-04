@@ -38,6 +38,9 @@ export PATH="$PSPDEV/bin:/usr/local/bin:/usr/bin:/bin"
 REPO="$(cd "$(dirname "$SCRIPT_PATH")/../.." && pwd)"
 WORK="${WOWEE_PSP_WORK:-$HOME/wowee_psp_build}"
 OUT="$REPO/psp/bin"
+WORK="$(realpath -m "$WORK")"
+case "$REPO/" in "$WORK/"*) WORK="${WORK}_out" ;; esac
+case "$REPO/" in "$WORK/"*) echo "Build work folder contains the source checkout; choose WOWEE_PSP_WORK outside it." >&2; exit 1 ;; esac
 
 command -v psp-g++ >/dev/null || { echo "psp-g++ not found; PSPDEV=$PSPDEV" >&2; exit 1; }
 command -v cmake   >/dev/null || { echo "cmake not found" >&2; exit 1; }
@@ -61,13 +64,32 @@ rm -rf "$WORK"
 mkdir -p "$WORK/src"
 tar -C "$REPO" \
     --exclude='./psp/bin' \
-    -cf - ./psp ./cmake ./src ./include ./Data ./extern/lua-5.1.5/src \
+    -cf - ./psp ./cmake ./src ./include ./extern/lua-5.1.5/src \
     | tar -C "$WORK/src" -xf -
+
+# Preserve personal artwork when rebuilding instead of replacing it with empty sections.
+XMB_DIR="${WOWEE_PSP_XMB:-}"
+if [ -z "$XMB_DIR" ]; then
+    for candidate in "$REPO/xmb" "$REPO/psp/xmb"; do
+        if [ -f "$candidate/ICON0.PNG" ] && [ -f "$candidate/PIC1.PNG" ]; then XMB_DIR="$candidate"; break; fi
+    done
+fi
+if [ -z "$XMB_DIR" ] && [ -f "$OUT/EBOOT.PBP" ]; then
+    if python3 "$REPO/tools/psp/xmb_pbp.py" extract "$OUT/EBOOT.PBP" "$WORK/xmb"; then XMB_DIR="$WORK/xmb"; fi
+fi
+XMB_ARGS=()
+if [ -n "$XMB_DIR" ]; then
+    XMB_DIR="$(cd "$XMB_DIR" && pwd)"
+    XMB_ARGS+=("-DWOWEE_PSP_XMB_DIR=$XMB_DIR")
+else
+    echo "No embedded XMB art found. Set WOWEE_PSP_XMB to Kiln's output/xmb folder to include it."
+fi
 
 cmake -S "$WORK/src/psp" -B "$WORK/build" \
     -DCMAKE_TOOLCHAIN_FILE="$WORK/src/cmake/psp-toolchain.cmake" \
     -DCMAKE_BUILD_TYPE=RelWithDebInfo \
     -DWOWEE_PSP_BUILD="$BUILD_NUM" \
+    "${XMB_ARGS[@]}" \
     > "$WORK/configure.log" 2>&1 || { cat "$WORK/configure.log"; exit 1; }
 
 set +e
@@ -97,6 +119,11 @@ cp "$WORK/src/psp/sandstone-debug/prx/sdbg.prx" "$OUT/sdbg.prx"
 cmp -s "$WORK/build/EBOOT.PBP" "$OUT/EBOOT.PBP" || { echo "EBOOT copy mismatch" >&2; exit 1; }
 
 printf '%s\n' "$BUILD_NUM" > "$OUT/BUILD"
+
+# Keep an audit of successful rebuilds; repeated old --no-bump builds could not
+# be counted from BUILD_NUMBER alone. The bin folder remains untracked.
+EBOOT_HASH="$(md5sum "$OUT/EBOOT.PBP" | cut -c1-32)"
+printf '%s\t%s\t%s\n' "$BUILD_NUM" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$EBOOT_HASH" >> "$OUT/build-history.tsv"
 echo "== OK build $BUILD_NUM"
-echo "   EBOOT.PBP $(stat -c %s "$OUT/EBOOT.PBP") bytes  md5 $(md5sum "$OUT/EBOOT.PBP" | cut -c1-32)"
+echo "   EBOOT.PBP $(stat -c %s "$OUT/EBOOT.PBP") bytes  md5 $EBOOT_HASH"
 echo "   text/data/bss: $(psp-size "$WORK/build/wowee_psp.debug.elf" | tail -1 | awk '{print $1"/"$2"/"$3}')"

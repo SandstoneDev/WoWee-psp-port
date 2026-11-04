@@ -3,6 +3,7 @@
 // No movement yet (that is gameplay, M10): the server knows where we stand.
 #pragma once
 
+#include "rendering/psp/psp_marker_visibility.hpp"
 #include "platform/psp/psp_item_icons.hpp"  // Item icons
 #include "platform/psp/psp_input.hpp"
 #include "platform/psp/psp_pak.hpp"
@@ -16,7 +17,12 @@
 #include "rendering/psp/psp_terrain.hpp"
 #include "ui/psp/ui_art.hpp"  // Window art with a failure trail (ui_art_fail, retry at the next open)
 #include "ui/psp/ui_focus.hpp"
+#include "ui/psp/psp_follow_camera.hpp"
+#include "platform/psp/psp_frame_budget.hpp"
+#include "ui/psp/ui_action_assignment.hpp"
 #include "ui/psp/ui_kit.hpp"
+#include "ui/psp/ui_npc_layout_cache.hpp"
+#include "rendering/psp/psp_equipment_warmup.hpp"
 #include "ui/psp/ui_renderer.hpp"
 #include "ui/psp/ui_settings_menu.hpp"
 #include "ui/psp/ui_world_chat.hpp"  // Chat
@@ -37,6 +43,7 @@ struct FrameStats;
 
 class WorldScreen {
 public:
+    void setLoadingScreen(bool on) {creatures_.setLoadingScreen(on);}
     WorldScreen(const UiKit& kit, platform::psp::WorldSession& session, std::string characterName);
 
     void update(const platform::psp::PadState& pad, float dtSec);
@@ -54,9 +61,15 @@ private:
     void updateAnimation(float dtSec);
     float cameraDistance(const glm::vec3& pivot, glm::vec3& dir);
     float floorAt(float x, float y, float maxZ, bool* onTerrain = nullptr) const;
+    bool collisionReadyAt(float x, float y, float z);
     void sendMove(game::Opcode opcode, bool moving);
     // Graphics settings menu (SELECT -> Menu -> Graphics): values -> renderers, and back.
     void applySettings();
+    void updateFrameBudget(float dtSec);
+    platform::psp::FrameBudget frameBudget_;
+    float performanceDistance_ = 1, performanceCosmetic_ = 1, performanceSpells_ = 1;
+    uint32_t performancePlayerMax_ = 10;
+    int beforeAdaptiveClock_ = 0;
     GraphicsSettings liveSettings() const;
 
     const UiKit& kit_;
@@ -76,6 +89,12 @@ private:
     std::vector<rendering::psp::DoodadPlacement> goPlaced_;
     void updateGameObjects();
     void drawGameObjects(const rendering::psp::TerrainCamera& cam, uint32_t fogABGR);
+    bool forcedRunAnim_=false;
+    uint64_t fishingVisualGuid_=0;
+    uint32_t fishingSpawnMs_=0;
+    void drawFishingSplash(const rendering::psp::TerrainCamera& cam);
+    void drawFishingLine(const rendering::psp::TerrainCamera& cam);
+    float fishingBobberVisualOffset() const;
     rendering::psp::CharacterModel player_;
     // M10a: other players (models built from their update fields).
     struct RemotePlayer {
@@ -114,6 +133,7 @@ private:
         rendering::psp::Equipment wantEquip;
         int wantUnresolved = 0;
         bool dressWanted = false;        // a (re-)dress is due: the look, an item, an enchantment or a flag changed
+        rendering::psp::EquipmentWarmup<rendering::psp::Equipment> equipmentWarmup;
         bool attachWanted = false;       // dressed without item models yet: they come in a later frame
         uint32_t unresolvedSinceMs = 0;  // entries the client's Item.dbc lacks: their queries pending since
         float dist = 0.0f;               // yd from the player (the scan, then the drawn position)
@@ -136,6 +156,7 @@ private:
     std::vector<std::pair<float, uint64_t>> dressJobs_;  // this frame's queue, nearest first
     uint32_t crowdNextMs_ = 0, crowdLogMs_ = 0, crowdYields_ = 0, crowdTurns_ = 0, dressMaxMs_ = 0, dressQueueMax_ = 0;
     uint32_t dressLogs_ = 0, dressCount_ = 0;
+    uint32_t dressPrepareYields_=0;
     std::unordered_map<uint64_t, RemotePlayer> remotes_;
     platform::psp::Pak charPak_;  // kept open: remote players load on demand
     rendering::psp::ItemBank items_;  // M10c: data/items.pak, kept open (equipment)
@@ -208,6 +229,9 @@ private:
     float shownZ_ = 0.0f;                     // drawn feet height, eased over steps
     bool camInit_ = false;
     bool rotating_ = false;
+    glm::vec3 collisionProbe_{};
+    uint8_t collisionWaitReason_ = 0;
+    uint32_t nextCollisionWaitLogMs_ = 0;
     uint32_t nextStatsMs_ = 0;
     bool moving_ = false;
     uint32_t moveFlags_ = 0;   // MovementFlags sent while moving (R: back / strafe)
@@ -237,6 +261,10 @@ private:
         std::unordered_map<uint32_t, uint32_t> areaParents, tileToZone, zoneIndex;
         std::unordered_map<uint32_t, std::array<uint16_t, 256>> grids;  // tileX * 100 + tileY
         const char* lastPlayed = nullptr;
+        std::vector<rendering::psp::AudioMusicRule> musicRules;
+        std::vector<uint16_t> musicTracks;
+        const rendering::psp::AudioMusicRule* musicRule(uint32_t areaId) const;
+        const char* authoredMusic(const rendering::psp::AudioMusicRule& rule, bool night);
         // world map levels: the area grid of the map we are on - data/minimap_<map>.pak "agrid"
         // (rendering::psp::AreaGridView, validated at load; ~60 KB for a continent). audio.pak's "a_<x>_<y>"
         // grids above are map 0's (psp_audio_conv --map <map 0>): read only on map 0 and only without it.
@@ -252,22 +280,27 @@ private:
         const char* randomMusic(uint32_t zoneId);
     };
     ZoneMusic zoneMusic_;
+    uint8_t deathAudioMode_=255;
+    float deathAudioRetry_=0.f;
     bool musicOk_ = false;
     uint32_t zoneId_ = 0, lastResolvedZone_ = 0;
     float musicCooldown_ = 0.0f;
+    uint32_t musicKey_ = 0xFFFFFFFFu;
+    bool musicWasPlaying_ = false;
+    uint32_t musicStartCount_ = 0;
     char pendingTrack_[256] = {};
     float pendingTrackSec_ = 0.0f;
     void initAudio();
     void updateAudio(float dtSec);
-    void playZoneMusic(const char* track);
+    bool playZoneMusic(const char* track);
     // Windows + cursor mode (ui_world_windows.cpp): SELECT toggles, like
     // upstream GamepadControls' pointer mode.
     enum : uint8_t { kWinMenu = 1, kWinDebug = 2 };
     bool uiMode_ = false;
     std::vector<uint8_t> windows_;   // open windows, last = top
     FocusRing winFocus_;
-    // PSP (owner): movable windows - R + stick drags the window under the
-    // cursor; the place of each window id is kept in wowee.cfg (winxy_<id>).
+    // Explicit Move action; Cross confirms, Circle cancels. Modifiers never
+    // move a window. Confirmed positions are kept in wowee.cfg (winxy_<id>).
     struct WinPos {
         float dx = 0.0f, dy = 0.0f;
     };
@@ -280,7 +313,18 @@ private:
     std::unordered_map<uint8_t, Rect> winRect_;  // last frame's drawn bounds (offset included)
     std::vector<uint8_t> winDrawn_;               // last frame's draw order, last = top
     uint8_t dragWin_ = 0;
-    float dragX_ = 0.0f, dragY_ = 0.0f;
+    bool dragShoulder_ = false;
+    struct PspMenuIcons {
+        platform::psp::Texture tex[14];bool tried=false;
+        void release(){if(!tried)return;for(auto& t:tex)platform::psp::textureRelease(t);tried=false;}
+        ~PspMenuIcons(){release();}
+    } pspMenuIcons_;
+    bool pspMenuDrawing_=false;
+    void loadPspMenuIcons();
+    WinPos dragOrigin_;
+    uint32_t dragReturnFocus_=0;
+    bool menuReturnSettings_=false;
+    uint8_t menuReturnWindow_=0;
     bool winPosLoaded_ = false;
     WinPos windowPos(uint8_t w);
     // PSP (owner: "I cannot keep two windows open - START closes the first"): START opens the game menu over
@@ -299,6 +343,16 @@ private:
     // "armed" rule: the SELECT/Circle hand must not click or walk).
     uint32_t suppress_ = 0;
     void setUiMode(bool on);
+    void toggleGameMenu();
+    uint8_t activeWindow() const;
+    void raiseWindow(uint8_t w);
+    uint32_t windowSwitchCount() const;
+    bool windowSwitchPad(const platform::psp::PadState& pad);
+    void cycleWindow(int direction);
+    bool windowBack(const platform::psp::PadState& pad);
+    bool windowManagementAction(uint32_t act);
+    void drawWindowAffordances(UiRenderer& ui);
+    void drawBagControlHints(UiRenderer& ui);
     bool windowOpen(uint8_t w) const;
     void openWindow(uint8_t w);
     void closeWindow(uint8_t w);
@@ -314,6 +368,7 @@ private:
     void updateSitting(const platform::psp::PadState& pad, float dtSec);    // wowee.cfg remotepredict (PSP remote-player prediction)
     bool airborne_ = false;
     float vz_ = 0.0f;
+    float fallStartZ_ = 0.0f;
     float jumpVelocity_ = 0.0f;
     uint32_t fallStartMs_ = 0;
     uint32_t dropLogs_ = 0;
@@ -323,6 +378,7 @@ private:
     bool modelsOn_ = true;
     bool fillTest_ = false;     // D-pad right: 1x1 scissor for the 3D pass (fill vs vertex bound)      // D-pad left: A/B test of the doodad cost on hardware
     uint32_t modelsCpuUs_ = 0;
+    uint32_t npcCpuUs_ = 0, crowdSyncCpuUs_ = 0, nextFrameCostLogMs_ = 0;
     SettingsMenu settings_;
     float remoteView_ = 120.0f;  // yd, other players drawn (wowee.cfg playerview)
     uint32_t terrainCpuUs_ = 0;  // CPU time of TerrainRenderer::draw  // CPU time of ModelRenderer::draw (culling + list building)
@@ -503,6 +559,8 @@ private:
     } spellDbLink_;
     SpellArt spellArt_;
     bool spellsInit_ = false;
+    int actionBarPage_ = 0;
+    uint32_t specialMeleeAnim_ = 0;
     int barPage_ = 0;             // 0..2: which 4 of the 12 main-bar buttons L + face buttons press
     uint32_t lCastMask_ = 0;      // face buttons pressed with L: not movement until released
     platform::psp::PadState spellPad_{};
@@ -516,6 +574,13 @@ private:
     std::vector<uint32_t> bookSpells_;
     uint32_t bookVersion_ = ~0u;
     int bookPage_ = 0;
+    ActionAssignment barAssign_;
+    FocusRing barAssignFocus_;
+    void beginSpellAssignment(uint32_t spell, uint32_t origin);
+    void cancelSpellAssignment();
+    void updateSpellAssignment(const platform::psp::PadState& pad, float dtSec);
+    void drawSpellAssignment(UiRenderer& ui);
+    bool castBookSpell(uint32_t id);
     uint32_t bookPick_ = 0;       // the spell on the cursor (PickupSpell / PickupAction), 0 = none
     // SpellBookFrame (ui_world_spellbook.cpp).
     struct SpellBookArt {
@@ -544,6 +609,9 @@ private:
     struct SpellFxUi;
     static void destroySpellFxUi(SpellFxUi* p);
     std::unique_ptr<SpellFxUi, void (*)(SpellFxUi*)> spellFx_{nullptr, nullptr};
+    int spellFxReal_ = -1;
+    void configureSpellFx(int mode, bool fancy);
+    uint32_t spellKitAnimation(uint32_t spell, int phase);
     int spellFxMode_ = -1;                                       // -1: wowee.cfg not read yet
     void spellFxEvents();                                        // updateSpells, after the cast animations
     void drawSpellFx(const rendering::psp::TerrainCamera& cam);  // draw, after the last 3D draw
@@ -554,8 +622,11 @@ private:
     struct FxWorldUi;
     static void destroyFxWorldUi(FxWorldUi* p);
     std::unique_ptr<FxWorldUi, void (*)(FxWorldUi*)> fxWorld_{nullptr, nullptr};
+    int fxWorldSettings_ = -1;
+    void configureWorldFx(bool particles, bool weather);
     int fxWorldState_ = 0;                                         // 0 not made yet, 1 on, -1 off
     void updateParticles(float dtSec);                             // update(): the game objects, the weather state
+    void updateEnvironmentAudio();
     void updateWeather(float dtSec);                               // from updateParticles (ui_world_weather.cpp)
     void drawParticles(const rendering::psp::TerrainCamera& cam);  // draw(): before the spell effects
     void drawWeather(const rendering::psp::TerrainCamera& cam);    // draw(): after the spell effects
@@ -597,6 +668,9 @@ private:
     std::unordered_map<uint32_t, uint32_t> reagentCount_;  // item -> count in the bags, per inventoryVersion
     uint32_t reagentInvVersion_ = ~0u;
     void loadMainMenuBarArt(platform::psp::Pak& pak, uint32_t& bytes);
+    // Optional replacement layout removed. Ignore obsolete uilayout config values.
+    static constexpr bool pspLayoutActive() { return false; }
+    Rect hudXpRect() const;
     Rect mmbButton(int i) const;  // ActionButton1..12 (MainMenuBar at 0.5)
     void updateXpView();
     void updateUseCtx();
@@ -614,6 +688,9 @@ private:
     void castMount();
     void drawModeHud(UiRenderer& ui);
     bool controlsInit_ = false, modeTextOn_ = true, camFollow_ = true;
+    ReverseStickTurn reverseStickTurn_;
+    bool camSmartFollow_ = true;
+    void updateFollowCamera(float dtSec);
     int controlsScheme_ = 2;
     bool combatMode_ = false;      // Combat mode: weapons drawn; else Travel mode
     bool modeManual_ = false;      // drawn by hand: stays until the next calm after a fight
@@ -656,6 +733,7 @@ private:
     LootArt lootArt_;
     platform::psp::ItemIconDb itemIcons_;
     bool itemIconsTried_ = false;
+    uint32_t nextItemIconsOpenMs_ = 0;
     UiArtRetry itemIconsRetry_;  // itemicons.pak there but not opened (memory / descriptor)
     int lootPage_ = 1;
     void loadLootArt();
@@ -663,13 +741,13 @@ private:
     // Loot (end)
     // Lighting (ui_world_lighting.cpp) - upstream LightingManager
     // over data/light.pak (Light.dbc bands by hour and zone), GE fog / tint /
-    // sky gradient / glow, the "Light" window (Debug -> Light).
+    // sky gradient / screen tint, the "Light" window (Debug -> Light).
     static constexpr uint8_t kWinLight = 0x70;
     struct LightingUi {
         rendering::psp::Lighting light;
-        // wowee.cfg: lighting sky fogbands lighttint glow timeofday lightgain
+        // wowee.cfg: lighting sky fogbands lighttint timeofday lightgain
         // fogstrength lightzero lightdefault timeadvance light2x
-        int on = 1, sky = 1, fogBands = 1, tint = 1, glow = 0, timeOfDay = -1, gain = 100, fogStrength = 40;
+        int on = 1, sky = 1, fogBands = 1, tint = 1, timeOfDay = -1, gain = 100, fogStrength = 40;
         int zero = 1, mapDefault = 1, advance = 1, twoX = 0;
         int moon = 60;  // Moonlight, % of the night diffuse (was 100 = |z|)
         float hours = 12.0f, tintLevel = 1.0f;
@@ -702,6 +780,7 @@ private:
     StepSurface sfxSurface_ = StepSurface::Stone;
     glm::vec3 sfxSurfacePos_{0.0f};
     float sfxSurfaceTimer_ = 999.0f;
+    glm::vec3 sfxStepPos_{0.f};
     void initSounds();
     void updateSounds(float dtSec);
     StepSurface soundSurface(float dtSec);
@@ -746,6 +825,8 @@ private:
         std::vector<std::string> wrapLines[6];
     };
     NpcUi npc_;
+    rendering::psp::MarkerVisibilityCache npcHudVisibility_;
+    std::array<NpcFrameLayout,4> npcLayouts_;
     // The original GossipFrame / QuestFrame (ui_world_npc_frame.cpp).
     enum : uint8_t {
         kNpcIconGossip = 0, kNpcIconAvailable = 11, kNpcIconActive, kNpcIconIncomplete, kNpcIconDaily,
@@ -761,10 +842,12 @@ private:
         void release(bool all);
         ~NpcArt();
     };
+    uint64_t npcVoiceGuid_=0;uint32_t npcVoiceAtMs_=0;bool npcVoiceSeenWindow_=false;
     NpcArt npcArt_;
     void loadNpcArt(bool frame = true);  // False = only the small art (buttons, coins, close)
     bool drawNpcFrame(UiRenderer& ui, uint8_t w);
-    void drawPanelButton(UiRenderer& ui, uint32_t id, const Rect& r, const char* label, bool enabled, bool top);
+    void drawPanelButton(UiRenderer& ui, uint32_t id, const Rect& r, const char* label, bool enabled, bool top,
+                         float measuredWidth=-1.f);
     // MerchantFrame (ui_world_merchant.cpp) - the merchant / buyback tabs, pages, repair,
     // selling from the bags (ui_world_inventory.cpp), the backpack opened with it as the original.
     struct MerchantUi {
@@ -806,6 +889,8 @@ private:
     };
     QuestLogUi qlog_;
     // WatchFrame (ui_world_watch.cpp) - the tracked quests under the minimap, collapsible.
+    bool watchPspLayout_=false;
+    size_t watchPage_=0,watchPageCount_=1;
     bool watchInit_ = false, watchCollapsed_ = false;
     std::vector<uint32_t> watchOff_;  // quests taken off the tracker (QuestLogFrameTrackButton)
     platform::psp::Texture watchBtn_;
@@ -813,7 +898,11 @@ private:
         std::string text;
         bool header, dash;
         float y;
+        uint32_t color = 0xFFFFFFFFu;
     };
+    struct WatchQuest { uint32_t id; float y, h; };
+    std::vector<WatchQuest> watchQuests_;
+    uint32_t watchHidden_ = 0;
     std::vector<WatchRow> watchRows_;
     uint32_t watchRebuildMs_ = 0;
     bool questWatched(uint32_t questId) const;
@@ -841,15 +930,29 @@ private:
     uint32_t reactionColor(uint64_t guid) const;
     // PSP (owner: "you cannot tell whom you selected"): the client's
     // selection circle on the ground under the target, in its reaction colour.
+    uint32_t shadowNextMs_=0;float shadowFloor_=-1e30f;
+    void drawPlayerShadow(const rendering::psp::TerrainCamera& cam);
     void drawSelectionCircle(const rendering::psp::TerrainCamera& cam);
     void drawTargetOutline(const rendering::psp::TerrainCamera& cam);
     uint32_t selectionColor(uint64_t guid) const;                       // the circle's / rim's colour
     // The target's 3D portrait (CreatureRenderer::drawPortrait) in
-    // the last 8 KB of a VRAM block reserved at the top with the glow's.
+    // the last 8 KB of a VRAM block reserved at the top for portraits.
+    uint32_t ownPortraitVram_ = 0, ownPortraitRevision_ = 0;
+    platform::psp::Texture ownPortraitTex_;
+    bool ownPortraitOk_ = false;
+    uint64_t ownPortraitGuid_ = 0;
+    void renderOwnPortrait(const rendering::psp::TerrainCamera& cam);
+    bool renderCharacterHead(rendering::psp::CharacterModel& model, uint32_t vram, const rendering::psp::TerrainCamera& cam);
+    const platform::psp::Texture& ownPortrait(int race,int sex) const {
+        return ownPortraitOk_ ? ownPortraitTex_ : ufArt_.portrait[race>0 && race<12 ? race : 0][sex==1 ? 1 : 0];
+    }
     uint32_t portraitVram_ = 0;
     platform::psp::Texture portraitTex_;
     uint64_t portraitGuid_ = 0;
     bool portraitOk_ = false;
+    void drawLogoutCountdown(UiRenderer& ui);
+    FocusRing logoutFocus_;
+    bool logoutWasPending_ = false;
     void initPortrait();
     void renderPortrait(const rendering::psp::TerrainCamera& cam);
     // The CharacterModelFrame - our model in a 128 x 128 VRAM target below the portrait's.
@@ -858,6 +961,7 @@ private:
     bool pdModelOk_ = false;
     void renderPaperDollModel(const rendering::psp::TerrainCamera& cam);
     const platform::psp::Texture* portraitOf(uint64_t guid) const {
+        if (guid==session_.playerGuid() && ownPortraitGuid_==guid && ownPortraitOk_) return &ownPortraitTex_;
         return portraitOk_ && guid != 0 && guid == portraitGuid_ ? &portraitTex_ : nullptr;
     }
     platform::psp::Texture selCircle_;
@@ -935,7 +1039,7 @@ private:
     void applyOwnLoadout();
     bool inventoryActivateSlot(uint32_t id);
     bool inventoryAltAction(uint32_t id);  // Circle = the right click
-    void inventoryPickPut(uint32_t id);    // Cross / Square = the left click
+    void inventoryPickPut(uint32_t id);    // Cross = move; Circle = use; Square = delete
     bool inventoryIdToWire(uint32_t id, uint8_t& bag, uint8_t& slot) const;
     const game::ItemDef* inventoryItemAt(uint32_t id) const;
     void drawItemSlot(UiRenderer& ui, uint32_t id, const Rect& r, const game::ItemDef* item, const char* emptyLabel,
@@ -968,16 +1072,20 @@ private:
     static constexpr uint32_t kIdBagSlot0 = 0x6C00, kIdBagClose0 = 0x6CF0;
     struct BagArt {
         platform::psp::Texture backpack, comps, backpackBtn, emptyBag;
-        bool tried = false;
+        bool tried = false, barTried = false;
         UiArtRetry artRetry;
         void release();
         ~BagArt();
     };
     BagArt bagArt_;
+    bool lootPoseActive_=false;
     bool bagOpen_[5] = {};          // ContainerFrame shown: backpack, worn bags 1..4
     void openBags(bool all);        // OpenAllBags / OpenBackpack
     void loadBagArt();
     void drawContainerFrames(UiRenderer& ui, bool focusable);
+    void drawBagBar(UiRenderer& ui, bool focusable);
+    void closeBag(int container);
+    bool closeFocusedBag();
     static bool bagSlotId(uint32_t id, int& container, int& slot);
     // CharacterFrame + PaperDollFrame (ui_world_paperdoll.cpp): the frame, the 19 slots with the
     // empty-slot art, the model (rendered into VRAM like the NPC portraits), the level line, the two stat
@@ -1169,6 +1277,7 @@ private:
     void tutorialShow(uint32_t id);
     void tutorialAlertClick();
     void tutorialHidden(bool showNext);
+    bool tutorialPad(const platform::psp::PadState& pad);
     // Map - minimap (HUD, own GE pass "minimap") and the world map window
     // (Menu -> Map) over data/minimap_<map>.pak (ui_world_minimap.cpp, ui_world_map.cpp,
     // include/ui/psp/ui_world_map.hpp). Last member: its tile reader thread stops first.
@@ -1210,6 +1319,7 @@ private:
     static constexpr float kDialogScale = 0.8f;  // tools/psp/build_ui_pak.py POPUP_S
     static constexpr uint8_t kWinQuestAbandon = 0x5E;  // StaticPopup ABANDON_QUEST (over the quest log)
     struct StaticPopup {
+        FocusRing* focus = nullptr; // null uses the normal window focus ring
         const char* text = "";           // formatted (SetFormattedText), wrapped to 290 units
         const char* button1 = nullptr;   // null: no button 1
         uint32_t button1Id = 0;
@@ -1254,7 +1364,7 @@ private:
     bool drawMinimapWindow(UiRenderer& ui, uint8_t w);   // the tracking dropdown
     void drawMinimapTooltip(UiRenderer& ui);             // after the windows
     void drawMinimapCluster(UiRenderer& ui);             // drawMinimap: the cluster's art and buttons
-    void refreshMinimapBlips();                          // drawMinimap: the blip list (every 8 frames)
+    void refreshMinimapBlips();                          // drawMinimap: 100ms snapshots, live player arrow
     void refreshMinimapCluster();                        // drawMinimap: zone text / PvP type, tracking, clock
     // minimap (end)
 
@@ -1444,6 +1554,8 @@ private:
     struct DeleteItemState {
         uint8_t bag = 0xFF, slot = 0;  // wire position of the item the popup names
         uint32_t itemId = 0;
+        uint64_t itemGuid = 0;
+        uint32_t stackCount = 0;
         std::string name;
         std::string typed;             // DELETE_GOOD_ITEM's edit box
         bool good = false;             // quality >= 3: the confirm string is asked for
@@ -1453,6 +1565,7 @@ private:
         bool alertTried = false;
     };
     DeleteItemState del_;
+    bool beginDeleteItem(uint8_t bag, uint8_t slot);
     const game::ItemDef* itemAtWire(uint8_t bag, uint8_t slot) const;
     bool deleteItemPad(const platform::psp::PadState& pad);  // the held item put down on the world
     bool drawDeleteItemPopup(UiRenderer& ui, uint8_t w);
@@ -1677,8 +1790,9 @@ private:
     void drawTransports(const rendering::psp::TerrainCamera& cam, uint32_t fogABGR);  // with the game objects
     bool transportCarry(float dtSec);    // updateMovement's start: carried along; true = hold still (map change)
     void transportAfterMove();           // updateMovement's end: boarding / leaving, the place in the frame
-    bool transportFloor(float x, float y, float maxZ, float& z) const;   // floorAt: a deck, a lift's floor
+    bool transportFloor(float x, float y, float maxZ, float& z, uint64_t* owner = nullptr) const;
     void transportWalls(glm::vec3& to, float feetZ) const;               // the hulls' walls
+    bool transportCollisionReady(float x,float y,float z) const;
     float transportCameraRay(const glm::vec3& origin, const glm::vec3& dir, float maxDist) const;
     bool transportOwns(uint64_t guid, uint32_t displayId);               // updateGameObjects leaves it to us
     bool transportRiding() const;

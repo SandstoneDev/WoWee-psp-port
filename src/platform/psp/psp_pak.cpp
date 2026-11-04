@@ -8,6 +8,7 @@
 #include <psputils.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -21,6 +22,7 @@ namespace {
 uint32_t g_pakReads = 0;  // pakReadCount()
 PakReadTick g_readTick = nullptr;  // pakSetReadTick
 void* g_readTickUser = nullptr;
+std::atomic<SceUID> g_readTickThread{-1};
 
 struct PakHeader {
     char magic[4];
@@ -66,16 +68,20 @@ bool pakRead(int fd, uint32_t offset, void* dst, uint32_t size) {
         if (!ok) return false;
         got += want;
     }
-    if (PakReadTick tick = g_readTick) tick(g_readTickUser);
+    // Loading-screen hooks can send network packets and touch UI state. Only
+    // the thread which registered the hook may invoke it; workers only read.
+    if(g_readTickThread.load(std::memory_order_acquire)==sceKernelGetThreadId())
+        if (PakReadTick tick = g_readTick) tick(g_readTickUser);
     return true;
 }
 
 void pakSetReadTick(PakReadTick fn, void* user) {
-    // Another thread may be inside pakRead with the old function: the user pointer stays when clearing.
+    g_readTickThread.store(-1,std::memory_order_release);
     g_readTick = nullptr;
     if (!fn) return;
     g_readTickUser = user;
     g_readTick = fn;
+    g_readTickThread.store(sceKernelGetThreadId(),std::memory_order_release);
 }
 
 namespace {

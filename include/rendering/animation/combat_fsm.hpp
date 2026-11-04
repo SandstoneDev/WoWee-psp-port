@@ -76,6 +76,7 @@ public:
     // ── Spell cast management ───────────────────────────────────────────
     void startSpellCast(uint32_t precast, uint32_t cast, bool castLoop, uint32_t finalize);
     void stopSpellCast();
+    void cancelSpellCast();
     void clearSpellState();
 
     // ── Hit/stun management ─────────────────────────────────────────────

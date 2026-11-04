@@ -47,7 +47,7 @@ public:
 
     // Reads the TOC, "entries" and the "g_<mapId>_*" grids, closes the pak,
     // starts the loader thread. False when the pak is missing or bad.
-    bool open(const char* absPath, uint32_t budgetKb, uint32_t mapId);
+    bool open(const char* absPath, uint32_t budgetKb, uint32_t mapId, bool audio = true);
     void close();
     bool isOpen() const { return open_; }
 
@@ -61,7 +61,9 @@ public:
     // Plays clip `index` on a free (or the quietest) voice: gain 0..1, pan
     // -1..1, pitch = playback rate factor (upstream's pitch variation).
     // Returns false when it could not be started or queued.
-    bool play(int index, float gain, float pan, float pitch);
+    bool play(int index, float gain, float pan, float pitch, uint32_t tag = 0, bool loop = false);
+    void cancelTag(uint32_t tag);
+    void ambience(int channel,int index,float gain); // channel 0 zone, 1 weather
     // Loads the clip ahead (no sound).
     void prefetch(int index);
     // Main thread, once per frame: finished loads, late plays, eviction.
@@ -95,18 +97,23 @@ private:
         int index = -1;
         float gain = 0, pan = 0, pitch = 1;
         uint32_t deadlineMs = 0;
+        uint32_t tag = 0;
+        bool loop = false;
     };
     bool request(int index);
-    bool start(Clip& c, float gain, float pan, float pitch, uint32_t nowMs);
+    bool start(Clip& c, float gain, float pan, float pitch, uint32_t nowMs, uint32_t tag, bool loop);
     void evict(uint32_t nowMs);
     static int loaderMain(unsigned int args, void* argp);
     int loaderLoop();
 
+    struct AmbienceLoop { int index=-1, voice=-1; };
+    AmbienceLoop ambience_[2];
     bool open_ = false;
     char paths_[kMaxPaks][128] = {};
     int paks_ = 0;
     std::vector<Clip> clips_;            // sorted by hash
-    std::unordered_map<uint32_t, uint32_t> gridOffsets_;  // tileX * 100 + tileY -> offset in sounds.pak
+    struct GridEntry { uint32_t offset, size; };
+    std::unordered_map<uint32_t, GridEntry> gridOffsets_;  // tileX * 100 + tileY -> offset in sounds.pak
     static constexpr int kGridCache = 6;  // the player's tile and its neighbours (a corner touches 4)
     struct GridSlot {
         uint32_t key = ~0u;

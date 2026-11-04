@@ -2,9 +2,12 @@
 #include "platform/psp/psp_sound_bank.hpp"
 
 #include "platform/psp/psp_audio.hpp"
+#include "platform/psp/psp_audio_io.hpp"
+#include "platform/psp/psp_bigheap.hpp"
 #include "platform/psp/psp_log.hpp"
 #include "platform/psp/psp_pak.hpp"
 #include "rendering/psp/psp_sound_format.hpp"
+#include "rendering/psp/psp_water_format.hpp"
 
 #include <pspiofilemgr.h>
 #include <pspkernel.h>
@@ -27,7 +30,7 @@ constexpr uint32_t kBusyMarginMs = 150;  // a mixer block is ~23 ms; stolen voic
 
 SoundBank::~SoundBank() { close(); }
 
-bool SoundBank::open(const char* absPath, uint32_t budget, uint32_t mapId) {
+bool SoundBank::open(const char* absPath, uint32_t budget, uint32_t mapId, bool audio) {
     close();
     const uint64_t t0 = sceKernelGetSystemTimeWide();
     budgetKb = budget;
@@ -55,7 +58,7 @@ bool SoundBank::open(const char* absPath, uint32_t budget, uint32_t mapId) {
         for (uint32_t i = 0; i < pak.count(); ++i) {
             const PakEntry* e = pak.entry(i);
             unsigned h = 0;
-            if (e->name[0] == 's' && e->name[1] == '_' && std::sscanf(e->name + 2, "%8x", &h) == 1 &&
+            if (audio && e->name[0] == 's' && e->name[1] == '_' && std::sscanf(e->name + 2, "%8x", &h) == 1 &&
                 e->size > sizeof(fmt::SoundClipHeader)) {
                 Clip c;
                 c.hash = h;
@@ -64,15 +67,15 @@ bool SoundBank::open(const char* absPath, uint32_t budget, uint32_t mapId) {
                 c.pak = static_cast<uint8_t>(k);
                 clips_.push_back(c);
                 dataBytes += e->size;
-            } else if (k == 0 && std::strcmp(e->name, "entries") == 0 && e->size >= sizeof(fmt::SoundEntriesHeader)) {
+            } else if (audio && k == 0 && std::strcmp(e->name, "entries") == 0 && e->size >= sizeof(fmt::SoundEntriesHeader)) {
                 entries_ = pak.load(e);
                 entriesSize_ = entries_ ? e->size : 0;
             } else if (k == 0 && std::strncmp(e->name, gridPrefix, static_cast<size_t>(gp)) == 0 &&
-                       e->size >= fmt::kSurfaceGridBytes) {
+                       e->size >= fmt::kSurfaceGridBytes && e->size <= fmt::kMaxSurfaceBytes) {
                 int x = 0, y = 0;
                 if (std::sscanf(e->name + gp, "%d_%d", &x, &y) != 2) continue;
                 // PSP: only where it is - read when a tile is first asked for (surfaceGrid)
-                gridOffsets_[static_cast<uint32_t>(x * 100 + y)] = e->offset;
+                gridOffsets_[static_cast<uint32_t>(x * 100 + y)] = {e->offset, e->size};
             }
         }
         pak.close();  // card open-file limit: no descriptor kept (the loader reopens on demand)
@@ -85,13 +88,14 @@ bool SoundBank::open(const char* absPath, uint32_t budget, uint32_t mapId) {
              static_cast<unsigned>(entriesSize_ / 1024u), static_cast<unsigned>(gridOffsets_.size()),
              static_cast<unsigned>((sceKernelGetSystemTimeWide() - t0) / 1000u));
     if (clips_.empty()) {
+        if (!gridOffsets_.empty()) { open_ = true; return true; } // surface data with sfx=0
         close();
         return false;
     }
     sema_ = sceKernelCreateSema("wowee_sfxreq", 0, 0, kRing, nullptr);
     running_ = true;
     // Below the main thread (0x20), the tile streamer (streamprio 40) and the
-    // MP3 decoder (0x30): a clip read never delays a frame or the music.
+    // MP3 decoder (0x18): a clip read never delays a frame or the music.
     thread_ = sceKernelCreateThread("wowee_sfxload", &SoundBank::loaderMain, 0x31, 8 * 1024, PSP_THREAD_ATTR_USER,
                                     nullptr);
     if (sema_ < 0 || thread_ < 0) {
@@ -108,6 +112,7 @@ bool SoundBank::open(const char* absPath, uint32_t budget, uint32_t mapId) {
 }
 
 void SoundBank::close() {
+    ambience_[0]=AmbienceLoop{}; ambience_[1]=AmbienceLoop{};
     if (thread_ >= 0) {
         running_ = false;
         if (sema_ >= 0) sceKernelSignalSema(sema_, 1);
@@ -180,12 +185,13 @@ const uint8_t* SoundBank::surfaceGrid(int tileX, int tileY) const {
     s.lastUse = gridTick_;
     s.ok = false;
     s.failMs = nowMs;
-    s.data.resize(fmt::kSurfaceGridBytes);
+    if (s.data.capacity() < it->second.size && !heapRoomFor(it->second.size, 256u)) return nullptr;
+    s.data.resize(it->second.size);
     const SceUID fd = sceIoOpen(paths_[0], PSP_O_RDONLY, 0);
     if (fd >= 0) {
-        if (sceIoLseek32(fd, static_cast<int>(it->second), PSP_SEEK_SET) == static_cast<int>(it->second))
-            s.ok = sceIoRead(fd, s.data.data(), fmt::kSurfaceGridBytes) == static_cast<int>(fmt::kSurfaceGridBytes) &&
-                   std::memcmp(s.data.data(), "WSRF", 4) == 0;
+        if (sceIoLseek32(fd, static_cast<int>(it->second.offset), PSP_SEEK_SET) == static_cast<int>(it->second.offset))
+            s.ok = sceIoRead(fd, s.data.data(), it->second.size) == static_cast<int>(it->second.size) &&
+                   fmt::surfaceGridValid(s.data.data(), it->second.size);
         sceIoClose(fd);
     }
     ++gridReads_;
@@ -213,13 +219,13 @@ void SoundBank::prefetch(int index) {
     if (open_ && index >= 0 && static_cast<size_t>(index) < clips_.size()) request(index);
 }
 
-bool SoundBank::start(Clip& c, float gain, float pan, float pitch, uint32_t nowMs) {
+bool SoundBank::start(Clip& c, float gain, float pan, float pitch, uint32_t nowMs, uint32_t tag, bool loop) {
     const auto* h = static_cast<const fmt::SoundClipHeader*>(c.block);
     const auto* pcm = reinterpret_cast<const int16_t*>(h + 1);
     const float p = pitch > 0.25f && pitch < 4.0f ? pitch : 1.0f;
     const uint32_t rate = static_cast<uint32_t>(static_cast<float>(h->rate) * p);
     c.lastUsedMs = nowMs;
-    const int voice = sfxPlay(pcm, h->frames, h->channels, rate, gain, pan, false);
+    const int voice = sfxPlay(pcm, h->frames, h->channels, rate, gain, pan, loop, tag);
     if (voice < 0) {
         ++stats_.drops;
         return false;
@@ -230,11 +236,12 @@ bool SoundBank::start(Clip& c, float gain, float pan, float pitch, uint32_t nowM
     return true;
 }
 
-bool SoundBank::play(int index, float gain, float pan, float pitch) {
+bool SoundBank::play(int index, float gain, float pan, float pitch, uint32_t tag, bool loop) {
     if (!open_ || index < 0 || static_cast<size_t>(index) >= clips_.size()) return false;
+    if(loop && !tag)return false; // sustained voices must have a cancellation owner
     Clip& c = clips_[static_cast<size_t>(index)];
     const uint32_t now = logUptimeMs();
-    if (c.state == 2) return start(c, gain, pan, pitch, now);
+    if (c.state == 2) return start(c, gain, pan, pitch, now, tag, loop);
     if (c.state == 3 || !request(index)) {
         ++stats_.drops;
         return false;
@@ -251,8 +258,32 @@ bool SoundBank::play(int index, float gain, float pan, float pitch) {
         ++stats_.drops;
         return false;
     }
-    *slot = Late{index, gain, pan, pitch, now + lateMs};
+    *slot = Late{index, gain, pan, pitch, now + lateMs, tag, loop};
     return true;
+}
+
+void SoundBank::ambience(int channel,int index,float gain) {
+    if (channel<0 || channel>1 || !open_) return;
+    auto& loop=ambience_[channel];
+    const uint32_t tag=0x414D4200u+static_cast<uint32_t>(channel);
+    if (gain<=0 || index<0 || static_cast<size_t>(index)>=clips_.size()) index=-1;
+    if (index!=loop.index) {
+        cancelTag(tag);
+        if (loop.index>=0) clips_[loop.index].busyUntilMs=std::max(clips_[loop.index].busyUntilMs,logUptimeMs()+200u);
+        loop=AmbienceLoop{index,-1};
+    }
+    if (index<0) return;
+    auto& clip=clips_[index];
+    if (clip.state!=2) { request(index); return; }
+    if (loop.voice>=0 && sfxPlayingTag(loop.voice,tag)) { sfxSetGain(loop.voice,gain,0); return; }
+    const auto* h=static_cast<const fmt::SoundClipHeader*>(clip.block);
+    loop.voice=sfxPlay(reinterpret_cast<const int16_t*>(h+1),h->frames,h->channels,h->rate,gain,0,true,tag);
+}
+
+void SoundBank::cancelTag(uint32_t tag) {
+    if (!tag) return;
+    for (auto& late : late_) if (late.tag==tag) late.index=-1;
+    sfxStopTag(tag);
 }
 
 void SoundBank::update() {
@@ -293,7 +324,7 @@ void SoundBank::update() {
         if (l.index < 0) continue;
         Clip& c = clips_[static_cast<size_t>(l.index)];
         if (c.state == 2) {
-            if (start(c, l.gain, l.pan, l.pitch, now)) ++stats_.latePlays;
+            if (start(c, l.gain, l.pan, l.pitch, now, l.tag, l.loop)) ++stats_.latePlays;
             l.index = -1;
         } else if (c.state != 1 || static_cast<int32_t>(now - l.deadlineMs) > 0) {
             ++stats_.drops;
@@ -313,7 +344,10 @@ void SoundBank::evict(uint32_t now) {
     while (residentBytes_ > budget) {
         Clip* oldest = nullptr;
         for (Clip& c : clips_) {
-            if (c.state != 2 || static_cast<int32_t>(now - c.busyUntilMs) < 0) continue;
+            if (c.state != 2 || static_cast<int32_t>(now - c.busyUntilMs) < 0 ||
+                (&c==((ambience_[0].index>=0) ? &clips_[ambience_[0].index] : nullptr)) ||
+                (&c==((ambience_[1].index>=0) ? &clips_[ambience_[1].index] : nullptr))) continue;
+            if (sfxUsesPcm(reinterpret_cast<const int16_t*>(static_cast<const fmt::SoundClipHeader*>(c.block)+1))) continue;
             if (!oldest || static_cast<int32_t>(c.lastUsedMs - oldest->lastUsedMs) < 0) oldest = &c;
         }
         if (!oldest) break;  // everything resident is playing: over budget until they end
@@ -353,7 +387,7 @@ int SoundBank::loaderLoop() {
                 fd = -1;
             }
             if (fd < 0 && valid) {
-                fd = sceIoOpen(paths_[part], PSP_O_RDONLY, 0);
+                fd = audioOpenRead(paths_[part]);
                 fdPak = part;
                 if (fd < 0) {
                     if (static_cast<unsigned>(fd) == 0x80020320u) pakFdRelieve(1);  // MFILE

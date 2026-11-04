@@ -998,7 +998,7 @@ void WorldScreen::drawTalents(UiRenderer& ui, bool top) {
         const Rect pr = FR(7, 6, 60, 60);
         const game::Character* me = session_.activeCharacter();
         const int race = me ? static_cast<int>(me->race) : 0, sex = me && me->gender == game::Gender::FEMALE ? 1 : 0;
-        if (race > 0 && race < 12 && ufArt_.portrait[race][sex].pixels) ui.image(ufArt_.portrait[race][sex], pr);
+        if (race > 0 && race < 12 && ownPortrait(race,sex).pixels) ui.image(ownPortrait(race,sex), pr);
         else ui.fill(Rect{pr.x + 2, pr.y + 2, pr.w - 4, pr.h - 4}, 0xFF101010u);
     }
     if (trArt_.talFrame.pixels) ui.image(trArt_.talFrame, Rect{kOx, kOy, kTalW, kTalH});

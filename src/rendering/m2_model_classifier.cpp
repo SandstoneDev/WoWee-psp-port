@@ -227,7 +227,7 @@ M2ClassificationResult classifyM2Model(
     // Simple single-token flags
     // ---------------------------------------------------------------
     r.isInvisibleTrap = has(n, "invisibletrap");
-    r.isGroundDetail  = has(fullPath, "\\nodxt\\detail\\") || has(fullPath, "\\detail\\");
+    r.isGroundDetail  = has(fullPath, "\\detail\\") || has(fullPath, "/detail/");
     // A model under PARTICLEEMITTERS\ is pure VFX - the 61 models there are
     // auras, wisps and splashes, and not one of them is a physical object.
     // kEffectTokens already carries "particleemitter", but tokens are matched

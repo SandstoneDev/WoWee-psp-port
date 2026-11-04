@@ -39,9 +39,12 @@
 //   of its model, for the nearest maxEquipped NPCs within equipDistance; the cape (texture baked into the
 //   display) on its cape batches.
 #pragma once
+#include "rendering/psp/psp_npc_batch_plan.hpp"
+#include "rendering/psp/psp_npc_priority.hpp"
 
 #include "platform/psp/psp_pak.hpp"
 #include "platform/psp/psp_pak_index.hpp"  // creature displays
+#include "platform/psp/psp_npc_asset_loader.hpp"
 #include "platform/psp/psp_texture.hpp"
 #include "rendering/psp/psp_model_format.hpp"
 #include "rendering/psp/psp_skinned.hpp"  // Creature anim
@@ -77,7 +80,7 @@ struct CreatureUnit {
     uint32_t emoteAnim = 0;      // UNIT_NPC_EMOTESTATE through Emotes.dbc (a looping state), 0 = none
     float speed = 0.0f;          // walk/run - spline ground speed, yd/s (0 = unknown)
     // Mounts. A mount under a player (WorldScreen, ui_world_mount.cpp):
-    // kept before other units when maxDrawn cuts the list.
+    // Remote mounts use ordinary viewport/distance priority; the controlled body uses driven.
     bool mount = false;
     // The own mount: its animation is the caller's (upstream MountFSM through
     // playDriven / animationState), it is posed every frame (outside npcposes)
@@ -169,6 +172,7 @@ public:
     uint32_t releaseUnused(uint32_t idleFrames);
     void setUnits(const CreatureUnit* units, size_t count);
     size_t unitCount() const { return units_.size(); }
+    void setLoadingScreen(bool on) {loadingScreen_=on;}
 
     // Loads what the nearest maxDrawn units within viewDistance of t need,
     // with no per-frame budget (world entry, behind a loading screen), so the
@@ -185,6 +189,13 @@ public:
     void draw(const TerrainCamera& cam, uint32_t fogColorABGR);
     const CreatureStats& stats() const { return stats_; }
 
+    float performanceScale = 1.f;
+    float performanceLodScale = 1.f; // mesh detail adapts independently of NPC visibility/range
+    uint32_t performancePoses = 0; // 0: configured pose budget
+    uint32_t performanceMax = 64;
+    bool keepViewportNpcs = false; // adaptive mode: visible NPCs bypass draw-count caps
+    uint64_t importantGuid = 0; // keep target metadata/portrait without displacing visible neighbors
+    void setPriorityOrigin(const glm::vec3& origin) { priorityOrigin_=origin; priorityOriginKnown_=true; }
     float viewDistance = 70.0f;     // yards, plus the unit's radius
     float lodDistance = 18.0f;      // LOD 1 (simplified / lower skin) beyond this
     uint32_t maxDrawn = 24;         // nearest units kept (an NPC is ~2.3k triangles near, ~1.1k far)
@@ -230,8 +241,8 @@ public:
     void update(float dtSec);
     void setAnimate(bool on);
     bool animate() const { return animate_; }
-    float animDistance = 45.0f;
-    uint32_t maxPoses = 12;  // pose evaluations per frame (0 = every due unit), longest-waiting first
+    float animDistance = 20.0f;
+    uint32_t maxPoses = 12;  // distant pose budget; near/important/unposed actors bypass it (0 = unlimited)
     uint32_t maxBoneUploads = 2000;  // sceGuBoneMatrix per frame (13 list words each); farther units skipped
     // Combat hooks (task B wires them to its events; no-ops for unknown guids
     // or units without an animated model; an unseen unit is ignored):
@@ -301,6 +312,11 @@ public:
     bool readRecord(const char* name, std::vector<uint8_t>& out);
 
 private:
+    struct InstallTimer;
+    void startAsync(const char* path);
+    std::unique_ptr<platform::psp::NpcAssetLoader> async_;
+    bool asyncDrawing_=false,entryPending_=false,loadingScreen_=false;
+    uint32_t assetKey_=0,asyncCommits_=0,asyncInstallUs_=0,asyncInstallLimitUs_=2000,asyncNextLogMs_=0;
     struct Model {
         void* blob = nullptr;
         const ModelHeader* h = nullptr;
@@ -309,22 +325,27 @@ private:
         const ModelBatch* batches = nullptr;
         uint32_t bytes = 0;
         uint32_t lastUsed = 0;
+        uint32_t retryAtMs = 0;
         bool failed = false;
     };
     struct Tex {
         platform::psp::Texture t;
         uint32_t bytes = 0;
         uint32_t lastUsed = 0;
+        uint32_t retryAtMs = 0;
         bool loaded = false;
         bool failed = false;
     };
     struct Display {
         uint32_t id = 0;
         uint32_t lastUsed = 0;      // creature displays: frame (the pool evicts the least recent)
+        uint32_t retryAtMs = 0;
         bool loaded = false, failed = false;
+        bool scaleLogged = false;  // one bounded scale diagnostic after assets load
         bool texturesKnown = false; // `textures` filled (needs the model once)
         CreatureDisplayHeader h{};
         std::vector<uint8_t> active;
+        NpcBatchPlans batchPlans;
         std::vector<uint16_t> textures;  // "x_<n>" the shown batches need (model + slots)
         uint8_t skinMode = 0;       // 0 undecided, 1 skinned ("n_"), 2 static ("m_")
         bool hasEquip = false;      // creature displays: CreatureDisplayEquip read
@@ -362,6 +383,7 @@ private:
         bool hull = false;          // The outline pass (opaque batches, one colour)
         bool skipped = false;       // Over the frame's bone upload / list budget
         bool portraitOnly = false;  // Culled in the world, kept for the portrait
+        bool inViewport = false;
     };
     uint64_t portraitUnit_ = 0;     // setPortraitUnit
 
@@ -411,7 +433,10 @@ private:
     std::unordered_map<uint16_t, Tex> textures_;
     std::vector<Unit> units_;
     std::vector<Visible> visible_;
-    std::vector<std::pair<float, Unit*>> near_;  // creature displays: the frame's candidates, nearest first
+    struct Candidate { float cameraDistanceSq; Unit* unit; NpcPriority priority; };
+    std::vector<Candidate> near_;
+    glm::vec3 priorityOrigin_{0};
+    bool priorityOriginKnown_=false;
     std::vector<uint32_t> order_;
     uint32_t frame_ = 0;
     uint32_t memoryBytes_ = 0;

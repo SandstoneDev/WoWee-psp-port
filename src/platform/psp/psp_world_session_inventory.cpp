@@ -400,6 +400,7 @@ void WorldSession::handleInventoryChangeFailure(network::Packet& packet) {
     if (packet.getRemainingSize() < 1) return;
     const uint8_t error = packet.readUInt8();
     if (error == 0) return;
+    if(lootWindowOpen_ && lootRequests_.pending())lootRequests_.fail(logUptimeMs());
     uint32_t requiredLevel = 0;
     if (packet.hasRemaining(17)) {
         packet.readUInt64();
@@ -920,6 +921,7 @@ void WorldSession::rebuildOnlineInventory() {
         lastEquipDisplayIds_ = displayIds;
         ++equipmentVersion_;
     }
+    syncQuestItemCountsFromInventory();
     ++inventoryVersion_;
     fireBagUpdates();  // upstream: announced from here, once per rebuild
     // (upstream then reconciles "collect N" quest objectives from the bag

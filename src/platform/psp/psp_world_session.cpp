@@ -149,6 +149,11 @@ bool WorldSession::begin(const std::string& host, uint16_t port, const std::stri
 }
 
 void WorldSession::close() {
+    ownForcedMove_=false;ownForcedEntity_.reset();
+    lootRequests_.reset();
+    lootWindowOpen_=false;
+    pendingLootActive_=false;
+    serverSounds_.clear();
     wardenEnd();  // PSP
     if (socket_) socket_->disconnect();
     socket_.reset();
@@ -174,6 +179,10 @@ bool WorldSession::keepAlive() {
 void WorldSession::update() {
     if (!socket_) return;
     socket_->update();
+    if (logoutPending_ && nowUs()-logoutRequestedUs_ > 35ull*1000*1000) {
+        cancelLogout();
+        socialError(OWN_STR(LOGOUT_TIMEOUT));
+    }
     if (state_ != State::Failed && socket_ && !socket_->isConnected()) {
         fail(CLIENT_STR(GLUE_DISCONNECTED));
         return;
@@ -529,6 +538,7 @@ bool WorldSession::predictRemote(uint64_t guid, glm::vec3& pos, float& yaw, bool
 }
 
 void WorldSession::updateEntities(float dtSec) {
+    if(ownForcedMove_ && ownForcedEntity_)ownForcedEntity_->updateMovement(dtSec);
     for (const auto& [guid, e] : entities_.getEntities()) e->updateMovement(dtSec);
 }
 
@@ -571,6 +581,27 @@ void WorldSession::sendSetSheathed(uint8_t state) {
     network::Packet packet(game::wireOpcode(game::LogicalOpcode::CMSG_SET_SHEATHED));
     packet.writeUInt32(state);
     socket_->send(packet);
+}
+
+void WorldSession::requestLogout(bool exitGame) {
+    if (!socket_ || state_!=State::InWorld || logoutPending_) return;
+    logoutExitGame_=exitGame;
+    logoutInstant_=(selfField(game::fieldIndex(game::UF::PLAYER_FLAGS)) & 0x20u)!=0;
+    logoutPending_=true; logoutResponseReceived_=false; logoutRequestedUs_=nowUs();
+    PSP_LOGI(tag::Sys,"logout_request exit=%d resting=%d",exitGame?1:0,logoutInstant_?1:0);
+    socket_->send(game::LogoutRequestPacket::build());
+}
+
+uint32_t WorldSession::logoutSecondsRemaining() const {
+    if (!logoutPending_) return 0;
+    const uint64_t elapsed=nowUs()-logoutRequestedUs_;
+    return elapsed>=20000000ull ? 0u : static_cast<uint32_t>((20000000ull-elapsed+999999ull)/1000000ull);
+}
+
+void WorldSession::cancelLogout() {
+    if (!socket_ || !logoutPending_) return;
+    socket_->send(game::LogoutCancelPacket::build());
+    logoutPending_=false; logoutExitGame_=false; logoutInstant_=false; logoutResponseReceived_=false;
 }
 
 void WorldSession::enterWorld(uint64_t characterGuid) {
@@ -626,6 +657,27 @@ void WorldSession::onPacket(const network::Packet& packetIn) {
     if (handleChatPacket(*logical, packet)) return;  // chat (psp_world_session_chat.cpp)
     if (handleCombatPacket(*logical, packet)) return;  // combat
     if (handleTrainerPacket(*logical, packet)) return;  // trainers + talents (watches LEARNED_SPELL first)
+    if (*logical == game::LogicalOpcode::SMSG_LOGOUT_RESPONSE) {
+        game::LogoutResponseData response;
+        if (game::LogoutResponseParser::parse(packet,response)) {
+            if (response.result != 0) {
+                logoutPending_=false; logoutExitGame_=false; logoutInstant_=false; logoutResponseReceived_=false;
+                socialError(OWN_STR(LOGOUT_REFUSED));
+            } else if (logoutPending_) {
+                logoutInstant_=response.instant!=0; // the server has the final say (inn/city too)
+                logoutResponseReceived_=true;
+                PSP_LOGI(tag::Sys,"logout_response instant=%u exit=%d",static_cast<unsigned>(response.instant),logoutExitGame_?1:0);
+            }
+        }
+        return;
+    }
+    if (*logical == game::LogicalOpcode::SMSG_LOGOUT_CANCEL_ACK) { logoutPending_=false; logoutExitGame_=false; logoutInstant_=false; logoutResponseReceived_=false; return; }
+    if (*logical == game::LogicalOpcode::SMSG_LOGOUT_COMPLETE) {
+        logoutPending_=false; logoutResponseReceived_=false; logoutComplete_=true;
+        PSP_LOGI(tag::Sys,"logout_complete exit=%d",logoutExitGame_?1:0);
+        setState(State::Ready);
+        return;
+    }
     if (handleSpellPacket(*logical, packet)) return;   // spells (psp_world_session_spells.cpp)
     if (handleLootPacket(*logical, packet)) return;  // loot (psp_world_session_loot.cpp)
     if (handleNpcPacket(*logical, packet)) return;  // npc (psp_world_session_npc.cpp)

@@ -6,8 +6,8 @@
 // OnAccept = DeleteCursorItem (CMSG_DESTROYITEM, the whole stack), OnCancel / Escape = ClearCursor,
 // and the popup hides when the cursor no longer holds the item (OnUpdate).
 //
-// PSP: the cursor item is the Square pick-up (invHeld_); "put down on the world" = Cross or Square with the cursor
-// over no window and no button. The edit box opens the system keyboard (Cross); the confirm string is compared
+// PSP: Cross picks up items (invHeld_). Square on a carried item, or on the
+// world with a held item, opens confirmation. Cross opens the edit keyboard; the confirm string is compared
 // with the Cyrillic letters folded to upper case too, on both sides (PSP: the keyboard's case switch is awkward;
 // the client's strupper folds ASCII only); the keyboard offers Cyrillic when the running language's confirm string
 // has it, else Latin letters. The alert icon (showAlert): the auction code's StaticPopup::alert.
@@ -102,28 +102,61 @@ const game::ItemDef* WorldScreen::itemAtWire(uint8_t bag, uint8_t slot) const {
     return s && !s->empty() ? &s->item : nullptr;
 }
 
-// Cross / Square with the cursor over nothing (no window, no button) while an item is held: WorldFrame's click with
+// Square with the cursor over nothing (no window, no button) while an item is held: WorldFrame's click with
 // an item on the cursor -> DELETE_ITEM_CONFIRM. True = handled (the press is ours).
 bool WorldScreen::deleteItemPad(const pp::PadState& pad) {
-    if (!invHeld_.active || !(pad.pressed & (PSP_CTRL_CROSS | PSP_CTRL_SQUARE))) return false;
-    if (windowOpen(kWinDeleteItem) || winFocus_.focused() != 0) return false;
+    if (windowOpen(kWinDeleteItem)) return false;
+    // Square destroys the highlighted bag item without dragging it onto
+    // the world. The existing confirmation still owns the destructive action.
+    if ((pad.pressed & PSP_CTRL_SQUARE) && !(pad.held & PSP_CTRL_LTRIGGER) &&
+        (windowOpen(kWinBags) || windowOpen(kWinCharacter))) {
+        const uint32_t id = winFocus_.focused();
+        uint8_t bag = 0, slot = 0;
+        if (!inventoryIdToWire(id, bag, slot)) return false;
+        const bool carriedSlot =
+            (bag == game::slots::kNoContainer && slot >= game::slots::kBackpackFirst &&
+             slot < game::slots::kBackpackFirst + game::slots::kBackpackCount) ||
+            (bag >= game::slots::kWornBagFirst &&
+             bag < game::slots::kWornBagFirst + game::slots::kWornBagCount);
+        if (!carriedSlot) return false;
+        beginDeleteItem(bag, slot);
+        return true;
+    }
+    if (!invHeld_.active || !(pad.pressed & PSP_CTRL_SQUARE) || (pad.held & PSP_CTRL_LTRIGGER)) return false;
+    if (winFocus_.focused() != 0) return false;
     const float cx = winFocus_.cursorX(), cy = winFocus_.cursorY();
     for (const auto& [w, r] : winRect_)
         if (windowOpen(w) && cx >= r.x && cx < r.x + r.w && cy >= r.y && cy < r.y + r.h) return false;
-    const game::ItemDef* it = itemAtWire(invHeld_.bag, invHeld_.slot);
+    return beginDeleteItem(invHeld_.bag, invHeld_.slot);
+}
+
+bool WorldScreen::beginDeleteItem(uint8_t bag, uint8_t slot) {
+    if (bankMailItemLocked(bag, slot) || auctionItemLocked(bag, slot) || session_.tradeItemLocked(bag, slot))
+        return false;
+    if (invHeld_.active && (invHeld_.bag != bag || invHeld_.slot != slot)) return false;
+    const game::ItemDef* it = itemAtWire(bag, slot);
     if (!it) {
         invHeld_ = InvHeld{};
         return true;
     }
+    if (!it->guid) {
+        invStatus_ = OWN_STR(INV_ITEM_PENDING);
+        invStatusMs_ = pp::logUptimeMs();
+        return false;
+    }
     if (del_.alert.pixels) pp::textureRelease(del_.alert);
     del_ = DeleteItemState{};
-    del_.bag = invHeld_.bag;
-    del_.slot = invHeld_.slot;
+    invHeld_ = InvHeld{true, bag, slot};
+    del_.bag = bag;
+    del_.slot = slot;
     del_.itemId = it->itemId;
+    del_.itemGuid = it->guid;
+    del_.stackCount = it->stackCount;
     del_.name = it->name;
     del_.good = static_cast<int>(it->quality) >= 3;  // UIParent: arg2 >= 3 -> DELETE_GOOD_ITEM
     del_.open = true;
     openWindow(kWinDeleteItem);
+    winFocus_.setFocus(kIdDelNo);
     PSP_LOGI(pp::tag::Ctrl, "delete_confirm item=%u bag=%u slot=%u quality=%d good=%d", static_cast<unsigned>(del_.itemId),
              static_cast<unsigned>(del_.bag), static_cast<unsigned>(del_.slot), static_cast<int>(it->quality),
              del_.good ? 1 : 0);
@@ -135,6 +168,12 @@ bool WorldScreen::drawDeleteItemPopup(UiRenderer& ui, uint8_t w) {
     // OnUpdate: the cursor no longer holds that item -> the popup goes.
     if (!invHeld_.active || invHeld_.bag != del_.bag || invHeld_.slot != del_.slot) {
         closeWindow(kWinDeleteItem);
+        return true;
+    }
+    const game::ItemDef* current = itemAtWire(del_.bag, del_.slot);
+    if (!current || current->itemId != del_.itemId || current->guid != del_.itemGuid ||
+        current->stackCount != del_.stackCount) {
+        deleteItemAction(kIdDelNo);
         return true;
     }
     if (!del_.alertTried) {  // showAlert = 1 of DELETE_ITEM / _GOOD_ITEM
@@ -190,7 +229,9 @@ bool WorldScreen::deleteItemAction(uint32_t act) {
     if (act == kIdDelYes) {
         // DeleteCursorItem: the whole stack - only if that slot still holds the item the popup named.
         const game::ItemDef* it = itemAtWire(del_.bag, del_.slot);
-        if (it && it->itemId == del_.itemId && (!del_.good || confirmTyped(del_.typed))) {
+        if (it && it->itemId == del_.itemId && it->guid == del_.itemGuid && it->stackCount == del_.stackCount &&
+            !bankMailItemLocked(del_.bag, del_.slot) && !auctionItemLocked(del_.bag, del_.slot) &&
+            !session_.tradeItemLocked(del_.bag, del_.slot) && (!del_.good || confirmTyped(del_.typed))) {
             session_.destroyItem(del_.bag, del_.slot, 0);
             invStatus_ = OWN_FMT(INV_DESTROYED, del_.name);
             invStatusMs_ = pp::logUptimeMs();
@@ -232,6 +273,7 @@ bool WorldScreen::devDeleteItem(bool open, uint32_t itemId) {
             }
         }
     if (!it) return false;
+    if (!it->guid) return false;
     if (!uiMode_) setUiMode(true);
     invHeld_ = InvHeld{true, bag, slot};
     if (del_.alert.pixels) pp::textureRelease(del_.alert);
@@ -239,6 +281,8 @@ bool WorldScreen::devDeleteItem(bool open, uint32_t itemId) {
     del_.bag = bag;
     del_.slot = slot;
     del_.itemId = it->itemId;
+    del_.itemGuid = it->guid;
+    del_.stackCount = it->stackCount;
     del_.name = it->name;
     del_.good = static_cast<int>(it->quality) >= 3;
     del_.open = true;

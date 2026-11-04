@@ -139,11 +139,16 @@ void WorldScreen::updateLoot(float dtSec) {
     session_.updateLoot(dtSec, lootDespawn_);
     if (itemIconsTried_) itemIcons_.tick(pp::logUptimeMs());  // close the pak when idle
     const bool open = session_.isLootWindowOpen();
+    const bool pose=open && !session_.isCasting();
+    if(pose!=lootPoseActive_) {
+        lootPoseActive_=pose;
+        if(pose)animator_.startLooting();else animator_.stopLooting();
+    }
     const uint64_t guid = open ? session_.getLootGuid() : 0;
     // A new loot: its window on top, the cursor up (like the release window).
     // PSP: auto-loot opens no window (upstream fires LOOT_OPENED with
     // autoLoot = 1 and the Lua frame stays hidden).
-    if (open && guid != lootShownGuid_ && !session_.isAutoLoot()) {
+    if (open && guid != lootShownGuid_ && (!session_.isAutoLoot() || session_.lootNeedsManual())) {
         lootShownGuid_ = guid;
         lootPressSeen_ = false;
         lootPage_ = 1;  // LootFrame_OnEvent LOOT_OPENED: page 1
@@ -349,11 +354,13 @@ void WorldScreen::loadLootArt() {
 }
 
 pp::ItemIconDb& WorldScreen::itemIcons() {
-    // itemicons.pak there but not opened (no memory for its TOC, no descriptor) - asked again at
-    // the next window open (was: "missing", items without icons for the session; seen on hardware).
-    if (itemIconsTried_ && itemIconsRetry_.due()) itemIconsTried_ = false;
+    // Descriptor pressure must not disable icons for the rest of the session.
+    const uint32_t now = pp::logUptimeMs();
+    if (!itemIcons_.isOpen() && itemIconsTried_ &&
+        static_cast<int32_t>(now-nextItemIconsOpenMs_) >= 0) itemIconsTried_ = false;
     if (!itemIconsTried_) {
         itemIconsTried_ = true;
+        nextItemIconsOpenMs_ = now + 3000u;
         if (!itemIcons_.open() && itemIcons_.openFailedTransient()) {
             itemIconsRetry_.fail();
             UiArtPak::logFail("itemicons", "itemicons.pak");
@@ -457,7 +464,7 @@ bool WorldScreen::drawLootWindow(UiRenderer& ui, uint8_t w) {
             hx += static_cast<float>(fs.measure(text)) + 8;
         };
         hint(kPadCross, OWN_STR(LOOT_HINT_TAKE));
-        hint(kPadUp, OWN_STR(LOOT_HINT_ALL));
+        hint(kPadTriangle, OWN_STR(LOOT_HINT_ALL));
         hint(kPadStart, OWN_STR(LOOT_HINT_CLOSE));  // START = Esc (Circle is the right click now)
     }
     // Pages (LootFrame_Update): the arrows and PREV / NEXT.
@@ -480,16 +487,10 @@ bool WorldScreen::drawLootWindow(UiRenderer& ui, uint8_t w) {
 
 // PSP: Triangle on the open loot window takes everything (LootFrame has no
 // button for it; the client's shift-click / auto-loot).
-// (Looting failed: Up, the key that opened the window, moved
-// the focus onto the close button above the items and Cross closed it): Up -
-// the same key again - and Triangle take everything; Up never moves the focus
-// here.
+// D-pad Up/Down remain navigation, including after an inventory-full error.
 void WorldScreen::lootWindowPad(pp::PadState& pad) {
     if (!windowOpen(kWinLoot) || !session_.isLootWindowOpen()) return;
-    const bool take = (pad.pressed & (PSP_CTRL_TRIANGLE | PSP_CTRL_UP)) != 0;
-    pad.held &= ~PSP_CTRL_UP;
-    pad.pressed &= ~PSP_CTRL_UP;
-    pad.released &= ~PSP_CTRL_UP;
+    const bool take = (pad.pressed & PSP_CTRL_TRIANGLE) != 0; // D-pad Up navigates even with full bags
     if (!take) return;
     lootPressSeen_ = true;
     lootWindowAction(kIdLootAll);
@@ -544,10 +545,7 @@ bool WorldScreen::lootWindowAction(uint32_t act) {
         // PSP: Triangle - the packets of upstream's auto-loot path (the
         // client's shift-click / auto-loot), no button on the frame.
         if (loot.goldLeft()) session_.lootMoney();
-        std::vector<uint8_t> slots;
-        for (const auto& it : loot.items)
-            if (!it.looted) slots.push_back(it.slotIndex);
-        for (uint8_t s : slots) session_.lootItem(s, true);
+        session_.lootAll(); // serialized; an inventory failure cancels the remaining batch
     } else {
         // PSP: the bind-on-pickup confirmation (LOOT_BIND) is still answered
         // yes here (the Lua interface asks through hasPendingLootConfirm).

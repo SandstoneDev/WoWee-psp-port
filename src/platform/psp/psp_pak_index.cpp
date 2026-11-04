@@ -176,7 +176,16 @@ void PakIndex::setRare(bool on) {
 uint32_t PakIndex::fdLastUse(void* self) { return static_cast<PakIndex*>(self)->lastUseMs_; }
 void PakIndex::fdRelease(void* self) { static_cast<PakIndex*>(self)->releaseFd(); }
 
+bool PakIndex::findOnFd(const char* name,PakEntry& out,int fd) {
+    if(fd<0) {lookupIoFailed_=true;return false;}
+    const int saved=fd_;fd_=fd;
+    const bool found=find(name,out);
+    fd_=saved;
+    return found;
+}
+
 bool PakIndex::find(const char* name, PakEntry& out) {
+    lookupIoFailed_ = false;
     if (!records_ || !name) return false;
     lastUseMs_ = logUptimeMs();
     ++lookups_;
@@ -184,7 +193,11 @@ bool PakIndex::find(const char* name, PakEntry& out) {
     PakDiskEntry* scratch = blocks_ + 2u * step_;
     const bool hit = pakIndexLookup(
         name, records_, step_, fences_, [this](uint32_t i) { return fenceName(i); },
-        [this](uint32_t first, uint32_t n, PakDiskEntry* dst) { return readBlock(first, n, dst); }, scratch, d);
+        [this](uint32_t first, uint32_t n, PakDiskEntry* dst) {
+            const bool ok = readBlock(first, n, dst);
+            if (!ok) lookupIoFailed_ = true;
+            return ok;
+        }, scratch, d);
     if (!hit) return false;
     std::memcpy(name_, d.name, sizeof(name_));
     name_[sizeof(name_) - 1] = '\0';

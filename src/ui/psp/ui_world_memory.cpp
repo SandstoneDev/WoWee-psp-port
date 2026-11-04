@@ -2,7 +2,7 @@
 // descriptor budget's per-frame work (psp_fd_budget.hpp) for the world screen. PSP only - the original client has neither:
 // it is a 32-bit Windows program with gigabytes to spare and no limit on open files worth the name.
 //
-// Twice a second one heap probe (govcut KB); short of memory the next step is cut, in this order:
+// Four times a second one heap probe (govcut KB); short of memory the next step is cut, in this order:
 //   1 particles     the world's emitters closed (WorldParticles: cache, directories, descriptor)  particlesGovernor
 //   2 attachments   other characters' item models: attachcap down to govattachpct %, the farthest give way
 //                   (remoteCrowdTurn sheds), what nobody holds freed (attachmentCacheTrim)
@@ -17,9 +17,10 @@
 //
 // wowee.cfg (read at the first world update):
 //   memgov=1          0 = never cuts (the probes and the status line stay)
-//   govcut=2048       KB of headroom a probe must get, else the next step is cut (2048, was 1024 of one block)
-//   govrestore=4096   KB (+ what the step freed) a probe must get for 10 s to give the last step back (was 3072)
-//   govemerg=768      KB: not even this - the next step at once, no cut gap (768, was 384)
+//   govcut=4096       KB of headroom a probe must get, else the next step is cut
+//   govrestore=6144   KB (+ what the step freed) a probe must get for 10 s to give the last step back
+//   govemerg=2048     KB: not even this - the next step at once, no cut gap
+//   govblockkb=2048  contiguous block needed for pending allocations (0 disables this probe)
 //   govstarve=1       a waiting consumer of higher priority cuts lower ones (0 = only the probe cuts)
 //   govfragkb=1024    free >= 4 x govcut but the largest block under this - the heap is fragmented, not
 //                     full: no more cuts (they free small pieces between pins, nothing merges), restores as the probe
@@ -77,6 +78,7 @@ struct WorldScreen::MemGovState {
     uint32_t changeLogs = 0;
     // who waited for memory since the last tick - the NPCs' held frames, the textures' failed blocks.
     uint32_t lastHeapHeld = 0, lastTexNomem = 0, starveNpc = 0, starveTerrain = 0;
+    uint32_t blockKb = 2048;
     uint32_t fragKb = 1024, fragEpisodes = 0, lastLargestKb = 0;
     bool frag = false;
     // near_starve_flush - the doodads in view waited nearstarvems with nothing in flight for them.
@@ -147,20 +149,21 @@ void WorldScreen::updateMemoryGovernor(float dtSec) {
         memGov_ = std::unique_ptr<MemGovState, void (*)(MemGovState*)>(p, &WorldScreen::destroyMemGovState);
         pp::MemGovernorConfig c;
         c.on = pp::configGetInt("memgov", 1) != 0;
-        // 2048 / 4096 / 768 for the device's 41.3 MB heap (were 1024 / 3072 / 384 -
-        // the autopilot used to set these by hand); the probes are headroom now, not one block.
-        c.cutKb = static_cast<uint32_t>(std::clamp(pp::configGetInt("govcut", 2048), 64, 16384));
-        c.restoreKb = static_cast<uint32_t>(std::clamp(pp::configGetInt("govrestore", 4096), 128, 32768));
-        c.emergencyKb = static_cast<uint32_t>(std::clamp(pp::configGetInt("govemerg", 768), 0, 16384));
+        // Keep headroom for tile/grid bursts before the hardware heap is exhausted.
+        c.cutKb = static_cast<uint32_t>(std::clamp(pp::configGetInt("govcut", 4096), 64, 16384));
+        c.restoreKb = static_cast<uint32_t>(std::clamp(pp::configGetInt("govrestore", 6144), 128, 32768));
+        c.emergencyKb = static_cast<uint32_t>(std::clamp(pp::configGetInt("govemerg", 2048), 0, 16384));
         c.starve = pp::configGetInt("govstarve", 1) != 0;
         if (c.restoreKb <= c.cutKb) c.restoreKb = c.cutKb + 512u;  // the restore line stays above the cut line
         c.maxLevel = static_cast<uint8_t>(std::clamp(pp::configGetInt("govmax", pp::kMemStepCount), 0,
                                                      static_cast<int>(pp::kMemStepCount)));
+        c.tickMs=250; // bridge/tile bursts can consume megabytes inside the old 500 ms cadence
         p->gov.configure(c);
         p->attachPct = static_cast<uint32_t>(std::clamp(pp::configGetInt("govattachpct", 50), 10, 100));
         p->npcPct = static_cast<uint32_t>(std::clamp(pp::configGetInt("govnpcpct", 60), 20, 100));
         p->fdIdleMs = static_cast<uint32_t>(std::clamp(pp::configGetInt("fdidle", 5000), 0, 600000));
         p->npcStatic = pp::configGetInt("npcstatic", 0) != 0;
+        p->blockKb = static_cast<uint32_t>(std::clamp(pp::configGetInt("govblockkb",2048),0,8192));
         p->fragKb = static_cast<uint32_t>(std::clamp(pp::configGetInt("govfragkb", 1024), 0, 16384));
         p->nearStarveMs = static_cast<uint32_t>(std::clamp(pp::configGetInt("nearstarvems", 3000), 0, 600000));  // B121
         PSP_LOGI(pp::tag::Mem, "mem_governor ev=config on=%d cut_kb=%u restore_kb=%u emerg_kb=%u starve=%d max=%u "
@@ -191,14 +194,17 @@ void WorldScreen::updateMemoryGovernor(float dtSec) {
         memGovernorApply(pp::kMemStepNpcDistance, true);
     }
     if (s.gov.due(now)) {
-        bool cutOk = heapGivesKb(s.gov.cutProbeKb());
+        // Headroom alone can pass while a pending vector growth cannot get a
+        // contiguous block. Reserve room for the main-thread rebuild as well.
+        const bool blockOk=!s.blockKb || pp::heapGivesBlockKb(s.blockKb);
+        bool cutOk = blockOk && heapGivesKb(s.gov.cutProbeKb());
         const uint32_t restoreKb = s.gov.restoreProbeKb();
         const bool restoreOk = cutOk && restoreKb && heapGivesKb(restoreKb);
-        const bool emergencyOk = cutOk || heapGivesKb(s.gov.emergencyProbeKb());
+        const bool emergencyOk = blockOk && (cutOk || heapGivesKb(s.gov.emergencyProbeKb()));
         // who waited since the last tick - the ground first (a terrain job the streamer could not
         // start, a chunk texture without its block), then the NPCs near the player (a read held, units waiting).
         uint8_t starveMax = 0;
-        const char* why = cutOk ? "starve" : "probe";
+        const char* why = !blockOk ? "block" : cutOk ? "starve" : "probe";
         const uint32_t texNomem = terrain_.texNomemCount(), heapHeld = creatures_.stats().heapHeld;
         // A landing hold waiting over a second for the floor counts as the ground waiting too.
         const bool landingWaits = tpHold_.active && now - tpHold_.startMs > 1000u;

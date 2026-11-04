@@ -1,3 +1,4 @@
+#include "platform/psp/psp_rest_triggers.hpp"
 // transfers between maps, area triggers and the instance messages of the PSP
 // world session (include/platform/psp/psp_world_session.hpp). GameHandler,
 // MovementHandler and SocialHandler are not built for the PSP (see psp_world_session_combat.cpp), so their steps
@@ -438,6 +439,7 @@ void WorldSession::transferResetWorld() {
     closeVendor();
     npcQuestStatus_.clear();
     closeTrainer();
+    ownForcedMove_=false;
     forceClearTaxi("new_world");  // upstream: onTaxiFlight_ / taxiMountActive_ / taxiClientActive_ ... = false
     closeTaxi();
     releaseTaxiData();            // the next taxi window reads the new map's nodes
@@ -553,6 +555,7 @@ void WorldSession::handleNewWorld(network::Packet& packet) {
     if (sameMap) {
         // upstream WorldEntryCallbackHandler: the same map is not reloaded - the player is put there (the world screen
         // takes it as a teleport: takeTeleport -> applyTeleport, the streamer follows).
+        ownForcedMove_=false;
         teleportPending_ = true;
         teleportPos_ = glm::vec3(x, y, z);
         teleportO_ = o;
@@ -733,8 +736,13 @@ void WorldSession::updateAreaTriggers(float dtSec, const glm::vec3& selfPos) {
         }
         if (in) {
             if (activeAreaTriggers_.count(at.id)) continue;
-            const bool suppress = suppressFirst || cooldownActive || postTransferReturnTrigger_ == at.id;
-            if (suppressFirst) {
+            const bool restTrigger=isRestAreaTrigger(at.id);
+            const bool suppress=suppressAreaTrigger(at.id,suppressFirst,cooldownActive,postTransferReturnTrigger_==at.id);
+            if (restTrigger) {
+                // Inn notifications are safe at login/hearthstone destinations.
+                // The server still validates the trigger and owns PLAYER_FLAGS_RESTING.
+                activeAreaTriggers_.insert(at.id);
+            } else if (suppressFirst) {
                 // upstream: spawned inside a portal - armed, it fires only after leaving and re-entering.
                 if (postTransferReturnTrigger_ == at.id) postTransferReturnSawNear_ = true;
                 activeAreaTriggers_.insert(at.id);

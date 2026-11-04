@@ -36,6 +36,7 @@
 #include "platform/psp/psp_transport_parse.hpp"
 #include "rendering/psp/psp_transport_format.hpp"
 #include "rendering/psp/psp_transport_path.hpp"
+#include "rendering/psp/psp_transport_rider.hpp"
 
 #include <pspthreadman.h>
 
@@ -171,6 +172,7 @@ struct WorldScreen::TransportsUi {
     std::unordered_map<uint32_t, std::unique_ptr<rp::MoTransportPath>> paths;  // by entry
     std::unordered_set<uint32_t> noPath;
     std::map<uint64_t, Obj> objs;  // by guid: the placement order
+    uint32_t placementBuilds=0,placementReuses=0;
     uint32_t seenTrVersion = ~0u, seenGoVersion = ~0u, gen = 0, seenMap = ~0u;
     int seenGoState = -2;
     // riding
@@ -180,6 +182,7 @@ struct WorldScreen::TransportsUi {
     bool placePending = false;  // the server put us on it (login / transfer): hold until it is placed
     bool beatDue = false;       // boarded / left since the last heartbeat
     uint32_t heldSinceMs = 0;
+    uint32_t riderLogMs = 0;
     uint32_t logs = 0, frameLogMs = 0, boardings = 0, memRetryMs = 0;
     bool off = false;
 
@@ -406,12 +409,11 @@ rp::MoTransportPath* pathFor(TrUi& tr, uint32_t entry, const pp::WorldSession::T
 void placeParts(const TrUi::Obj& o, std::vector<rp::DoodadPlacement>& out) {
     const float c = std::cos(o.yaw), s = std::sin(o.yaw), k = o.scale;
     const glm::mat3 R(glm::vec3(c * k, s * k, 0.0f), glm::vec3(-s * k, c * k, 0.0f), glm::vec3(0.0f, 0.0f, k));
-    const uint32_t salt = static_cast<uint32_t>(o.guid & 0xFFFFFFFFu) * 2654435761u ^ static_cast<uint32_t>(o.guid >> 32);
     if (o.wmo) {
         for (size_t i = 0; i < o.wmo->parts.size(); ++i) {
             const rp::TransportPart& p = o.wmo->parts[i];
             rp::DoodadPlacement d{};
-            d.uniqueId = (salt + static_cast<uint32_t>(i) * 40503u) | 0x40000000u;
+            d.uniqueId = rp::transportPartId(o.guid,static_cast<uint32_t>(i));
             d.model = p.model;
             const glm::vec3 pos = o.pos + R * glm::vec3(p.position[0], p.position[1], p.position[2]);
             const glm::mat3 A(glm::vec3(p.axes[0], p.axes[1], p.axes[2]), glm::vec3(p.axes[3], p.axes[4], p.axes[5]),
@@ -430,7 +432,7 @@ void placeParts(const TrUi::Obj& o, std::vector<rp::DoodadPlacement>& out) {
         return;
     }
     rp::DoodadPlacement d{};
-    d.uniqueId = salt | 0x40000000u;
+    d.uniqueId = rp::transportPartId(o.guid,0);
     d.model = o.m2.model;
     for (int a = 0; a < 3; ++a) d.position[a] = o.pos[a];
     const float axes[9] = {c * k, s * k, 0.0f, -s * k, c * k, 0.0f, 0.0f, 0.0f, k};
@@ -470,6 +472,8 @@ void WorldScreen::updateTransports(float dtSec) {
     (void)dtSec;
     TransportsUi& tr = transportsUi();
     if (tr.off) return;
+    for(auto& slot:tr.slots)
+        if(slot.pak && slot.pak->isOpen()) slot.r.retryCollisions(*slot.pak);
     const auto& trObjs = session_.transportObjects();
     if (trObjs.empty() && tr.objs.empty() && session_.gameObjects().empty()) return;
     PROF_SCOPE("transports");
@@ -483,8 +487,9 @@ void WorldScreen::updateTransports(float dtSec) {
     };
     // 1. The objects, when the session's change (fields copied: the frame below reads only ours).
     // (Also when gameobjects.pak's index comes up: the M2 transports' models are known from then.)
-    if (session_.transportObjectsVersion() != tr.seenTrVersion || session_.gameObjectsVersion() != tr.seenGoVersion ||
-        mapId != tr.seenMap || goState_ != tr.seenGoState) {
+    const bool objectDataChanged=session_.transportObjectsVersion()!=tr.seenTrVersion ||
+        session_.gameObjectsVersion()!=tr.seenGoVersion || mapId!=tr.seenMap || goState_!=tr.seenGoState;
+    if (objectDataChanged) {
         tr.seenTrVersion = session_.transportObjectsVersion();
         tr.seenGoVersion = session_.gameObjectsVersion();
         tr.seenMap = mapId;
@@ -581,7 +586,7 @@ void WorldScreen::updateTransports(float dtSec) {
     // 2. Where each is this frame.
     const uint32_t clock = pp::WorldSession::transportClockMs();
     const uint32_t nowMs = pp::logUptimeMs();
-    bool anyMoved = false;
+    std::array<bool,kSlots> slotMoved{};
     for (auto& [guid, o] : tr.objs) {
         const glm::vec3 oldPos = o.pos;
         const float oldYaw = o.yaw;
@@ -642,7 +647,7 @@ void WorldScreen::updateTransports(float dtSec) {
                 if (hasRot) o.yaw = wrapAngle(o.spawnYaw + yawOf(q));
             }
         }
-        if (o.placed && (o.pos != oldPos || o.yaw != oldYaw)) anyMoved = true;
+        if (o.placed && (o.pos != oldPos || o.yaw != oldYaw)) slotMoved[o.slot()] = true;
     }
     // 3. The resident sets: in reach of the player (the one we ride always), on this map.
     std::array<std::vector<uint64_t>, kSlots> sets;
@@ -715,6 +720,7 @@ void WorldScreen::updateTransports(float dtSec) {
             }
         };
         auto place = [&] {
+            ++tr.placementBuilds;
             s.placed.clear();
             for (uint64_t g : set) placeParts(tr.objs[g], s.placed);
             for (auto& d : s.placed) d.uniqueId ^= s.idBit;
@@ -725,7 +731,10 @@ void WorldScreen::updateTransports(float dtSec) {
         const bool reload = !hold && set == s.set && s.reloadMs && nowMs >= s.reloadMs;
         const bool swap = !hold && (set != s.set || reload);
         if (swap) s.idBit ^= kIdFlip;  // the new tile's uniqueIds differ from the old one's: every part asks again
-        place();
+        // Unchanged static sets keep both their placement vertices and collision grid.
+        // Moving elevators still rebuild their own slot every frame; riders below remain live.
+        if(swap || slotMoved[si] || objectDataChanged || set!=s.set)place();
+        else ++tr.placementReuses;
         if (swap) {
             const uint64_t t0 = sceKernelGetSystemTimeWide();
             const int newTile = s.tileFlip ? s.tileA : s.tileB, oldTile = s.curTile();
@@ -780,7 +789,7 @@ void WorldScreen::updateTransports(float dtSec) {
                              static_cast<unsigned>(pp::heapUsedKb()), static_cast<unsigned>(missing),
                              static_cast<unsigned>(reload ? s.reloads : 0u));
             }
-        } else if (anyMoved && s.has && !s.placed.empty()) {
+        } else if ((slotMoved[si] || objectDataChanged) && s.has && !s.placed.empty()) {
             s.r.movePlacements(s.curTile(), s.curTile(), s.placed.data(), static_cast<uint32_t>(s.placed.size()));
         }
         for (uint64_t g : set) tr.objs[g].placed = true;
@@ -830,6 +839,7 @@ void WorldScreen::updateTransports(float dtSec) {
     // A sample every 10 s while something is near.
     if (tr.anyResident() && nowMs >= tr.frameLogMs) {
         tr.frameLogMs = nowMs + 10000;
+        PSP_LOGI(pp::tag::Gfx,"transport_work builds=%u reused=%u",static_cast<unsigned>(tr.placementBuilds),static_cast<unsigned>(tr.placementReuses));
         const TransportsUi::Obj* closest = nullptr;
         float best = 1e30f;
         for (const auto& [guid, o] : tr.objs) {
@@ -860,12 +870,26 @@ void WorldScreen::drawTransports(const rp::TerrainCamera& cam, uint32_t fogABGR)
         if (!s.set.empty()) s.r.draw(cam, fogABGR);
 }
 
-bool WorldScreen::transportFloor(float x, float y, float maxZ, float& z) const {
+bool WorldScreen::transportFloor(float x, float y, float maxZ, float& z, uint64_t* owner) const {
+    if (owner) *owner = 0;
     if (!tr_ || tr_->off) return false;
     bool found = false;
     float best = -1e30f, h = 0.0f;
     for (const auto& s : tr_->slots) {
-        if (!s.set.empty() && s.r.floorHeight(x, y, maxZ, h) && h > best) {
+        uint32_t part = 0;
+        if (!s.set.empty() && s.r.floorHeight(x, y, maxZ, h, &part) && h > best) {
+            uint64_t floorOwner = 0;
+            if (owner) {
+                for (uint64_t guid : s.set) {
+                    const auto at = tr_->objs.find(guid);
+                    if (at == tr_->objs.end() || !at->second.transport || !at->second.placed) continue;
+                    const auto& object = at->second;
+                    const uint32_t parts = object.wmo ? static_cast<uint32_t>(object.wmo->parts.size()) : 1u;
+                    if (rp::transportOwnsPart(guid,parts,s.idBit,part)) { floorOwner = guid; break; }
+                }
+                if (!floorOwner) continue;  // static doors/walls cannot carry a rider
+                *owner = floorOwner;
+            }
             best = h;
             found = true;
         }
@@ -878,6 +902,13 @@ void WorldScreen::transportWalls(glm::vec3& to, float feetZ) const {
     if (!tr_ || tr_->off) return;
     for (const auto& s : tr_->slots)
         if (!s.set.empty()) s.r.collideWalls(to, feetZ);
+}
+
+bool WorldScreen::transportCollisionReady(float x,float y,float z) const {
+    if(!tr_ || tr_->off) return true;
+    for(const auto& slot:tr_->slots)
+        if(!slot.r.collisionReadyAt(x,y,z)) return false;
+    return true;
 }
 
 float WorldScreen::transportCameraRay(const glm::vec3& origin, const glm::vec3& dir, float maxDist) const {
@@ -980,18 +1011,30 @@ bool WorldScreen::transportCarry(float dtSec) {
     }
     tr.heldSinceMs = 0;
     const TransportsUi::Obj& o = it->second;
-    const glm::vec3 world = o.pos + rotZ(o.yaw, tr.local);
+    const glm::vec3 world = rp::transportRiderWorld(o.pos, o.yaw, tr.local);
     const float facing = wrapAngle(o.yaw + tr.localO);
     const float dyaw = wrapAngle(facing - facing_);
     const glm::vec3 delta = world - glm::vec3(playerX_, playerY_, playerZ_);
     playerX_ = world.x;
     playerY_ = world.y;
     playerZ_ = world.z;
+    if (airborne_) {
+        fallStartZ_ += delta.z;  // jump/fall height remains relative to the moving deck
+    } else {
+        vz_ = jumpVelocity_ = 0.0f;
+        fallStartZ_ = world.z;
+        fallStartMs_ = nowMs;
+    }
     facing_ = facing;
     sentFacing_ += dyaw;  // the transport's turn is no turn of ours to tell the server
     if (camInit_) {
         smoothedCam_ += delta;  // the camera's easing rides along (no lag behind a ship)
         shownZ_ += delta.z;     // the drawn feet too (a lift does not "climb steps")
+    }
+    if (nowMs >= tr.riderLogMs) {
+        tr.riderLogMs = nowMs + 5000u;
+        PSP_LOGI(pp::tag::Gfx,"transport_carry guid=%08X dz=%.2f local_z=%.2f feet_z=%.2f air=%d",
+                 static_cast<unsigned>(tr.riding),delta.z,tr.local.z,world.z,airborne_ ? 1 : 0);
     }
     if (tr.placePending) {
         tr.placePending = false;
@@ -1010,18 +1053,9 @@ void WorldScreen::transportAfterMove() {
     if (!airborne_) {
         // Standing on a transport's floor (its collision under the feet) -> that transport.
         float tz = 0.0f;
-        if (transportFloor(me.x, me.y, me.z + 0.25f, tz) && std::fabs(tz - me.z) < 0.05f) {
-            float bestVol = 1e30f;
-            for (const auto& [guid, o] : tr.objs) {
-                if (!o.transport || !o.placed || !insideBox(o, me, 1.0f, 3.0f)) continue;
-                const glm::vec3 ext = (o.boxMax - o.boxMin) * o.scale;
-                const float vol = ext.x * ext.y * ext.z;
-                if (vol < bestVol) {
-                    bestVol = vol;
-                    now = guid;
-                }
-            }
-        }
+        uint64_t floorOwner = 0;
+        if (transportFloor(me.x, me.y, me.z + 0.25f, tz, &floorOwner) &&
+            rp::transportDeckContact(true, me.z, tz)) now = floorOwner;
     } else if (tr.riding) {
         // In the air (a jump on the deck): still riding while inside its bounds.
         auto it = tr.objs.find(tr.riding);

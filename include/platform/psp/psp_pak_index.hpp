@@ -100,6 +100,10 @@ public:
     // The first record named `name` (one TOC block read unless cached). `out.name` points into this index
     // and stays valid until the next find(); copy the record if it has to live longer.
     bool find(const char* name, PakEntry& out);
+    // One-owner lookup using a caller-owned descriptor. Does not reopen/register
+    // a file; the worker can close the borrowed descriptor between batches.
+    bool findOnFd(const char* name,PakEntry& out,int fd);
+    bool lookupIoFailed() const { return lookupIoFailed_; }
     // Reads an entry like Pak::load (64-byte aligned heap block, D-cache written back; a blob the tile
     // streamer parked for this file is handed out instead). Free with pakFree().
     void* load(const PakEntry& e);
@@ -110,6 +114,7 @@ public:
     uint32_t blockReads() const { return blockReads_; }
 
 private:
+    bool lookupIoFailed_ = false;
     bool rare_ = false;          // the descriptor budget
     bool worldArena_ = false;    // setWorldArena
     static uint32_t fdLastUse(void* self);  // FdRegistry hooks

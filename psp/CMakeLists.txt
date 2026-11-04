@@ -99,6 +99,7 @@ set(WOWEE_PSP_PLATFORM_SOURCES
     ${WOWEE_ROOT}/src/platform/psp/reuse_probe.cpp
     ${WOWEE_ROOT}/src/platform/psp/psp_pak.cpp
     ${WOWEE_ROOT}/src/platform/psp/psp_pak_index.cpp  # big sorted paks, TOC on the card
+    ${WOWEE_ROOT}/src/platform/psp/psp_npc_asset_loader.cpp
     ${WOWEE_ROOT}/src/platform/psp/psp_texture.cpp
     ${WOWEE_ROOT}/src/platform/psp/psp_prof.cpp
     ${WOWEE_ROOT}/src/platform/psp/psp_net.cpp
@@ -213,6 +214,7 @@ set(WOWEE_PSP_UI_SOURCES
     ${WOWEE_ROOT}/src/rendering/psp/psp_weapon_placement.cpp  # clean room: weapon_placement.md / weapon_glow.md
     ${WOWEE_ROOT}/src/rendering/psp/psp_creatures.cpp
     ${WOWEE_ROOT}/src/rendering/psp/psp_attachments.cpp
+    ${WOWEE_ROOT}/src/rendering/psp/psp_simple_spellfx.cpp
     ${WOWEE_ROOT}/src/rendering/psp/psp_spellfx.cpp  # spell effects (spellfx.pak)
     ${WOWEE_ROOT}/src/ui/psp/ui_world_spellfx.cpp    # their world screen half
     ${WOWEE_ROOT}/src/rendering/psp/psp_particles.cpp  # particle engine, world emitters, weather
@@ -229,6 +231,7 @@ set(WOWEE_PSP_UI_SOURCES
     ${WOWEE_ROOT}/src/rendering/psp/psp_lighting_ge.cpp  # Lighting (fog, tint, sky, glow)
     ${WOWEE_ROOT}/src/ui/psp/ui_world_lighting.cpp       # Lighting
     ${WOWEE_ROOT}/src/ui/psp/ui_world_sounds.cpp  # Sounds
+    ${WOWEE_ROOT}/src/ui/psp/ui_world_water.cpp
     ${WOWEE_ROOT}/src/rendering/psp/psp_footsteps.cpp  # Sounds ($FSD accessors)
     # Trainers + talents + spell book tabs
     ${WOWEE_ROOT}/src/platform/psp/psp_world_session_trainer.cpp
@@ -478,7 +481,17 @@ add_custom_command(TARGET wowee_psp POST_BUILD
     COMMAND $ENV{PSPDEV}/bin/psp-strip $<TARGET_FILE:wowee_psp>
     COMMENT "Stripping wowee_psp for the EBOOT")
 
+set(WOWEE_PSP_XMB_DIR "" CACHE PATH "Kiln output xmb directory (ICON0.PNG and PIC1.PNG)")
+set(WOWEE_PSP_XMB_ARGS)
+if(WOWEE_PSP_XMB_DIR)
+    if(NOT EXISTS "${WOWEE_PSP_XMB_DIR}/ICON0.PNG" OR NOT EXISTS "${WOWEE_PSP_XMB_DIR}/PIC1.PNG")
+        message(FATAL_ERROR "XMB art directory must contain ICON0.PNG and PIC1.PNG")
+    endif()
+    list(APPEND WOWEE_PSP_XMB_ARGS ICON_PATH "${WOWEE_PSP_XMB_DIR}/ICON0.PNG"
+         BACKGROUND_PATH "${WOWEE_PSP_XMB_DIR}/PIC1.PNG")
+endif()
 create_pbp_file(
+    ${WOWEE_PSP_XMB_ARGS}
     TARGET wowee_psp
     TITLE "WoWee PSP"
     VERSION ${WOWEE_PSP_RELEASE}

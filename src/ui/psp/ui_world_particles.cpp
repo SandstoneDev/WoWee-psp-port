@@ -55,11 +55,19 @@ const char* fxMapDir(uint32_t mapId) {
 
 void WorldScreen::destroyFxWorldUi(FxWorldUi* p) { delete p; }
 
+void WorldScreen::configureWorldFx(bool particles, bool weather) {
+    const int mask = (particles ? 1 : 0) | (weather ? 2 : 0);
+    if (mask == fxWorldSettings_) return;
+    fxWorld_.reset();
+    fxWorldState_ = 0;
+    fxWorldSettings_ = mask;
+}
+
 void WorldScreen::updateParticles(float dtSec) {
     if (fxWorldState_ < 0) return;
     if (fxWorldState_ == 0) {
-        const bool particles = pp::configGetInt("particles", 1) != 0;
-        const bool weather = pp::configGetInt("weather", 1) != 0;
+        const bool particles = settings_.values().particles != 0;
+        const bool weather = settings_.values().weather != 0;
         if (!particles) PSP_LOGI(pp::tag::Gfx, "particles off (wowee.cfg particles=0)");
         if (!weather) PSP_LOGI(pp::tag::Gfx, "weather off (wowee.cfg weather=0)");
         if (!particles && !weather) {
@@ -191,6 +199,7 @@ uint32_t WorldScreen::particlesFlush() {
 
 void WorldScreen::drawParticles(const rendering::psp::TerrainCamera& cam) {
     if (!fxWorld_ || !fxWorld_->particlesOn) return;
+    fxWorld_->world.performanceScale=performanceCosmetic_;
     fxWorld_->world.frame(cam, lastDt_);
 }
 

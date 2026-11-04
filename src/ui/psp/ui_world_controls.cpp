@@ -18,6 +18,7 @@
 // says what every button does in each mode: the action bar glyphs read it,
 // and so will the tutorial windows (cloud batch 4, task C).
 #include "ui/psp/ui_world_screen.hpp"
+#include "ui/psp/ui_psp_layout.hpp"
 
 #include "platform/psp/psp_config.hpp"
 #include "platform/psp/psp_display.hpp"
@@ -62,7 +63,8 @@ void WorldScreen::initControls() {
     controlsInit_ = true;
     controlsScheme_ = std::clamp(pp::configGetInt("controls", 2), 1, 2);
     modeTextOn_ = pp::configGetInt("modetext", 1) != 0;
-    camFollow_ = pp::configGetInt("camfollow", 1) != 0;
+    camFollow_ = settings_.values().camfollow != 0;
+    camSmartFollow_ = settings_.values().camsmartfollow != 0;
     // The camera defaults: fov 90 -> 54 deg vertical, max distance 15, start 5.55 yd (camdist, tenths of a
     // yard: 56). The field of view and the distances await observation (round 2: camera_fov, ui_camera).
     camFovY_ = 0.6f * static_cast<float>(std::clamp(pp::configGetInt("fov", 90), 50, 120));
@@ -238,34 +240,20 @@ const pp::PadState& WorldScreen::updateControls(const pp::PadState& pad, float d
                 }
             }
         }
-        if (combatMode_ && (live & PSP_CTRL_START)) {
-            if (sitting_ && !flightTakesCircle()) setSitting(false, false);  // PSP: upstream - stands up, no jump
-            else jumpReq_ = true;
-        }
     }
     if (!alive && walks && !rHeld && !lHeld && (live & PSP_CTRL_CROSS) && !taxiLocksControls())
         jumpReq_ = true;  // PSP: a ghost's ✕ jumps (no spells, no sitting, no mount)
-    if (!combatMode_ && (live & PSP_CTRL_START)) {  // Esc: the game menu
-        setUiMode(true);
-        openWindow(kWinMenu);
-        ctlMask_ |= PSP_CTRL_START;
-    }
+    // START belongs to the global game-menu handler, in every combat/UI mode.
 
-    // Camera follows behind while walking with the stick (upstream camera
-    // "follow" style; camfollow=0 = never).
-    // (Running toward the camera used to shake it left and right:)
-    // facing the camera the difference is ~180 deg and its sign flips frame to
-    // frame. The pull is weighted by how much the run goes away from the
-    // camera (cos of the difference): full straight ahead, none sideways or
-    // toward it - the camera stays and the character runs into view.
-    if (camFollow_ && stickMove_ && !rHeld) {
+    // Recenter behind the player's facing direction only while moving.
+    // Preserve the manually chosen camera angle while standing still.
+    if (!camSmartFollow_ && camFollow_ && stickMove_ && !rHeld && !session_.isOnTaxiFlight()) {
         const float d = angleDiff(facing_, camYaw_);
-        const float weight = std::max(0.0f, std::cos(d));
-        camYaw_ += d * (1.0f - std::exp(-dtSec * 1.6f * weight));
+        camYaw_ += d * (1.0f - std::exp(-dtSec * 1.6f));
     }
     // in flight the camera follows behind the flight's heading (the client's camera follow while
     // the character moves); R + stick still looks around, released it comes back behind.
-    if (camFollow_ && !rHeld && session_.isOnTaxiFlight()) camYaw_ += angleDiff(facing_, camYaw_) * (1.0f - std::exp(-dtSec * 1.6f));
+    if (!camSmartFollow_ && camFollow_ && !rHeld && session_.isOnTaxiFlight()) camYaw_ += angleDiff(facing_, camYaw_) * (1.0f - std::exp(-dtSec * 1.6f));
 
     // What the older handlers see: no face buttons / D-pad / START / L (all
     // taken here), R only as the camera's drag, the stick only with R.
@@ -278,8 +266,41 @@ const pp::PadState& WorldScreen::updateControls(const pp::PadState& pad, float d
     return ctlPad_;
 }
 
+// Run after movement has set this frame's facing, before building the camera.
+void WorldScreen::updateFollowCamera(float dtSec) {
+    if (!camSmartFollow_ || controlsScheme_ < 2) return;
+    const bool manual = (lastRawHeld_ & PSP_CTRL_RTRIGGER) != 0;
+    const bool moving = wantMove_ || session_.isOnTaxiFlight();
+    const bool enabled = camFollow_ && !uiMode_ && !settings_.isOpen() &&
+                         lifeWalks(static_cast<int>(session_.life()));
+    if (!enabled || !moving || manual) reverseStickTurn_.reset();
+    if (enabled && moving && !manual) yawVel_ = 0.0f; // cancel the released orbit stick's tail
+    camYaw_ = SmartFollowCamera::follow(camYaw_, facing_, dtSec, enabled, manual, moving);
+}
+
 // Mode line: a UIErrorsFrame info row now (setCombatMode -> uiInfo,
 // drawn with the error stack, ui_world_errors.cpp); nothing is drawn here (the spells pass still calls it).
-void WorldScreen::drawModeHud(UiRenderer& ui) { (void)ui; }
+void WorldScreen::drawModeHud(UiRenderer& ui) {
+    if(!pspLayoutActive() || settings_.isOpen() || (uiMode_ && !windows_.empty()) || session_.logoutPending())return;
+    const Rect box=psp_layout::hints();kit_.panel(ui,box);
+    const Font& font=kit_.font(kFontTiny);
+    const char* lines[5];
+    if(uiMode_) {
+        lines[0]="{cross}: Select";lines[1]="{circle}: Back";lines[2]="{stick}: Pointer";
+        lines[3]="SELECT: Game";lines[4]="START: Menu";
+    } else if(controlsScheme_>=2 && combatMode_) {
+        lines[0]="{square}{triangle}{circle}{cross}: Cast";lines[1]="L: 5-8   R: 9-12";
+        lines[2]="R+{stick}: Camera";lines[3]="SELECT: Interface";lines[4]="START: Menu";
+    } else if(controlsScheme_>=2) {
+        lines[0]="{cross}: Jump  {circle}: Sit";lines[1]="{square}: Clear  {triangle}: Mount";
+        lines[2]="L+{square}{triangle}{circle}{cross}: Cast";lines[3]="R+{stick}: Camera";lines[4]="SELECT: UI  START: Menu";
+    } else {
+        lines[0]="L+{square}{triangle}{circle}{cross}";lines[1]="Cast current page";
+        lines[2]="{stick}: Camera";lines[3]="SELECT: Interface";lines[4]="START: Menu";
+    }
+    ui.pushClip(Rect{box.x+5,box.y+5,box.w-10,box.h-10});
+    for(int i=0;i<5;++i)kit_.controlHint(ui,font,box.x+6,box.y+6+10.f*i,lines[i],kColGold);
+    ui.popClip();
+}
 
 }  // namespace wowee::ui::psp

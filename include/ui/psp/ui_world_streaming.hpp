@@ -22,8 +22,8 @@
 // (pakPrefetchPut) and then calls the unchanged loaders - TerrainRenderer /
 // ModelRenderer::loadTile, CreatureRenderer::appendStaticSpawns - whose
 // Pak::load takes the parked blob instead of reading. A tile appears at once
-// (terrain, then its doodads with every model/texture/collision mesh), never
-// half-textured. Frees happen in update(), after frameEnd's sceGuSync, so the
+// (terrain, then nearby doodads and collision, followed by the remaining
+// models and textures in bounded batches). Frees happen in update(), after frameEnd's sceGuSync, so the
 // GE never reads freed memory. wowee.cfg stream=0 keeps the pre-streaming
 // behaviour (3x3 at entry, nothing more).
 #pragma once
@@ -183,6 +183,11 @@ private:
         // terrainRetryMs (hardware hw2 crashed in loadTile instead).
         bool terrainRetry = false;
         uint32_t terrainRetryMs = 0;
+        uint32_t doodadRetryMs = 0;
+        bool doodadRetry = false;
+        bool doodadRetryDue(uint32_t now) const {
+            return !doodadRetry || static_cast<int32_t>(now - doodadRetryMs) >= 0;
+        }
         std::vector<rendering::psp::CreatureUnit> spawns;
     };
     struct Job {
@@ -195,6 +200,7 @@ private:
         bool topUp = false;                      // memory budget: the tile's deferred doodads (resumeTile)
         bool texRetry = false;                   // A top-up for the textures drawn batches found missing
         bool nearRule = false;                   // Doodads in view (memoryOk / install without the guard)
+        uint32_t textureBytes = 0;
         uint32_t modelBytes = 0;                 // memory budget: m_ + k_ bytes requested (jobKb_)
         uint32_t deferredBefore = 0;             // memory budget: the tile's deferred placements at the start
         uint32_t doodadOffset = 0, doodadSize = 0;  // parked "d_" blob (rescan after evictions)
@@ -233,6 +239,7 @@ private:
     // kDoodadKeepYd; the terrain keeps its 3x3.
     bool wantDoodads(int x, int y, float px, float py) const;
     bool needsDoodads(const TileRec& t, float px, float py) const;
+    bool doodadPlacementMemoryOk(int x, int y, bool nearTile);
     bool needsTerrain(const TileRec& t) const;  // Its terrain failed for want of memory, retry due
     uint32_t terrainRetries_ = 0, retryScanMs_ = 0;
     bool stepEvictDoodads(Env& env);
@@ -252,6 +259,7 @@ private:
     // view is in, when the whole window is, after 45 s without it (+ stream_ready_deferred: tile:deferred/in_view@yd).
     void checkReady(Env& env);
     bool readyLogged_ = false, readyLate_ = false, readyNearLogged_ = false;
+    uint32_t readyCheckNextMs_=0; // readiness diagnostics, four scans/second
     uint32_t readySinceMs_ = 0, texRetryJobs_ = 0, flushes_ = 0, nearStarveSinceMs_ = 0;
     bool useThread_ = true;
     int prio_ = 40;
@@ -276,7 +284,7 @@ private:
     float texCheckX_ = -1e9f, texCheckY_ = -1e9f, texStepYd_ = 8.0f;
     bool texDirty_ = true, texMore_ = false;
     bool topUpOk_ = true;
-    uint32_t jobKb_ = 3072, tileReserveKb_ = 1536, terrainIdleMs_ = 5000;
+    uint32_t jobKb_ = 768, tileReserveKb_ = 1536, terrainIdleMs_ = 5000;
     uint32_t topUps_ = 0, topUpNextMs_ = 0, lastTerrainReqMs_ = 0, terrainReleases_ = 0, deferredLogs_ = 0;
     uint32_t fdWaitLogs_ = 0;
 

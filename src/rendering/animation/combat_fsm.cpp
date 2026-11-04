@@ -78,9 +78,15 @@ void CombatFSM::startSpellCast(uint32_t precast, uint32_t cast, bool castLoop, u
 
 void CombatFSM::stopSpellCast() {
     if (state_ != State::SPELL_PRECAST && state_ != State::SPELL_CASTING) return;
+    if(!spellFinalizeAnimId_){cancelSpellCast();return;}
     spellFinalizeAnimSeen_ = false;
     spellFinalizeFrames_ = 0;
     state_ = State::SPELL_FINALIZE;
+}
+
+void CombatFSM::cancelSpellCast() {
+    if(state_!=State::SPELL_PRECAST && state_!=State::SPELL_CASTING && state_!=State::SPELL_FINALIZE)return;
+    clearSpellState();state_=State::INACTIVE;
 }
 
 void CombatFSM::clearSpellState() {
@@ -99,10 +105,9 @@ void CombatFSM::clearSpellState() {
 void CombatFSM::triggerHitReaction(uint32_t animId) {
     // Don't interrupt swim/jump/stun states
     if (state_ == State::STUNNED) return;
-    // Interrupt spell casting
-    if (state_ == State::SPELL_PRECAST || state_ == State::SPELL_CASTING || state_ == State::SPELL_FINALIZE) {
-        clearSpellState();
-    }
+    // A hit is not a server cast interruption: pushback can extend this cast.
+    if (state_ == State::SPELL_PRECAST || state_ == State::SPELL_CASTING) return;
+    if (state_ == State::SPELL_FINALIZE) clearSpellState();
     hitReactionAnimId_ = animId;
     state_ = State::HIT_REACTION;
 }
@@ -416,7 +421,8 @@ AnimOutput CombatFSM::resolve(const Input& in, const AnimCapabilitySet& caps,
             break;
 
         case State::SPELL_CASTING:
-            animId = spellCastAnimId_ ? spellCastAnimId_ : anim::SPELL;
+            if(!spellCastAnimId_)return AnimOutput::stay();
+            animId = spellCastAnimId_;
             loop = spellCastLoop_;
             break;
 

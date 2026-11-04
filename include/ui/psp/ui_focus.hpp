@@ -9,6 +9,7 @@
 
 #include "platform/psp/psp_input.hpp"
 #include "ui/psp/ui_renderer.hpp"
+#include "ui/psp/ui_dpad_repeat.hpp"
 
 #include <cstdint>
 
@@ -31,6 +32,17 @@ public:
     void addBlocker(const Rect& r);
 
     uint32_t focused() const { return focused_; }
+    // World panels form separate navigation groups; group 0 is the HUD/free cursor.
+    void setGroup(uint8_t group) { group_ = group; }
+    void focusGroup(uint8_t group);
+    uint8_t activeGroup() const { return navGroup_; }
+    uint32_t rememberedFocus(uint8_t group) const { return remembered_[group]; }
+    void cancelPresses() { clickDown_=altDown_=0;altEmptyHeld_=pressHeld_=false;activated_=activatedAlt_=0;emptyAltActivated_=false; }
+    void setModalGroup(uint8_t group) { modalGroup_ = group; }
+    void setEnhancedNavigation(bool on) { enhanced_ = on; repeat_ = UiDpadRepeat{}; }
+    bool enhancedNavigation() const { return enhanced_; }
+    void setPanelNavigation(bool on) { panelNavigation_ = on; }
+    bool focusedRect(Rect& out) const;
     // Movable windows: stops declared from now on are shifted by
     // (dx, dy) - the same offset the renderer draws them with.
     void setOffset(float dx, float dy) {
@@ -45,6 +57,7 @@ public:
     // right one"): activated() = Cross released on it, activatedAlt() = Circle released on it.
     uint32_t activated() const { return activated_; }
     uint32_t activatedAlt() const { return activatedAlt_; }
+    bool emptyAltClick() const { return emptyAltActivated_; }
     // Stops whose centre lies under one of these rects (the windows drawn over the one being
     // declared now) are not declared - a widget covered by another window takes no focus.
     void setOccluders(const Rect* r, int n) {
@@ -61,10 +74,22 @@ private:
     struct Stop {
         uint32_t id;
         Rect r;
+        uint8_t group = 0;
     };
     int pick(int cur, int dx, int dy) const;
     int nearestTo(float px, float py) const;
     int indexOf(uint32_t id) const;
+    bool navigable(int i) const;
+    void cycleGroup(int direction);
+    uint8_t group_ = 0, navGroup_ = 0, modalGroup_ = 0;
+    bool groupPending_ = false, panelNavigation_ = false, enhanced_ = true;
+    uint8_t groupWait_=0;
+    uint32_t remembered_[256] = {};
+    uint32_t clickDown_ = 0, altDown_ = 0;
+    bool altEmptyHeld_ = false, emptyAltActivated_ = false;
+    float altStartX_ = 0, altStartY_ = 0;
+    UiDpadRepeat repeat_;
+    float analogDelay_ = 0;
 
     Stop stops_[kMaxStops];
     int count_ = 0;

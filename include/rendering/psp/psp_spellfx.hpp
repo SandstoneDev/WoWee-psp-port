@@ -46,6 +46,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#include <utility>
 
 namespace wowee::platform::psp {
 struct Texture;
@@ -66,6 +67,12 @@ class SpellFxHost {
 public:
     // World position (server coordinates) of M2 attachment `id` (1, 2, 5, 11) of a tracked
     // caster on this frame's pose; false when the unit is gone or has no such point.
+    virtual void impactSound(uint32_t visual, const glm::vec3& at) = 0;
+    virtual float castRemaining(uint64_t caster) = 0;
+    virtual int32_t auraRemaining(uint64_t target, uint32_t spell, uint64_t caster) = 0;
+    virtual bool auraAnchor(uint64_t guid, uint8_t attach, glm::vec3& out, float& scale) = 0;
+    virtual bool targetWorld(uint64_t guid, glm::vec3& out) = 0;
+    virtual bool unitFeet(uint64_t guid, glm::vec3& out) = 0;
     virtual bool attachmentWorld(uint64_t guid, uint8_t id, glm::vec3& out) = 0;
 
 protected:
@@ -81,22 +88,35 @@ public:
 
     // Reads the pak's visual table and entry offsets; false without data/spellfx.pak.
     bool open(const SpellFxConfig& cfg);
+    bool loadKits();
+    void keepAuraTargets(const uint64_t* targets,size_t count);
+    const SpellFxKitMeta* kit(uint32_t visual) const;
+    uint32_t kitStart(uint32_t visual,int phase) const;
     bool isOpen() const { return !visuals_.empty(); }
 
     // upstream SpellVisualSystem::playSpellVisualPrecast. feet: the caster's position (server
     // coordinates); caster: the guid to follow (0 = an untracked caster: static, height offset).
-    void playPrecast(uint32_t visualId, const glm::vec3& feet, uint32_t castMs, uint64_t caster, bool own,
+    bool playPrecast(uint32_t visualId, const glm::vec3& feet, uint32_t castMs, uint64_t caster, bool own,
                      SpellFxHost& host);
     // upstream SpellVisualSystem::playSpellVisual (impact = the ImpactKit path, never tracked).
-    void play(uint32_t visualId, const glm::vec3& feet, bool impact, uint64_t caster, bool own, SpellFxHost& host);
+    bool play(uint32_t visualId, const glm::vec3& feet, bool impact, uint64_t caster, bool own, SpellFxHost& host);
+    bool launch(uint32_t visualId, const glm::vec3& from, const glm::vec3& to, uint64_t target, bool own);
+    // State kits refresh without restarting; zero removes only this caster/spell/target.
+    bool aura(uint32_t spellId, uint32_t visualId, uint64_t caster, uint64_t target,
+              int32_t remainingMs, bool own, SpellFxHost& host);
+    bool auraImpact(uint32_t visualId, uint64_t target, bool own, SpellFxHost& host, uint8_t role = 1);
     void cancelAllPrecast();
+    void cancelPrecast(uint64_t caster);
     void reset();
     // PSP: the effects of a visual read ahead (the action bar at world entry), one per frame while
     // the cache is under 3/4 full - the first cast of a bar spell then reads nothing.
     void prefetch(uint32_t visualId);
 
     bool hasVisual(uint32_t visualId) const { return findVisual(visualId) != nullptr; }
+    bool hasMissile(uint32_t id) const { const auto* v = findVisual(id); return v && v->reserved; }
+    bool hasRoom() const { return active_.size() < static_cast<size_t>(cfg_.maxActive); }
     size_t activeCount() const { return active_.size(); }
+    float performanceScale = 1.f; // cosmetic particles only; effect timing and missiles stay intact
 
     // Per frame, after every other 3D draw: lifetimes, followed bones, particles, the GE pass.
     void frame(const TerrainCamera& cam, float dtSec, SpellFxHost& host);
@@ -111,6 +131,12 @@ private:
         bool precast = false, own = false;
         uint8_t attach = 0;          // followed attachment (0 = static)
         uint64_t caster = 0;
+        uint64_t target = 0; // flying missile only
+        glm::vec3 direction{1,0,0};
+        uint64_t auraTarget = 0;
+        uint32_t auraSpell = 0;
+        uint8_t auraAttach = 0;
+        float scale = 1.0f;
         glm::vec3 pos{0.0f};         // instance origin, server coordinates
         float acc[kFxEmitterSlots] = {};  // particles: the engine's accumulators
         int16_t lanes[kFxMaxRibbons] = {-1, -1, -1, -1};  // particles: ribbon lanes
@@ -134,7 +160,15 @@ private:
     std::string path_;
     int fd_ = -1;
     uint32_t lastReadMs_ = 0;
+    std::vector<SpellFxKitMeta> kits_;
+    std::vector<SpellFxKitStarts> kitStarts_;
+    uint32_t kitsRetryMs_ = 0;
+    bool kitsUnavailable_ = false;
     std::vector<SpellFxVisual> visuals_;          // sorted by visual id
+    // Flat sorted records keep the all-spell index small on PSP.
+    std::vector<SpellFxAuraVisual> auraEffects_;
+    using AuraIter = std::vector<SpellFxAuraVisual>::const_iterator;
+    std::pair<AuraIter, AuraIter> auraLayers(uint32_t visual) const;
     std::vector<uint32_t> effOff_, effSize_;      // "e_<n>" in the file
     std::vector<uint32_t> texOff_, texSize_;      // "x_<n>"
     std::unordered_map<uint16_t, std::unique_ptr<Loaded>> loaded_;

@@ -193,24 +193,16 @@ TEST_CASE("equipment selects a variant after the bare one", "[geoset]") {
     }
 }
 
-TEST_CASE("a night elf's eyes glow and nobody else's do", "[geoset]") {
-    // Group 17 is the eye-glow overlay. The NPC path restored it for race 4 and
-    // the player path never added it at all, so a night elf player looked out of
-    // pale eyes while every night elf standing beside them glowed.
-    const auto nightElf = wowee::core::bareCharacterGeosets(1, 1, 1, 1, 4);
-    CHECK(nightElf.count(wowee::core::kGeosetEyeGlow) == 1);
-
-    SECTION("every other playable race has it off") {
-        for (uint8_t race : {1, 2, 3, 5, 6, 7, 8, 10, 11}) {
-            const auto other = wowee::core::bareCharacterGeosets(1, 1, 1, 1, race);
-            CHECK(other.count(wowee::core::kGeosetEyeGlow) == 0);
-        }
+TEST_CASE("racial eyes select 1702 without the death-knight overlay", "[geoset]") {
+    for (uint8_t race : {4, 5, 10, 11}) {
+        const auto shown = bareCharacterGeosets(1, 1, 1, 1, race);
+        CHECK(shown.count(1702) == 1);
+        CHECK(shown.count(1703) == 0);
     }
-
-    SECTION("a caller that does not say the race gets no glow") {
-        // The default, which is what a path with no race to hand asks for.
-        const auto unknown = wowee::core::bareCharacterGeosets(1, 1, 1, 1);
-        CHECK(unknown.count(wowee::core::kGeosetEyeGlow) == 0);
+    for (uint8_t race : {0, 1, 2, 3, 6, 7, 8}) {
+        const auto shown = bareCharacterGeosets(1, 1, 1, 1, race);
+        CHECK(shown.count(1702) == 0);
+        CHECK(shown.count(1703) == 0);
     }
 }
 

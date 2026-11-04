@@ -12,6 +12,7 @@
 // upstream, 2 = + other players and NPCs within 25 yd, default 2),
 // sfxbudget (KB of PCM kept in RAM, 1024).
 #pragma once
+#include "rendering/psp/psp_sound_format.hpp"
 
 #include "platform/psp/psp_sound_bank.hpp"
 #include "ui/psp/ui_world_sound_paths.hpp"
@@ -21,6 +22,8 @@
 #include <cstdint>
 #include <unordered_map>
 #include <vector>
+
+namespace wowee::rendering::psp { struct TerrainCamera; }
 
 namespace wowee::ui::psp {
 
@@ -53,6 +56,7 @@ public:
     // resolved for the own race/sex (ActivitySoundManager voice profile).
     bool init(uint32_t mapId, uint32_t race, bool male);
     void shutdown();
+    void environment(uint32_t area,bool night,bool indoors,int weather,float intensity,int zoneVolume,int weatherVolume);
     bool active() const { return bank_.isOpen(); }
     int footstepMode() const { return footsteps_; }
     void setFootstepMode(int m) { footsteps_ = m < 0 ? 0 : (m > 2 ? 2 : m); }
@@ -68,12 +72,16 @@ public:
     // UiSoundManager.
     void playUi(UiSound s);
     bool playByName(const char* name);
-    bool playEntry(uint32_t soundEntryId, const glm::vec3* serverPos);
+    bool playNpcVoice(uint32_t display,uint8_t kind,const glm::vec3& pos);
+    bool playEntry(uint32_t soundEntryId, const glm::vec3* serverPos, uint32_t tag=0, bool sustain=false);
+    void cancelSoundTag(uint32_t tag) { bank_.cancelTag(tag); }
 
     // CombatSoundManager + ActivitySoundManager vocals: upstream
     // CombatHandler::handleAttackerStateUpdate's sound block (player's
     // combat only). hitInfo / victimState as SMSG_ATTACKERSTATEUPDATE.
     void onMeleeHit(bool playerAttacker, bool playerTarget, uint32_t hitInfo, uint32_t victimState);
+    void playDeath();
+    void spellWound(bool critical) { playWound(critical); }
 
     // SfxStateDriver::update over the own movement state (upstream
     // CameraController isGrounded/isJumping/isFalling/isSwimming/isMoving).
@@ -105,7 +113,7 @@ public:
     }
 
     // 3D gain/pan of a world position (upstream inverse attenuation).
-    bool spatial(const glm::vec3& serverPos, float maxDistance, float& gain, float& pan) const;
+    bool spatial(const glm::vec3& serverPos, float maxDistance, float& gain, float& pan, float minDistance=1.f) const;
     // Terrain part of upstream resolveFootstepSurface at a position (server
     // coords): water (MH2O under the feet) or the dominant ground layer's
     // surface, from the baked grids. False when the tile has no grid.
@@ -113,9 +121,11 @@ public:
     // flying: the terrain water (MH2O) at a position - the cell is covered and the surface is
     // its chunk's highest liquid level (the same baked grid). False: no water there / no grid for the tile.
     bool waterAt(float x, float y, float& level) const;
+    void drawWater(const rendering::psp::TerrainCamera& cam, uint32_t fogColor, bool enabled = true);
     float otherDistance = 25.0f;  // yd, footsteps of others
 
 private:
+    std::vector<rendering::psp::NpcVoiceRecord> npcVoices_;
     struct Tracker {  // upstream FootstepDriver's footstepLast* state
         uint32_t lastAnimationId = 0;
         float lastNormTime = 0.0f;
@@ -129,14 +139,14 @@ private:
     void sweepTrackers();
     int ui(UiSound s) const;
     std::vector<int> resolve(const std::vector<std::string>& paths) const;
+    std::vector<int> resolveEntry(uint32_t soundId) const;
     int first(const std::vector<std::string>& paths) const;  // upstream library[0]: the first path only
-    bool play2D(int clip, float volume, float pitch = 1.0f);
+    bool play2D(int clip, float volume, float pitch = 1.0f, uint32_t tag = 0);
     int pick(const std::vector<int>& clips);
     float rnd(float lo, float hi);
     bool elapsed(uint32_t& lastMs, float minSec, uint32_t now) const;
     void playRandomStep(StepSurface surface, float minInterval, float volumeMul);
     void playWaterFootstep(int size);  // MovementSoundManager, 0 small 1 medium 2 large/giant
-    void playJump();
     void playLanding(StepSurface surface, bool hardLanding);
     void playMeleeSwing();
     void playAttackGrunt();
@@ -146,6 +156,11 @@ private:
     const void* entries_ = nullptr;
     uint32_t entriesSize_ = 0;
     std::unordered_map<uint32_t, uint32_t> entryById_, entryByName_;
+    struct AmbienceArea { uint32_t parent,day,night; };
+    std::unordered_map<uint32_t,AmbienceArea> ambienceAreas_;
+    uint32_t ambienceEntry_ = ~uint32_t{0};
+    int ambienceClip_ = -1;
+    float ambienceGain_ = 1.0f;
     int footsteps_ = 2;
     int volume_ = -1;
     glm::vec3 listener_{0.0f};
@@ -171,12 +186,12 @@ private:
     std::unordered_map<uint64_t, Tracker> others_;
     uint32_t lastOtherStepMs_ = 0;
     // ActivitySoundManager
-    std::vector<int> jump_, splash_, swimStroke_, hardLand_, meleeSwing_, attackGrunt_, wound_, woundCrit_;
+    std::vector<int> splash_, swimStroke_, meleeSwing_, attackGrunt_, wound_, woundCrit_, deathVoice_;
     std::vector<int> landing_[7];
-    uint32_t lastJumpMs_ = 0, lastLandMs_ = 0, lastMeleeSwingMs_ = 0, lastGruntMs_ = 0, lastWoundMs_ = 0;
+    uint32_t lastLandMs_ = 0, lastMeleeSwingMs_ = 0, lastGruntMs_ = 0, lastWoundMs_ = 0;
     uint32_t lastSplashMs_ = 0, lastStrokeMs_ = 0;
     // SfxStateDriver
-    bool actInit_ = false, prevGrounded_ = true, prevJumping_ = false, prevFalling_ = false, prevSwimming_ = false;
+    bool actInit_ = false, prevGrounded_ = true, prevFalling_ = false, prevSwimming_ = false;
     float sinceWaterExit_ = 0.45f;
     // MovementSoundManager: [0] small, [1] medium, [2] huge
     std::vector<int> waterStep_[3];

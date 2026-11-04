@@ -137,8 +137,30 @@ struct SpellFxVisual {
     uint16_t precast;  // effect index n of "e_<n>", or kFxNone
     uint16_t cast;
     uint16_t impact;
-    uint16_t reserved;
+    uint16_t reserved; // missile index + 1; zero = absent (legacy packs)
 };
+
+// Optional "auras" pak entry; absent in legacy packs. One record per aura kit layer.
+struct SpellFxAuraVisual {
+    uint32_t visual;
+    uint16_t state;
+    uint16_t reserved; // low byte: attachment + 1 (0 = blob default); high byte: 0 state, 1 impact, 2 removal
+};
+constexpr uint32_t kFxLevelUpVisual = 0xFFFFFFFEu;
+static_assert(sizeof(SpellFxAuraVisual) == 8, "SpellFxAuraVisual size");
+
+// Optional "kits" entry: actual caster animations and SoundEntries IDs per visual.
+struct SpellFxKitStarts {
+    uint32_t visual, precast, cast, channel; // optional entry; 0xFFFFFFFF = no start animation
+};
+static_assert(sizeof(SpellFxKitStarts)==16);
+
+struct SpellFxKitMeta {
+    uint32_t visual;
+    uint32_t precastAnim, castAnim, channelAnim; // 0xFFFFFFFF = none
+    uint32_t precastSound, castSound, impactSound, channelSound; // 0 = none
+};
+static_assert(sizeof(SpellFxKitMeta)==32, "SpellFxKitMeta size");
 
 struct SpellFxHeader {
     char magic[4];  // "WSFX"

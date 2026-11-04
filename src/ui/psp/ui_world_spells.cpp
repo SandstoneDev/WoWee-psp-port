@@ -25,8 +25,10 @@
 //     CharacterAnimator::startSpellCast for us, a loop on other players and
 //     NPCs; instant melee abilities swing (meleeSwingCallback).
 #include "ui/psp/ui_world_screen.hpp"
+#include "ui/psp/ui_psp_layout.hpp"
 
 #include "game/spell_classification.hpp"
+#include "ui/psp/ui_world_sounds.hpp"
 #include "game/update_field_table.hpp"
 #include "platform/psp/psp_config.hpp"
 #include "platform/psp/psp_display.hpp"
@@ -63,7 +65,6 @@ constexpr uint32_t kSpellAttack = 6603;
 
 // Face buttons in bar order (left to right) and their hotkey labels.
 constexpr uint32_t kFaceKeys[4] = {PSP_CTRL_SQUARE, PSP_CTRL_TRIANGLE, PSP_CTRL_CIRCLE, PSP_CTRL_CROSS};
-const char* const kFaceLabel[4] = {"[]", "/\\", "O", "X"};
 constexpr uint32_t kFaceColor[4] = {0xFFD080FFu, 0xFF80E080u, 0xFF6060FFu, 0xFFFFB080u};
 constexpr uint32_t kFaceMask = PSP_CTRL_SQUARE | PSP_CTRL_TRIANGLE | PSP_CTRL_CIRCLE | PSP_CTRL_CROSS;
 
@@ -181,7 +182,7 @@ void WorldScreen::initSpells() {
 // -> page NUM_ACTIONBAR_PAGES + offset, e.g. Battle Stance = slots 72..83).
 int WorldScreen::mainBarBase() const {
     // GetBonusBarOffset as the client reports it (the override bar = 5, actions 121..132).
-    if (const int cb = classBarBonusBase(); cb >= 0) return cb;
+    if (const int cb = classBarBonusBase(); cb >= 0) return actionBarBase(actionBarPage_,cb);
     // 3.3.5a: the form is UNIT_FIELD_BYTES_2 byte 3 (UNIT_BYTES_2_OFFSET_SHAPESHIFT_FORM);
     // PSP: the field is not in upstream's UF table - 3.3.5a UpdateFields.h
     // OBJECT_END + 0x74 (= UNIT_FIELD_STAT0 84 + 38, see update_fields.json).
@@ -190,7 +191,7 @@ int WorldScreen::mainBarBase() const {
     const uint8_t bonus = spellDb_.bonusBar(static_cast<uint8_t>((b2 >> 24) & 0xFF));
     // ActionButton.lua: page = NUM_ACTIONBAR_PAGES (6) + offset, action = (page - 1) * 12 + button:
     // offset 1 (Battle Stance) = slots 72..83 (the server's 72:Attack 73:Heroic Strike).
-    return bonus > 0 && bonus <= 4 ? (5 + bonus) * 12 : 0;
+    return bonus > 0 && bonus <= 4 && actionBarPage_ == 0 ? (5 + bonus) * 12 : actionBarPage_ * 12;
 }
 
 // --- Input ------------------------------------------------------------------------
@@ -273,11 +274,18 @@ void WorldScreen::updateSpells(const pp::PadState& pad, float dtSec) {
     }
 
     // Session queues: animations, combat text, errors, cast bar.
+    spellFxEvents();
     pp::WorldSession::CastAnim a;
     while (session_.takeCastAnim(a)) playCastAnim(a);
-    spellFxEvents();  // SPELL_START / GO / PLAY_SPELL_VISUAL -> effects (ui_world_spellfx.cpp)
+  // SPELL_START / GO / PLAY_SPELL_VISUAL -> effects (ui_world_spellfx.cpp)
     pp::WorldSession::SpellText st;
-    while (session_.takeSpellText(st)) addCombatText(st.type, st.amount, st.outgoing, st.dst);
+    while (session_.takeSpellText(st)) {
+        addCombatText(st.type,st.amount,st.outgoing,st.dst);
+        if (st.dst==session_.playerGuid() && st.amount>0 &&
+            (st.type==game::CombatTextEntry::SPELL_DAMAGE || st.type==game::CombatTextEntry::CRIT_DAMAGE ||
+             (st.type==game::CombatTextEntry::ENVIRONMENTAL && st.environment==2)))
+            sounds_.spellWound(st.type==game::CombatTextEntry::CRIT_DAMAGE);
+    }
     std::string err;
     while (session_.takeSpellError(err)) {
         combatError_ = err;
@@ -335,16 +343,26 @@ void WorldScreen::updateSpells(const pp::PadState& pad, float dtSec) {
 // Upstream Application::spellCastAnimCallback (animation_callback_handler.cpp).
 void WorldScreen::playCastAnim(const pp::WorldSession::CastAnim& a) {
     const bool self = a.guid == session_.playerGuid();
-    if (self && a.melee) {
+    const uint32_t abilityAnim=spellKitAnimation(a.spellId,1);
+    if (self && a.melee && (abilityAnim==0xFFFFFFFFu || abilityAnim==anim::SPECIAL_1H ||
+                           abilityAnim==anim::SPECIAL_2H || abilityAnim==anim::SPECIAL_UNARMED)) {
         triggerMeleeSwing();
+        const auto& lo = animator_.getWeaponLoadout();
+        const auto& caps = animator_.getCapabilities();
+        specialMeleeAnim_ = lo.isFist ? caps.resolvedMeleeFist : lo.isDagger ? caps.resolvedMeleePierce :
+            lo.is2HLoose ? caps.resolvedMelee2HLoose : lo.inventoryType == game::InvType::TWO_HAND ? caps.resolvedMelee2H :
+            lo.inventoryType ? caps.resolvedMelee1H : caps.resolvedMeleeUnarmed;
+        const uint32_t special=(lo.inventoryType==game::InvType::TWO_HAND || lo.is2HLoose) ? caps.resolvedSpecial2H :
+            lo.inventoryType ? caps.resolvedSpecial1H : caps.resolvedSpecialUnarmed;
+        if (special) specialMeleeAnim_=special;
         return;
     }
     const bool directed = a.castType == CastType::DIRECTED;
     const bool area = a.castType == CastType::AREA;
     auto has = [&](uint32_t id) -> bool {
-        if (self) return player_.hasAnimation(id);
+        if (self) return player_.canPlay(id);
         auto r = remotes_.find(a.guid);
-        if (r != remotes_.end()) return r->second.model && r->second.model->hasAnimation(id);
+        if (r != remotes_.end()) return r->second.model && r->second.model->canPlay(id);
         return creatures_.hasAnimation(a.guid, id);
     };
     auto pickFirst = [&](std::initializer_list<uint32_t> ids) -> uint32_t {
@@ -357,7 +375,7 @@ void WorldScreen::playCastAnim(const pp::WorldSession::CastAnim& a) {
                  static_cast<unsigned>(a.guid & 0xFFFFFFFFu), a.start ? 1 : 0, a.isChannel ? 1 : 0,
                  static_cast<unsigned>(a.castType), static_cast<unsigned>(a.spellId));
     if (a.start) {
-        const uint32_t precast = a.isChannel ? 0 : pickFirst({anim::SPELL_PRECAST});
+        uint32_t precast = a.isChannel ? 0 : pickFirst({anim::SPELL_PRECAST});
         uint32_t cast = 0;
         if (a.isChannel) {
             cast = directed ? pickFirst({anim::CHANNEL_CAST_DIRECTED, anim::CHANNEL_CAST_OMNI, anim::READY_SPELL_DIRECTED, anim::SPELL})
@@ -374,6 +392,25 @@ void WorldScreen::playCastAnim(const pp::WorldSession::CastAnim& a) {
             if (area) finalize = pickFirst({anim::SPELL_CAST_AREA, anim::SPELL_CAST_OMNI, anim::SPELL_CAST, anim::SPELL});
             else if (directed) finalize = pickFirst({anim::SPELL_CAST_DIRECTED, anim::SPELL_CAST_OMNI, anim::SPELL_CAST, anim::SPELL});
             else finalize = pickFirst({anim::SPELL_CAST_OMNI, anim::SPELL_CAST_AREA, anim::SPELL_CAST, anim::SPELL});
+        }
+        const uint32_t authoredHold=spellKitAnimation(a.spellId,a.isChannel ? 2 : 0);
+        const uint32_t authoredStart=spellKitAnimation(a.spellId,a.isChannel ? 5 : 3);
+        const uint32_t authoredRelease=spellKitAnimation(a.spellId,1);
+        if(spellKitAnimation(a.spellId,6)!=0xFFFFFFFFu) {
+            // UINT_MAX means the client requests no pose; do not invent a spell stance.
+            precast=!a.isChannel && authoredStart!=0xFFFFFFFFu && has(authoredStart) ? authoredStart : 0;
+            cast=authoredHold!=0xFFFFFFFFu && has(authoredHold) ? authoredHold : 0;
+            finalize=authoredRelease!=0xFFFFFFFFu && has(authoredRelease) ? authoredRelease : 0;
+        }
+        if (game::spellclass::isFishingCast(a.spellId)) {
+            // Fishing is a pole cast followed by its idle loop, not a generic
+            // SpellVisualKit channel. Both clips already live in character extras.
+            precast=pickFirst({anim::FISHING_CAST});
+            cast=pickFirst({anim::FISHING_LOOP});
+            finalize=0;
+        }
+        if(self && a.melee) {
+            animator_.startSpellCast(0,0,false,finalize);animator_.stopSpellCast();return;
         }
         if (self) {
             if (animator_.getActivity().isEmoteActive()) animator_.cancelEmote();
@@ -395,12 +432,20 @@ void WorldScreen::playCastAnim(const pp::WorldSession::CastAnim& a) {
     }
     // Cast / channel ended.
     if (self) {
-        animator_.stopSpellCast();
+        if(a.release)animator_.stopSpellCast();
+        else animator_.getCombat().cancelSpellCast();
         return;
     }
     auto held = remoteCastAnim_.find(a.guid);
     if (held == remoteCastAnim_.end()) return;
     remoteCastAnim_.erase(held);
+    const uint32_t release=spellKitAnimation(a.spellId,1);
+    if(a.release && release!=0xFFFFFFFFu && has(release)) {
+        auto remote=remotes_.find(a.guid);
+        if(remote!=remotes_.end() && remote->second.model) {remote->second.model->playAnimation(release,false);remote->second.anim=release;}
+        else creatures_.playEmote(a.guid,release,false);
+        return;
+    }
     auto r = remotes_.find(a.guid);
     if (r != remotes_.end()) {
         // PSP: upstream leaves a finished non-channel pose to the next
@@ -557,15 +602,14 @@ void WorldScreen::drawActionBar(UiRenderer& ui) {
             // Kenney glyph (ui.pak pad_*), tinted red out of range; text fallback.
             constexpr PadGlyph kFaceGlyph[4] = {kPadSquare, kPadTriangle, kPadCircle, kPadCross};
             const Rect g{r.x + r.w - 7.0f, r.y - 4.0f, 10.0f, 10.0f};
-            if (!kit_.glyph(ui, kFaceGlyph[key], g, col == kColRed ? 0xFF6060FFu : 0xFFFFFFFFu))
-                ui.textShadow(small, r.x + r.w, r.y - 3, kFaceLabel[key], col, Align::Right);
+            kit_.glyph(ui,kFaceGlyph[key],g,col==kColRed?0xFF6060FFu:0xFFFFFFFFu);
             if (modifier > 0) kit_.glyph(ui, modifier == 1 ? kPadL : kPadR, Rect{g.x - 7.0f, g.y + 1.0f, 8.0f, 8.0f});
         }
     }
     // Page number (MainMenuBar's ActionBarPageNumber).
-    if (controlsScheme_ < 2) {  // controls=2 has no pages: all 12 buttons have keys
+    {  // Server bar : four-button group
         char pg[16];
-        std::snprintf(pg, sizeof(pg), "%d", barPage_ + 1);
+        std::snprintf(pg, sizeof(pg), "%d:%d", actionBarPage_ + 1, barPage_ + 1);
         const Rect b0 = mmbButton(0);
         ui.textShadow(small, b0.x - 8, b0.y + 3, pg, kColGold, Align::Center);
     }
@@ -576,7 +620,7 @@ void WorldScreen::drawActionBar(UiRenderer& ui) {
 void WorldScreen::drawCastBar(UiRenderer& ui) {
     if (castBarMode_ == 0) return;
     const float a = std::clamp(castBarAlpha_, 0.0f, 1.0f);
-    const Rect bar{kCastX, kCastY, kCastW, kCastH};
+    const Rect bar{kCastX, pspLayoutActive()?psp_layout::castY:kCastY, kCastW, kCastH};
     ui.fill(bar, withAlpha(0xB0000000u, a));
     const float v = std::clamp(castBarValue_, 0.0f, 1.0f);
     const Rect fill{bar.x, bar.y, bar.w * v, bar.h};
@@ -737,8 +781,20 @@ void WorldScreen::rebuildSpellbook() {
              static_cast<unsigned>(session_.knownSpells().size()));
 }
 
+bool WorldScreen::castBookSpell(uint32_t act) {
+    if (act < kIdBook0 || act >= kIdBook0 + kBookPer) return false;
+    const int idx=bookPage_*kBookPer+static_cast<int>(act-kIdBook0);
+    if (idx>=0 && idx<static_cast<int>(bookSpells_.size())) {
+        const uint32_t id=bookSpells_[idx];
+        if (id==kSpellAttack) toggleAutoAttack();
+        else if (!session_.useItemForSpell(id)) session_.castSpell(id,0,wantMove_ || moving_);
+    }
+    return true;
+}
+
 bool WorldScreen::spellWindowAction(uint32_t act) {
     if (act == kIdBarBook) {
+        if(windowOpen(kWinMenu))closeWindow(kWinMenu);
         if (windowOpen(kWinSpellbook)) closeWindow(kWinSpellbook);
         else openWindow(kWinSpellbook);
         return true;
@@ -758,13 +814,9 @@ bool WorldScreen::spellWindowAction(uint32_t act) {
         return true;
     }
     if (act >= kIdBook0 && act < kIdBook0 + kBookPer) {
-        // SpellButton_OnClick - CastSpell (Square picks it up: spellWindowPad).
         const int idx = bookPage_ * kBookPer + static_cast<int>(act - kIdBook0);
-        if (idx < static_cast<int>(bookSpells_.size())) {
-            const uint32_t id = bookSpells_[idx];
-            if (id == kSpellAttack) toggleAutoAttack();
-            else if (!session_.useItemForSpell(id)) session_.castSpell(id, 0, wantMove_ || moving_);  // 8690
-        }
+        if (settings_.values().barassignment == 0) return castBookSpell(act);
+        if (idx >= 0 && idx < static_cast<int>(bookSpells_.size())) beginSpellAssignment(bookSpells_[idx], act);
         return true;
     }
     if (act == kIdBookPrev) {

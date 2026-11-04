@@ -1,3 +1,4 @@
+#include "rendering/psp/psp_fishing_visual.hpp"
 // The game objects' models (every one needs its model - a mailbox once had none on hardware). The session keeps the objects in sight (psp_world_session_gameobject.cpp); their
 // displays are GameObjectDisplayInfo M2s baked into data/gameobjects.pak (psp_model_conv --gameobjects, index
 // "gidx"). Here: a second ModelRenderer (RAM only - the doodads own the eDRAM), fed the objects within kGoRange
@@ -8,11 +9,14 @@
 #include "ui/psp/ui_world_screen.hpp"
 
 #include "platform/psp/psp_config.hpp"
+#include "platform/psp/psp_display.hpp"
+#include "platform/psp/psp_bigheap.hpp"
 #include "platform/psp/psp_fs.hpp"
 #include "platform/psp/psp_log.hpp"
 #include "platform/psp/psp_prof.hpp"
 
 #include <glm/gtc/matrix_transform.hpp>
+#include <pspgu.h>
 
 #include <algorithm>
 #include <cmath>
@@ -31,6 +35,11 @@ constexpr int kGoTileA = -2000, kGoTileB = -2001;  // the two pseudo-tiles (outs
 }  // namespace
 
 void WorldScreen::updateGameObjects() {
+    const uint64_t bobber=session_.fishingBobber();
+    if(bobber!=fishingVisualGuid_) {
+        fishingVisualGuid_=bobber;fishingSpawnMs_=bobber ? pp::logUptimeMs() : 0;
+    }
+    if (goPak_.isOpen()) goModels_.retryCollisions(goPak_);
     if (goState_ < 0) return;
     if (goState_ == 0) {
         goState_ = -1;
@@ -108,6 +117,14 @@ void WorldScreen::updateGameObjects() {
         return std::memcmp(&a, &b, sizeof(a)) == 0;
     };
     if (placed.size() == goPlaced_.size() && std::equal(placed.begin(), placed.end(), goPlaced_.begin(), same)) return;
+    bool needsModel=false;
+    for(const auto& p:placed)if(!goModels_.modelKnown(p.model)){needsModel=true;break;}
+    if(needsModel && !pp::heapGivesKb(4096)) {
+        // Keep the current set intact and retry after cleanup; don't allocate
+        // new object textures into the world's last remaining heap block.
+        goSeenVersion_=~version;
+        return;
+    }
     // The new set as the other pseudo-tile, then the old one dropped (models in both stay resident).
     const int newTile = goTile_ ? kGoTileA : kGoTileB, oldTile = goTile_ ? kGoTileB : kGoTileA;
     goModels_.viewDistance = models_.viewDistance;  // the graphics menu's model distance
@@ -129,7 +146,89 @@ void WorldScreen::updateGameObjects() {
 void WorldScreen::drawGameObjects(const rp::TerrainCamera& cam, uint32_t fogABGR) {
     if (goState_ <= 0 || goPlaced_.empty()) return;
     PROF_SCOPE("draw.gameobjects");
+    const uint64_t bobber=session_.fishingBobber();
+    goModels_.visualOffset(static_cast<uint32_t>(bobber)^static_cast<uint32_t>(bobber>>32),fishingBobberVisualOffset());
     goModels_.draw(cam, fogABGR);
+}
+
+float WorldScreen::fishingBobberVisualOffset() const {
+    return rp::fishingBobberDip(pp::logUptimeMs(),session_.bobberBiteMs());
+}
+
+void WorldScreen::drawFishingLine(const rp::TerrainCamera& cam) {
+    if(!session_.isChanneling())return;
+    const auto* bobber=session_.findGameObject(session_.fishingBobber());
+    if(!bobber)return;
+    float point[3];
+    if(!player_.weaponTip(15,point))return; // no stale hand position or invented floating line
+    const glm::vec3 tip(point[0],point[1],point[2]);
+    const glm::vec3 end=bobber->pos+glm::vec3(0,0,fishingBobberVisualOffset()+.05f);
+    const glm::mat4 proj=glm::perspective(glm::radians(cam.fovyDeg),480.f/272.f,cam.nearZ,cam.farZ);
+    const glm::mat4 view=glm::lookAt(glm::vec3(0),cam.forward,cam.up),identity(1.f);
+    ScePspFMatrix4 m;
+    std::memcpy(&m,&proj[0][0],sizeof(m));sceGuSetMatrix(GU_PROJECTION,&m);
+    std::memcpy(&m,&view[0][0],sizeof(m));sceGuSetMatrix(GU_VIEW,&m);
+    std::memcpy(&m,&identity[0][0],sizeof(m));sceGuSetMatrix(GU_MODEL,&m);
+    struct Vertex {uint32_t color;float x,y,z;};
+    constexpr int segments=12;
+    auto* vertices=static_cast<Vertex*>(sceGuGetMemory((segments+1)*sizeof(Vertex)));
+    if(!vertices)return;
+    for(int i=0;i<=segments;++i) {
+        const glm::vec3 p=rp::fishingLinePoint(tip,end,i/static_cast<float>(segments))-cam.pos;
+        vertices[i]={0xFF8A9A9Au,p.x,p.y,p.z};
+    }
+    sceGuDisable(GU_TEXTURE_2D);sceGuDisable(GU_LIGHTING);sceGuDisable(GU_BLEND);sceGuDisable(GU_ALPHA_TEST);sceGuDisable(GU_FOG);
+    sceGuEnable(GU_DEPTH_TEST);sceGuDepthMask(GU_TRUE);
+    sceGuDrawArray(GU_LINE_STRIP,GU_COLOR_8888|GU_VERTEX_32BITF|GU_TRANSFORM_3D,segments+1,nullptr,vertices);
+    sceGuDepthMask(GU_FALSE);sceGuEnable(GU_TEXTURE_2D);pp::textureResetBinding();
+}
+
+void WorldScreen::drawFishingSplash(const rp::TerrainCamera& cam) {
+    const uint64_t guid=session_.fishingBobber();
+    const auto* bobber=guid?session_.findGameObject(guid):nullptr;
+    if(!bobber || pp::displayListFree()<8192)return;
+    const uint32_t now=pp::logUptimeMs(),bite=session_.bobberBiteMs();
+    uint32_t stamp=bite && now-bite<850u ? bite : (fishingVisualGuid_==guid?fishingSpawnMs_:0);
+    if(!stamp || now-stamp>=850u)return;
+    const float age=(now-stamp)/1000.f;
+    const glm::mat4 proj=glm::perspective(glm::radians(cam.fovyDeg),480.f/272.f,cam.nearZ,cam.farZ);
+    const glm::mat4 view=glm::lookAt(glm::vec3(0),cam.forward,cam.up),identity(1.f);
+    ScePspFMatrix4 m;
+    std::memcpy(&m,&proj[0][0],sizeof(m));sceGuSetMatrix(GU_PROJECTION,&m);
+    std::memcpy(&m,&view[0][0],sizeof(m));sceGuSetMatrix(GU_VIEW,&m);
+    std::memcpy(&m,&identity[0][0],sizeof(m));sceGuSetMatrix(GU_MODEL,&m);
+    struct V {uint32_t color;float x,y,z;};
+    constexpr int sides=16,drops=8,maxVertices=2*sides*6+drops*6;
+    auto* v=static_cast<V*>(sceGuGetMemory(maxVertices*sizeof(V)));if(!v)return;
+    int n=0;
+    const glm::vec3 origin=bobber->pos-cam.pos+glm::vec3(0,0,.04f);
+    auto emit=[&](glm::vec3 p,uint32_t c){v[n++]={c,p.x,p.y,p.z};};
+    for(int ring=0;ring<2;++ring) {
+        const float t=(age-ring*.12f)/.72f;if(t<0 || t>=1)continue;
+        const float radius=.06f+.7f*t,width=.025f*(1-t);
+        const uint32_t c=(static_cast<uint32_t>(170*(1-t))<<24)|0x00E8E2C8u;
+        for(int k=0;k<sides;++k) {
+            const float a=k*6.2831853f/sides,b=(k+1)*6.2831853f/sides;
+            const glm::vec3 da(std::cos(a),std::sin(a),0),db(std::cos(b),std::sin(b),0);
+            const auto p0=origin+da*(radius-width),p1=origin+da*(radius+width),p2=origin+db*(radius-width),p3=origin+db*(radius+width);
+            emit(p0,c);emit(p1,c);emit(p2,c);emit(p2,c);emit(p1,c);emit(p3,c);
+        }
+    }
+    const float t=age/.6f;
+    if(t<1) {
+        const glm::vec3 right=glm::normalize(glm::cross(cam.forward,cam.up))*.026f,up=cam.up*.045f;
+        const uint32_t c=(static_cast<uint32_t>(220*(1-t))<<24)|0x00F4EADCu;
+        for(int k=0;k<drops;++k) {
+            const float a=k*6.2831853f/drops;
+            const auto p=origin+glm::vec3(std::cos(a)*t*.45f,std::sin(a)*t*.45f,.4f*std::sin(3.14159265f*t));
+            emit(p-right-up,c);emit(p+right-up,c);emit(p-right+up,c);emit(p-right+up,c);emit(p+right-up,c);emit(p+right+up,c);
+        }
+    }
+    sceGuDisable(GU_TEXTURE_2D);sceGuDisable(GU_LIGHTING);sceGuDisable(GU_ALPHA_TEST);sceGuDisable(GU_FOG);sceGuDisable(GU_CULL_FACE);
+    sceGuEnable(GU_DEPTH_TEST);sceGuDepthMask(GU_TRUE);sceGuEnable(GU_BLEND);
+    sceGuBlendFunc(GU_ADD,GU_SRC_ALPHA,GU_ONE_MINUS_SRC_ALPHA,0,0);
+    sceGuDrawArray(GU_TRIANGLES,GU_COLOR_8888|GU_VERTEX_32BITF|GU_TRANSFORM_3D,n,nullptr,v);
+    sceGuDisable(GU_BLEND);sceGuDepthMask(GU_FALSE);sceGuEnable(GU_TEXTURE_2D);pp::textureResetBinding();
 }
 
 }  // namespace wowee::ui::psp
