@@ -164,6 +164,7 @@ private:
     std::vector<SpellFxKitStarts> kitStarts_;
     uint32_t kitsRetryMs_ = 0;
     bool kitsUnavailable_ = false;
+    bool kitStartsUnavailable_ = false;
     std::vector<SpellFxVisual> visuals_;          // sorted by visual id
     // Flat sorted records keep the all-spell index small on PSP.
     std::vector<SpellFxAuraVisual> auraEffects_;

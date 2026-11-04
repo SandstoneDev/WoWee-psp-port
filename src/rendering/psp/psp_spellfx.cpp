@@ -95,34 +95,40 @@ SpellFxRenderer::~SpellFxRenderer() {
 }
 
 bool SpellFxRenderer::loadKits() {
-    if(!kits_.empty()) return true;
-    if(kitsUnavailable_) return false;
+    const bool haveKits = !kits_.empty();
+    if (haveKits && (!kitStarts_.empty() || kitStartsUnavailable_)) return true;
+    if (kitsUnavailable_) return false;
     const uint32_t now=pp::logUptimeMs();
-    if(kitsRetryMs_ && static_cast<int32_t>(now-kitsRetryMs_)<0) return false;
+    if(kitsRetryMs_ && static_cast<int32_t>(now-kitsRetryMs_)<0) return haveKits;
     kitsRetryMs_=(now+2000u)|1u;
     char path[256]; pp::fsPath(path,sizeof(path),"data/spellfx.pak");
     pp::Pak pak;
-    if (!pak.open(path)) return false;
-    const auto* entry=pak.find("kits");
-    if (!entry || !entry->size || entry->size>1024u*1024u || entry->size%sizeof(SpellFxKitMeta)) {
-        kitsUnavailable_=true;
-        PSP_LOGW(pp::tag::Gfx,"spell_kits unavailable: missing/invalid kits record in spellfx.pak");
-        return false;
+    if (!pak.open(path)) return haveKits;
+    if (!haveKits) {
+        const auto* entry=pak.find("kits");
+        if (!entry || !entry->size || entry->size>1024u*1024u || entry->size%sizeof(SpellFxKitMeta)) {
+            kitsUnavailable_=true;
+            PSP_LOGW(pp::tag::Gfx,"spell_kits unavailable: missing/invalid kits record in spellfx.pak");
+            return false;
+        }
+        void* data=pak.load(entry);
+        if (!data) return false;
+        const auto* rows=static_cast<const SpellFxKitMeta*>(data);
+        kits_.assign(rows,rows+entry->size/sizeof(*rows));
+        pp::pakFree(data);
+        std::sort(kits_.begin(),kits_.end(),[](const auto& a,const auto& b){return a.visual<b.visual;});
+        PSP_LOGI(pp::tag::Gfx,"spell_kits loaded=%u",static_cast<unsigned>(kits_.size()));
     }
-    void* data=pak.load(entry);
-    if (!data) return false;
-    const auto* rows=static_cast<const SpellFxKitMeta*>(data);
-    kits_.assign(rows,rows+entry->size/sizeof(*rows));
-    pp::pakFree(data);
-    std::sort(kits_.begin(),kits_.end(),[](const auto& a,const auto& b){return a.visual<b.visual;});
-    if(const auto* starts=pak.find("kitstarts");starts && starts->size<=1024u*1024u && starts->size%sizeof(SpellFxKitStarts)==0) {
+    const auto* starts = pak.find("kitstarts");
+    if (starts && starts->size && starts->size <= 1024u * 1024u && starts->size % sizeof(SpellFxKitStarts) == 0) {
         if(void* data=pak.load(starts)) {
             const auto* rows=static_cast<const SpellFxKitStarts*>(data);
             kitStarts_.assign(rows,rows+starts->size/sizeof(*rows));pp::pakFree(data);
             std::sort(kitStarts_.begin(),kitStarts_.end(),[](const auto& a,const auto& b){return a.visual<b.visual;});
         }
+    } else {
+        kitStartsUnavailable_ = true;
     }
-    PSP_LOGI(pp::tag::Gfx,"spell_kits loaded=%u",static_cast<unsigned>(kits_.size()));
     return !kits_.empty();
 }
 

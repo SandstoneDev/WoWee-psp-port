@@ -304,7 +304,14 @@ void SettingsMenu::load() {
     // No new key: migrate existing manual configs without replacing their values.
     // New installs and existing adaptive configs select Adaptive by default.
     const int savedPreset=pp::configGetInt("graphicspreset",-1);
-    if(savedPreset<0)values_.graphicspreset=pp::configGetInt("adaptive30",1)?kGraphicsAdaptive:kGraphicsCustom;
+    if (savedPreset < 0) {
+        const int legacyAdaptive = pp::configGetInt("adaptive30", -1);
+        const bool hasManualGraphics = std::any_of(std::begin(kRows), std::end(kRows), [](const Row& row) {
+            return graphicsQualityKey(row.desc.key) && !pp::configGet(row.desc.key).empty();
+        });
+        values_.graphicspreset = legacyAdaptive < 0 && hasManualGraphics ? kGraphicsCustom :
+                                 legacyAdaptive == 0 ? kGraphicsCustom : kGraphicsAdaptive;
+    }
     applyGraphicsPreset(values_,values_.graphicspreset);
     const GraphicsSettings& s = values_;
     PSP_LOGI(pp::tag::Gfx,

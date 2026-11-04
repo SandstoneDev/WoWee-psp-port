@@ -1090,9 +1090,9 @@ void WorldSession::selectGossipOption(uint32_t optionId, const std::string& code
         const bool isVendor = text == "GOSSIP_OPTION_VENDOR" ||
                               (textLower.find("browse") != std::string::npos &&
                                (textLower.find("goods") != std::string::npos || textLower.find("wares") != std::string::npos)) ||
-                              text.find("Ñ‚Ð¾Ð²Ð°Ñ€") != std::string::npos;  // PSP: ruRU
+                              text.find("товар") != std::string::npos;  // PSP: ruRU
         const bool isArmorer = text == "GOSSIP_OPTION_ARMORER" || textLower.find("repair") != std::string::npos ||
-                               text.find("Ð¿Ð¾Ñ‡Ð¸Ð½") != std::string::npos;  // PSP: ruRU
+                               text.find("почин") != std::string::npos;  // PSP: ruRU
         if (isVendor || isArmorer) {
             if (isArmorer) setVendorCanRepair(true);
             socket_->send(game::ListInventoryPacket::build(currentGossip_.npcGuid));

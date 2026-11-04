@@ -11,7 +11,7 @@ def function(signature):
         depth+=(source[end]=='{')-(source[end]=='}'); end+=1
     return source[begin:end]+'\n'
 methods=''.join(function(s) for s in ['bool SpellFxRenderer::readRaw(',
-    'bool SpellFxRenderer::readTexture(', 'const pp::Texture* SpellFxRenderer::texture('])
+    'bool SpellFxRenderer::readTexture(', 'const pp::Texture* SpellFxRenderer::texture(', 'bool SpellFxRenderer::loadKits('])
 cpp=r'''
 #include <algorithm>
 #include <cassert>
@@ -23,7 +23,27 @@ cpp=r'''
 #include <unordered_map>
 #include <vector>
 #define PSP_LOGE(...) ((void)0)
+#define PSP_LOGW(...) ((void)0)
+#define PSP_LOGI(...) ((void)0)
+struct SpellFxKitMeta { uint32_t visual; };
+struct SpellFxKitStarts { uint32_t visual; };
 namespace pp {
+unsigned pakOpens=0, kitReads=0, startReads=0;
+bool failStarts=true, haveStarts=true;
+void fsPath(char*, size_t, const char*) {}
+void pakFree(void* p) { std::free(p); }
+struct Entry { size_t size; bool starts; };
+struct Pak {
+    bool open(const char*) { ++pakOpens; return true; }
+    const Entry* find(std::string name) const {
+        static const Entry kit{sizeof(SpellFxKitMeta),false}, start{sizeof(SpellFxKitStarts),true};
+        return name=="kits" ? &kit : haveStarts ? &start : nullptr;
+    }
+    void* load(const Entry* entry) const {
+        if(entry->starts){++startReads;if(failStarts)return nullptr;}else ++kitReads;
+        return std::calloc(1,entry->size);
+    }
+};
 struct Texture { void* pixels=nullptr; };
 unsigned now=100,opens=0,closes=0,reads=0;
 bool tight=true,failOpen=false,failRead=false,badAsset=false;
@@ -51,6 +71,11 @@ int fd_=-1;std::string path_="spellfx.pak";
 uint32_t lastReadMs_=0,frame_=1,cacheBytes_=0;
 std::vector<uint32_t> texOff_{100},texSize_{64};
 std::unordered_map<uint16_t,std::unique_ptr<TexEntry>> textures_;
+std::vector<SpellFxKitMeta> kits_;
+std::vector<SpellFxKitStarts> kitStarts_;
+uint32_t kitsRetryMs_=0;
+bool kitsUnavailable_=false,kitStartsUnavailable_=false;
+bool loadKits();
 bool makeRoom(uint32_t) { return true; }
 bool readRaw(uint32_t,void*,uint32_t);
 bool readTexture(uint16_t,TexEntry&);
@@ -75,6 +100,18 @@ int main() {
     SpellFxRenderer spare;SpellFxRenderer::TexEntry cached;
     assert(spare.readTexture(0,cached)&&spare.fd_==7); // retain normal fast path with spare slots
     sceIoClose(spare.fd_);
+    SpellFxRenderer metadata;
+    pp::now=3000;
+    assert(metadata.loadKits() && metadata.kitStarts_.empty() && pp::kitReads==1 && pp::startReads==1);
+    assert(metadata.loadKits() && pp::pakOpens==1);
+    pp::now=5100;pp::failStarts=false;
+    assert(metadata.loadKits() && metadata.kitStarts_.size()==1 && pp::kitReads==1 && pp::startReads==2);
+    assert(metadata.loadKits() && pp::pakOpens==2);
+    SpellFxRenderer legacy;
+    pp::haveStarts=false;
+    assert(legacy.loadKits() && legacy.kitStartsUnavailable_);
+    pp::now=9000;
+    assert(legacy.loadKits() && pp::pakOpens==3);
     std::puts("Spell file pressure passed: temporary failures recover, tight readers release files, cached textures remain visible.");
 }
 '''

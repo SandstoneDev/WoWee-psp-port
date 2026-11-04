@@ -20,7 +20,7 @@ The world sound profile now resolves its existing authored race/sex death entry 
 
 While dead/ghost, normal zone music and zone/weather ambience are replaced by the original extracted client `sound/ambience/ghoststate.wav`, transcoded to PSP MPEG-1 Layer III. The existing music decoder streams the full track rather than allocating its 48 seconds as resident PCM. It uses Ambient volume while dead, restores Music volume and normal authored zone selection on resurrection, clears pending zone-track requests at transitions, and retries a missing file with a five-second backoff. Death-to-ghost does not restart the ambience. This does not implement the original client's complete DSP/filter pipeline or claim sample-identical MP3/gapless playback.
 
-Prepared file: `outputs/Death-audio-fix/data/music/ambience/ghoststate.mp3` (768,545 bytes). All 1,842 MPEG-1 Layer III frames were checked, 44.1 kHz, approximately 48.118 seconds including codec padding. The source WAV is 48.065 seconds. `tools/psp/encode_ghost_mp3_windows.cpp` reproduces it with Windows Media Foundation; `tools/psp/rebuild_ghost_ambience.sh` can regenerate it using ffmpeg from an extracted client. The media file is kept outside source-review archives.
+Generate the MP3 locally from the user's extracted 3.3.5a client with FFmpeg and libmp3lame. See the install command below. The source repository contains the conversion scripts only.
 
 ## Install
 
@@ -31,7 +31,13 @@ bash tools/psp/build_psp.sh
 ```
 
 2. Copy the rebuilt `psp/bin/EBOOT.PBP` to the game directory.
-3. Merge the `data` folder in `Death-audio-fix.zip` into the game's existing `data` folder. The new file must be `data/music/ambience/ghoststate.mp3`.
+3. Generate the ambience into the game's existing data directory. Run this from the WoWee PSP source root, or from Kiln's baker source root:
+
+```bash
+bash tools/psp/rebuild_ghost_ambience.sh /path/to/extracted-client /path/to/WOWEEPSP/data
+```
+
+The command reads `sound/ambience/ghoststate.wav` from the extraction and writes `data/music/ambience/ghoststate.mp3`. Use your own client data for both files.
 
 No sounds.pak or audio.pak rebake is needed with the current packs. Existing asset updates from earlier fixes still apply. The ghost ambience file is new and must be copied along with the EBOOT.
 

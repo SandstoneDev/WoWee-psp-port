@@ -1,4 +1,3 @@
-#include "platform/psp/psp_rest_triggers.hpp"
 // Target selection and the unit frames (player + target).
 //
 // Target: D-pad right = the next unit/player (upstream CombatHandler::tabTarget:
@@ -489,7 +488,7 @@ void WorldScreen::drawUnitFrame(UiRenderer& ui, const UnitView& u, float x, floa
     if (mirrored && isSelf) {
         const bool resting = (session_.selfField(game::fieldIndex(UF::PLAYER_FLAGS)) & 0x20u) != 0;  // PLAYER_FLAGS_RESTING
         const bool modeSwords = controlsScheme_ >= 2 && combatMode_;
-        if (pp::showRestStatus(resting,session_.inCombat(),session_.autoAttacking())) st = St::Rest;
+        if (resting && !session_.inCombat() && !session_.autoAttacking()) st = St::Rest;
         else if (session_.autoAttacking()) st = St::Attack;
         else if (modeSwords || session_.inCombat()) st = St::Swords;
     }

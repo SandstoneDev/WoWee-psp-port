@@ -19,7 +19,7 @@ def main():
     env=dict(os.environ,CXX=args.cxx)
     def run(command):
         subprocess.run([str(x) for x in command],cwd=ROOT,env=env,check=True)
-    for name in ["forced_movement","decoration_removal","bag_navigation","movement_cast_audio","cast_sustain","stream_retry","fishing_owner","fishing_splash","death_audio","wmo_landmarks","window_menu","window_hints","object_fog","settings_categories","settings_dropdown","graphics_presets","player_portrait"]:
+    for name in ["forced_movement","decoration_removal","bag_navigation","movement_cast_audio","cast_sustain","spell_file_pressure","stream_retry","fishing_owner","fishing_splash","death_audio","wmo_landmarks","window_menu","window_hints","object_fog","settings_categories","settings_dropdown","graphics_presets","player_portrait"]:
         run([sys.executable,ROOT/"tests"/("test_psp_"+name+".py"),args.cxx])
     cases={
         "action_assignment":[],
@@ -37,7 +37,6 @@ def main():
         "wmo_landmarks":[],
         "camera_ray":[],
         "wmo_batch":[],
-        "rest_triggers":[],
         "fishing":["src/rendering/animation/combat_fsm.cpp","src/core/logger.cpp"],
         "tree_alpha":["src/pipeline/blp_loader.cpp","src/core/logger.cpp"],
     }

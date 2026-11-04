@@ -8,10 +8,9 @@ Removed the Full-Screen Glow setting, preset writes, adaptive glow helper and te
 
 The supplied hardware log shows Brill trigger 719 suppressed on the first post-load check at 598.340 s. That trigger was inserted into the active set, so it could not notify the server again until the character left/re-entered it. The later entry fired at 798.196 s and the server allowed instant logout at 802.909 s. This supports an arrival/login suppression bug; it does not establish every cause of missing resting in a newer session.
 
-Known WotLK rest notifications now bypass portal cooldown/first-sample suppression. Ordinary portals and paired-return protection retain their previous behavior. Shapes, coordinates, client notification cadence and server validation are unchanged. The normal initial trigger scan delay still applies after world entry. The client does not invent resting, rested XP or instant logout: those still come from server flags/logout responses.
+An earlier revision used a rest-trigger ID list derived from the AzerothCore tavern SQL. That list and its test fixtures were removed during review. First-sample and post-transfer portal suppression are back to the existing policy for every trigger. An inn occupied on arrival may still require leaving and re-entering before the client sends the trigger. The server owns resting, rested XP and instant logout.
 
-Rest trigger identities were checked against the AzerothCore WotLK tavern table, which identifies 719 as Gallows' End Tavern in Brill:
-https://github.com/azerothcore/azerothcore-wotlk/blob/master/data/sql/base/db_world/areatrigger_tavern.sql
+An independent follow-up can derive candidate regions from the user's local client geometry and verify classifications against ordinary movement and server rest-state changes. Client trigger geometry alone cannot establish that a trigger is a tavern. A server-specific local override would need independently observed trigger IDs and should remain outside distributed data.
 
 A selected PSP controller combat mode no longer hides the resting portrait state by itself. Actual combat/attacking still takes precedence. Rested XP bonus and its accumulation remain server-controlled.
 

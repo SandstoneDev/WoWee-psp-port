@@ -344,7 +344,7 @@ can be left out with `-DWOWEE_PSP_SPLASH=OFF`.
 The matching Kiln source must also be rebuilt for converter changes. Rebuild `ui.pak` for the critical-hit font,
 `sounds.pak` and its parts for NPC speech, and each affected world's doodads plus big-WMO companions for terrain and
 opaque tree materials. Rebuild `characters.pak`, `creatures.pak` and `spellfx.pak` for the current authored spell
-and loot animation changes. Music remains under `data/music/`. Ghost ambience uses a separately prepared
+and loot animation changes. Music remains under `data/music/`. Ghost ambience uses a locally generated
 `data/music/ambience/ghoststate.mp3`. See [death audio setup](docs/PSP_FISHING_CHARGE_DEATH_AUDIO.md). See [follow-up notes](docs/PSP_UI_WORLD_FOLLOWUP.md) for
 build and copy requirements. Asset changes and EBOOT changes are separate; keep their versions matched.
 

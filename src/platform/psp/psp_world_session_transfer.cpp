@@ -1,4 +1,3 @@
-#include "platform/psp/psp_rest_triggers.hpp"
 // transfers between maps, area triggers and the instance messages of the PSP
 // world session (include/platform/psp/psp_world_session.hpp). GameHandler,
 // MovementHandler and SocialHandler are not built for the PSP (see psp_world_session_combat.cpp), so their steps
@@ -736,13 +735,8 @@ void WorldSession::updateAreaTriggers(float dtSec, const glm::vec3& selfPos) {
         }
         if (in) {
             if (activeAreaTriggers_.count(at.id)) continue;
-            const bool restTrigger=isRestAreaTrigger(at.id);
-            const bool suppress=suppressAreaTrigger(at.id,suppressFirst,cooldownActive,postTransferReturnTrigger_==at.id);
-            if (restTrigger) {
-                // Inn notifications are safe at login/hearthstone destinations.
-                // The server still validates the trigger and owns PLAYER_FLAGS_RESTING.
-                activeAreaTriggers_.insert(at.id);
-            } else if (suppressFirst) {
+            const bool suppress = suppressFirst || cooldownActive || postTransferReturnTrigger_ == at.id;
+            if (suppressFirst) {
                 // upstream: spawned inside a portal - armed, it fires only after leaving and re-entering.
                 if (postTransferReturnTrigger_ == at.id) postTransferReturnSawNear_ = true;
                 activeAreaTriggers_.insert(at.id);

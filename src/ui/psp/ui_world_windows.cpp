@@ -304,7 +304,7 @@ bool WorldScreen::windowSwitchPad(const pp::PadState& pad) {
 }
 
 bool WorldScreen::windowBack(const pp::PadState& pad) {
-    if(!(pad.pressed&PSP_CTRL_CIRCLE))return false;
+    if(!((pad.pressed|pad.released)&PSP_CTRL_CIRCLE))return false;
     if(invHeld_.active && !windowOpen(kWinDeleteItem)){invHeld_=InvHeld{};winFocus_.cancelPresses();return true;}
     if(bookPick_){bookPick_=0;bookPickItem_=false;winFocus_.cancelPresses();return true;}
     const uint8_t w=activeWindow();
@@ -354,10 +354,10 @@ void WorldScreen::updateWindows(const pp::PadState& pad, float dtSec) {
     for (auto it = windows_.rbegin(); it != windows_.rend(); ++it)
         if (isPopupWindow(*it)) { modal = *it; break; }
     winFocus_.setModalGroup(modal);
-    if(windowBack(pad)){winFocus_.update(pp::PadState{},dtSec);return;}
-    if (modal == kWinDeleteItem && (pad.pressed & PSP_CTRL_CIRCLE)) {
-        invHeld_ = InvHeld{};
-        closeWindow(kWinDeleteItem);
+    const uint8_t active = activeWindow();
+    const bool immediateBack = invHeld_.active || bookPick_ || !active ||
+                               active == kWinDeleteItem || active == kWinBags || deathPopupKeepsOnEscape(active);
+    if ((pad.pressed & PSP_CTRL_CIRCLE) && immediateBack && windowBack(pad)) {
         winFocus_.update(pp::PadState{}, dtSec);
         return;
     }
@@ -413,7 +413,11 @@ void WorldScreen::updateWindows(const pp::PadState& pad, float dtSec) {
         if (lootWindowAction(alt)) return;      // a loot slot: take it
         if (trainerAltAction(alt)) return;      // a trainer service - select and learn it
         if (mapWindowAltAction(alt)) return;    // the map - zoom out (WorldMapButton RightButton)
-        if (alt >= 0x5C80 && alt < 0x5C8C) castBookSpell(alt);  // a book spell - CastSpell
+        if (alt >= 0x5C80 && alt < 0x5C8C) {
+            castBookSpell(alt);  // a book spell - CastSpell
+            return;
+        }
+        windowBack(p);  // no contextual action handled this release
         return;
     }
     const uint32_t act = winFocus_.activated();

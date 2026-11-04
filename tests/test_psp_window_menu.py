@@ -176,3 +176,9 @@ with tempfile.TemporaryDirectory(prefix='wowee-menu-') as temp:
         args=[compiler,'/nologo','/std:c++20','/EHsc','/O2','/FI'+str(root/'tests/psp_npc_async_stubs/host_compat.hpp')]+['/I'+str(p) for p in includes]+[str(src),str(root/'src/ui/psp/ui_focus.cpp'),'/Fe:'+str(exe),'/Fo:'+str(folder)+'\\']
     else:args=[compiler,'-std=c++20','-O2']+['-I'+str(p) for p in includes]+[str(src),str(root/'src/ui/psp/ui_focus.cpp'),'-o',str(exe)]
     subprocess.run(args,cwd=temp,check=True);subprocess.run([str(exe)],check=True)
+
+window_source = (root / "src/ui/psp/ui_world_windows.cpp").read_text(encoding="utf-8")
+window_update = window_source[window_source.index("void WorldScreen::updateWindows("):]
+assert window_update.index("&& immediateBack && windowBack(pad)") < window_update.index("winFocus_.update(p, dtSec)")
+for handler in ("trainerAltAction(alt)", "mapWindowAltAction(alt)", "tradeSkillAltAction(alt)", "castBookSpell(alt)"):
+    assert window_update.index(handler) < window_update.index("windowBack(p);  // no contextual action")

@@ -19,7 +19,7 @@ cpp=r'''#include "ui/psp/ui_graphics_presets.hpp"
 using namespace wowee::ui::psp;
 #define PSP_LOGI(...) ((void)0)
 ''' + settings + r'''
-namespace pp{std::map<std::string,int> config;int configGetInt(const char* key,int fallback){auto i=config.find(key);return i==config.end()?fallback:i->second;}}
+namespace pp{std::map<std::string,int> config;int configGetInt(const char* key,int fallback){auto i=config.find(key);return i==config.end()?fallback:i->second;}std::string configGet(const char* key){auto i=config.find(key);return i==config.end()?std::string{}:std::to_string(i->second);}}
 struct Row {struct Desc{const char* key;int defaultValue;}desc;int GraphicsSettings::*field;int lo,hi;};
 const Row kRows[]={{{"graphicspreset",5},&GraphicsSettings::graphicspreset,0,5},{{"framecap",30},&GraphicsSettings::framecap,30,60},
  {{"m2view",160},&GraphicsSettings::m2view,40,240},{{"spellfx",1},&GraphicsSettings::spellfx,0,2},
@@ -58,6 +58,7 @@ int main(){
  assert(menu.setValue("graphicspreset",kGraphicsCustom));assert(menu.values_.m2view==160 && !menu.values_.adaptive30);
  assert(menu.setValue("spellfx",0));assert(menu.values_.spellfx==0);
  pp::config.clear();menu.load();assert(menu.values_.graphicspreset==kGraphicsAdaptive && menu.values_.adaptive30);
+ pp::config={{"m2view",130},{"spellfx",0},{"weather",0},{"brightness",75}};menu.load();assert(menu.values_.graphicspreset==kGraphicsCustom && menu.values_.m2view==130 && menu.values_.spellfx==0 && menu.values_.weather==0 && menu.values_.brightness==75);
  pp::config={{"adaptive30",0},{"m2view",100}};menu.load();assert(menu.values_.graphicspreset==kGraphicsCustom && menu.values_.m2view==100 && !menu.values_.adaptive30);
  pp::config={{"graphicspreset",kGraphicsLow},{"framecap",60}};menu.load();assert(menu.values_.graphicspreset==kGraphicsLow && menu.values_.m2view==80 && menu.values_.framecap==60);
  pp::config={{"graphicspreset",kGraphicsCustom},{"m2view",200},{"adaptive30",1}};menu.load();assert(menu.values_.m2view==200 && !menu.values_.adaptive30);
