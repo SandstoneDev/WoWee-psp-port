@@ -56,13 +56,14 @@ decoration are omitted on PSP. See [water and collision notes](docs/PSP_WATER_CO
 
 Known gaps: WMO-only liquids and distinct magma/slime materials; a few world-map views of dungeons show a placeholder.
 Settings combines graphical options under Graphics and uses the client control art; see [settings and movement notes](docs/PSP_SETTINGS_MOVEMENT_FOLLOWUP.md).
-Northshire wolf and duskbat size reports are still under investigation. Build 123 ran on hardware. The latest
+Enemy reports (aka, Northshire wolves, etc) are still under investigation. Build 123 ran on hardware. The latest
 streaming changes passed host regressions and PSP source syntax checks. Stormwind hearthstone landings, floor
 collision and frame times still need a hardware retest. See [follow-up notes](docs/PSP_UI_WORLD_FOLLOWUP.md).
 
 The frame target defaults to 30 fps; 60 fps can be selected separately from adaptive rendering. These are targets,
 not guaranteed minimums: crowded towns and complex interiors can fall below them. The original PSP-3000 figures
 (about 28 fps median and 41 MB of game heap) are earlier measurements, not a benchmark of this revision.
+
 
 ## Controls
 
