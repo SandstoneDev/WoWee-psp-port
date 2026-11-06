@@ -19,6 +19,7 @@
 // Collapse: the button (in the interface, SELECT) or wowee.cfg watchcollapsed. The window column is only
 // "Book" right of the action bar, under these lines.
 #include "ui/psp/ui_world_screen.hpp"
+#include "ui/psp/ui_psp_layout.hpp"
 
 #include "platform/psp/psp_config.hpp"
 #include "platform/psp/psp_fs.hpp"
@@ -40,7 +41,7 @@ namespace pp = wowee::platform::psp;
 
 namespace {
 
-constexpr uint32_t kIdCollapse = 0x6E00;
+constexpr uint32_t kIdCollapse = 0x6E00,kIdWatchPrev=0x6E01,kIdWatchNext=0x6E02;
 constexpr float kRight = 476.0f, kTop = 126.0f, kBottom = 238.0f;  // under the minimap, above the action bar
 constexpr float kWidth = 150.0f;                                    // WATCHFRAME_EXPANDEDWIDTH 204 at ~0.72
 constexpr uint32_t kTitleCol = 0xFF009CBFu;                         // quest title (0.75, 0.61, 0)
@@ -107,6 +108,7 @@ void WorldScreen::drawWatchFrame(UiRenderer& ui) {
         }
     }
     if (settings_.isOpen()) return;
+    if(watchPspLayout_!=pspLayoutActive()){watchPspLayout_=pspLayoutActive();watchRebuildMs_=0;}
     const auto& log = session_.getQuestLog();
     int watched = 0;
     for (const auto& q : log)
@@ -121,7 +123,8 @@ void WorldScreen::drawWatchFrame(UiRenderer& ui) {
     // Header: OBJECTIVES_TRACKER_LABEL .. " (" .. n .. ")" and the collapse / expand button at its right.
     char title[64];
     std::snprintf(title, sizeof(title), "%s (%d)", CLIENT_STR(OBJECTIVES_TRACKER_LABEL), watched);
-    ui.textShadow(fn, x0, kTop, title, kColGold);
+    if(pspLayoutActive())ui.textMarquee(fs,Rect{x0,kTop,100,14},title,kColGold);
+    else ui.textShadow(fn, x0, kTop, title, kColGold);
     const Rect br{kRight - 14, kTop + 1, 14, 14};
     if (watchBtn_.pixels) {
         const float hw = watchBtn_.uw * 0.5f, hh = watchBtn_.uh * 0.5f;
@@ -139,6 +142,10 @@ void WorldScreen::drawWatchFrame(UiRenderer& ui) {
         }
         winFocus_.setOccluders(occl, n);
         if (winFocus_.addStop(kIdCollapse, br)) ui.fill(br, 0x40FFFFFFu);
+        if(pspLayoutActive() && !watchCollapsed_) {
+            kit_.button(ui,winFocus_,kIdWatchPrev,Rect{430,kTop,14,14},"<");
+            kit_.button(ui,winFocus_,kIdWatchNext,Rect{446,kTop,14,14},">");
+        }
         winFocus_.setOccluders(nullptr, 0);
     }
     if (watchCollapsed_) return;
@@ -202,7 +209,7 @@ void WorldScreen::drawWatchFrame(UiRenderer& ui) {
                     rows.push_back(WatchRow{parts[k], l.second, !l.second && k == 0, 0.0f});  // the dash: first line
             }
             const float h = lh * static_cast<float>(rows.size());
-            if (y + h > kBottom) break;
+            if (!pspLayoutActive() && y+h>kBottom)break;
             for (WatchRow& r : rows) {
                 r.y = y;
                 y += lh;
@@ -212,17 +219,33 @@ void WorldScreen::drawWatchFrame(UiRenderer& ui) {
         }
     }
     const float textX = x0 + 8.0f;
-    for (const WatchRow& r : watchRows_) {
+    size_t first=0,last=watchRows_.size();
+    const float bodyY=kTop+fn.lineHeight()+2;
+    if(pspLayoutActive()) {
+        const size_t perPage=std::max<size_t>(1,static_cast<size_t>((psp_layout::watchBottom-bodyY)/std::max(1.f,lh)));
+        watchPageCount_=std::max<size_t>(1,(watchRows_.size()+perPage-1)/perPage);
+        watchPage_%=watchPageCount_;
+        first=watchPage_*perPage;last=std::min(watchRows_.size(),first+perPage);
+        char page[24];std::snprintf(page,sizeof(page),"%u/%u",static_cast<unsigned>(watchPage_+1),static_cast<unsigned>(watchPageCount_));
+        if(!uiMode_)ui.textShadow(kit_.font(kFontTiny),460,kTop+2,page,kColGrey,Align::Right);
+    }
+    for (size_t i=first;i<last;++i) {
+        const WatchRow& r=watchRows_[i];
+        const float rowY=pspLayoutActive()?bodyY+static_cast<float>(i-first)*lh:r.y;
         if (r.header) {
-            ui.textShadow(fs, x0, r.y, r.text.c_str(), kTitleCol);
+            ui.textShadow(fs, x0, rowY, r.text.c_str(), kTitleCol);
         } else {
-            if (r.dash) ui.textShadow(fs, x0 + 1, r.y, "-", kColWhite);  // QUEST_DASH
-            ui.textShadow(fs, textX, r.y, r.text.c_str(), kColWhite);
+            if (r.dash) ui.textShadow(fs, x0 + 1, rowY, "-", kColWhite);  // QUEST_DASH
+            ui.textShadow(fs, textX, rowY, r.text.c_str(), kColWhite);
         }
     }
 }
 
 bool WorldScreen::watchAction(uint32_t act) {
+    if(pspLayoutActive() && (act==kIdWatchPrev || act==kIdWatchNext)) {
+        watchPage_=(watchPage_+watchPageCount_+(act==kIdWatchNext?1:watchPageCount_-1))%watchPageCount_;
+        playUiSound(UiSound::ButtonClick);return true;
+    }
     if (act != kIdCollapse) return false;
     watchCollapsed_ = !watchCollapsed_;  // WatchFrame_CollapseExpandButton_OnClick
     watchRebuildMs_ = 0;

@@ -463,7 +463,7 @@ bool WorldScreen::drawDressUpWindow(UiRenderer& ui, uint8_t w) {
     // DressUpFramePortrait (60 x 60 at 7,-6) under the frame; SetPortraitTexture is round.
     {
         const Rect pr{PX(7), PY(6), 60 * kSX, 60 * kSY};
-        if (race > 0 && race < 12 && ufArt_.portrait[race][sex].pixels) ui.imageCircle(ufArt_.portrait[race][sex], pr);
+        if (race > 0 && race < 12 && ownPortrait(race,sex).pixels) ui.imageCircle(ownPortrait(race,sex), pr);
         else ui.fillCircle(Rect{pr.x + 2, pr.y + 2, pr.w - 4, pr.h - 4}, 0xFF101010u);
     }
     const Font& fn = kit_.font(kFontNormal);

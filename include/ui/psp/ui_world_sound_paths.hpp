@@ -162,7 +162,6 @@ inline std::vector<std::string> jump(const std::string& raceFolder, const std::s
     std::vector<std::string> c;
     for (const auto& exert : exertionPrefixes(raceBase, male)) c.push_back(exert + "Jump.wav");
     c.push_back(prefix + stem + "Jump1.wav");
-    c.push_back(prefix + stem + "Land1.wav");
     c.push_back(prefix + stem + "JumpA.wav");
     c.push_back(prefix + stem + "JumpB.wav");
     c.push_back(prefix + stem + "Jump.wav");

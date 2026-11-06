@@ -13,10 +13,13 @@
 // Main thread only. update() plans what should be resident and installs what the loader read; frees happen only
 // there (after frameEnd's sceGuSync), never in draw.
 #pragma once
+#include "rendering/psp/psp_wmo_batch_cache.hpp"
 
 #include "platform/psp/psp_texture.hpp"
 #include "rendering/psp/psp_bigwmo_format.hpp"
 #include "rendering/psp/psp_bigwmo_vis.hpp"
+#include "rendering/psp/psp_collision_bounds_index.hpp"
+#include "rendering/psp/psp_wmo_group_cache.hpp"
 #include "rendering/psp/psp_terrain.hpp"  // TerrainCamera
 
 #include <pspgu.h>
@@ -30,11 +33,12 @@ namespace wowee::rendering::psp {
 
 struct BigWmoConfig {
     uint32_t budgetBytes = 3u << 20;  // wowee.cfg wmobudget (KB): meshes + shells + collision + textures
-    float collisionYd = 40.0f;        // wmocolyd: "q_" of chunks within this (XY) of the player or the camera
+    float collisionYd = 10.0f;        // wmocolyd: optional player-centered prefetch, capped at 10 yd
     float doodadYd = 160.0f;          // wmodoodadyd: "dd_" of cells within this of the camera
     float prefetchSec = 1.5f;         // wmoprefetch: also plan from where the camera will be (velocity x this)
     uint32_t texLodBytes = 16384;     // wmotexlod: drop mip 0 of textures whose level 0 is this big (0 off)
     bool portals = true;              // wmoportals=0: every group visible (A/B)
+    bool frontToBack = true;          // wmofrontsort: opaque depth bands before material sorting
     // wmovis: 2 walk + exterior seeds (default: the route's fewest holes), 4 walk-outdoor (kVisWalkOutdoor), 1 walk
     // only, 3 upstream as is.
     int visMode = PortalVisibility::kVisWalkExt;
@@ -55,6 +59,7 @@ struct BigWmoStats {
     uint32_t guardSkipped = 0, badBlobs = 0;
     // Draws of interior-group batches (their baked light, no day/night tint) / of the tinted ones.
     uint32_t interiorDraws = 0, tintedDraws = 0;
+    uint32_t spatialPlans = 0, queueRefreshes = 0, collisionPlans = 0, planCandidates = 0;
 };
 
 class BigWmo {
@@ -91,6 +96,8 @@ public:
     uint32_t uniqueId() const { return uniqueId_; }
     uint16_t doodadSet() const { return doodadSet_; }
     bool doodadsUsable() const { return doodadsOk_; }
+    uint32_t batchSaved() const {return batchSaved_;}
+    uint32_t batchCacheBytes() const {return static_cast<uint32_t>(drawCache_.bytes());}
     // wmo-transports: move it (world = M * local); the next draw / collision use it.
     void setPlacement(const float matrix[12]);
     const glm::mat4& placement() const { return M_; }
@@ -100,7 +107,7 @@ public:
     // Main thread, once per frame before draw: plans residency from the camera (and the player), evicts over the
     // budget, and returns the reads to issue (nearest first, at most maxRequests, none already in flight).
     void update(const glm::vec3& camWorld, const glm::vec3& playerWorld, float dtSec, uint32_t frame,
-                std::vector<Request>& out, uint32_t maxRequests);
+                std::vector<Request>& out, uint32_t maxRequests, bool collisionOnly = false);
     // A read finished (blob from the loader, 64-byte aligned, D-cache written back; ownership taken; nullptr = the
     // read failed: the request may be issued again later).
     // A failed read is asked again only ~5 s later; a blob that fails its check never again (a
@@ -109,6 +116,8 @@ public:
     // A request handed out by update() but not issued (the loader's ring full, no descriptor): no
     // read failed, it is asked again by the next plan (no back-off).
     void cancel(uint32_t key);
+    // The exact pending movement position must be included in the loading plan.
+    void setCollisionProbe(const glm::vec3* world);
     // Reads the caller has issued and not yet installed.
     uint32_t inFlight() const { return inFlight_; }
 
@@ -126,12 +135,19 @@ public:
     }
     // Every resident doodad record (set 0 + the placement's set), WMO-local.
     template <typename Fn>
-    void forDoodads(Fn&& fn) const {
+    void forDoodads(Fn&& fn, bool landmarksOnly = false) const {
+        for (const auto& d : landmarks_)
+            if (d.set == 0 || d.set == doodadSet_) fn(d);
+        if (landmarksOnly) return;
         for (const Res& r : cellDoodads_) {
             if (!r.blob) continue;
             const auto* d = static_cast<const BigWmoDoodad*>(r.blob);
             for (uint32_t i = 0; i < r.size / sizeof(BigWmoDoodad); ++i)
-                if (d[i].set == 0 || d[i].set == doodadSet_) fn(d[i]);
+                if (d[i].set == 0 || d[i].set == doodadSet_) {
+                    const bool landmark=std::any_of(landmarks_.begin(),landmarks_.end(),
+                        [&](const BigWmoDoodad& l){return l.index==d[i].index;});
+                    if (!landmark) fn(d[i]);
+                }
         }
     }
 
@@ -141,7 +157,7 @@ public:
     bool floorHeight(float x, float y, float probeZ, float& outZ) const;
     // The teleport landing hold (ui_teleport_hold.hpp): the collision ("q_") of every chunk whose box lies
     // within radiusYd (XY) of world (x, y) is resident - the floor a landing player needs. wanted / resident: counts.
-    bool collisionReadyAt(float x, float y, float radiusYd, uint32_t& wanted, uint32_t& resident) const;
+    bool collisionReadyAt(float x, float y, float z, float radiusYd, uint32_t& wanted, uint32_t& resident) const;
     void collideWalls(glm::vec3& to, float feetZ) const;
     float raycast(const glm::vec3& origin, const glm::vec3& dir, float maxDist) const;
 
@@ -154,6 +170,7 @@ private:
         uint32_t lastUse = 0;  // frame
         bool requested = false;
         bool wanted = false;
+        bool planned = false;  // candidate before the current memory-budget cut
         float prio = 0.0f;     // distance: smaller first
         bool bad = false;          // failed its check - never read again
         uint32_t retryAtMs = 0;    // a failed read - not before this (pp::logUptimeMs)
@@ -163,6 +180,7 @@ private:
         uint32_t bytes = 0;
         uint32_t lastUse = 0;
         bool requested = false, ok = false, wanted = false;
+        bool planned = false;
         float prio = 0.0f;
         bool bad = false;          // as Res
         uint32_t retryAtMs = 0;
@@ -172,6 +190,8 @@ private:
 
     Res* resOf(uint32_t kind, uint32_t index);
     void want(uint32_t kind, uint32_t index, float prio, uint32_t frame);
+    BigWmoBlobRef planRef(uint32_t kind,uint32_t index) const;
+    void planCollision();
     bool meshReady(const Res& r) const;  // resident and every texture it binds resident
     void freeRes(Res& r, uint32_t kind);
     int findGroup(const glm::vec3& local) const;
@@ -188,6 +208,7 @@ private:
     char path_[128] = {};
     uint32_t uniqueId_ = 0;
     uint16_t doodadSet_ = 0;
+    std::vector<BigWmoDoodad> landmarks_;
     bool doodadsOk_ = false;
     glm::mat4 M_{1.0f}, Minv_{1.0f};
     glm::mat3 A_{1.0f}, Ai_{1.0f};
@@ -195,6 +216,8 @@ private:
     std::vector<Tex> tex_;
     std::vector<std::vector<uint32_t>> groupChunks_;  // chunk ids per group (camera group test)
     std::vector<uint32_t> colResident_;                // chunks with "q_" resident (collision queries)
+    CollisionBoundsIndex collisionBounds_;
+    WmoGroupCache groupCache_;
     std::vector<uint8_t> cellShellMode_;               // hysteresis: 1 = drawing the shell
     std::vector<uint32_t> groupSeen_;                  // frame a group was last visible (interiors stay wanted)
     struct PlanItem {
@@ -206,11 +229,20 @@ private:
     std::vector<uint32_t> reqQueue_;                   // keys to read, nearest first (the last plan)
     size_t reqNext_ = 0;
     bool planDirty_ = true;
+    bool queueDirty_ = true, collisionDirty_ = true, buildingPlan_ = false;
+    bool lastCollisionOnly_ = false;
+    uint32_t requestRefreshMs_ = 0, lastPlanBudget_ = 0;
+    BigWmoConfig plannedCfg_;
+    glm::vec3 lastCollisionPlayer_{1e9f};
+    std::vector<uint32_t> residentKeys_;  // installed resources only, not whole-building tables
     uint32_t curFrame_ = 0;                            // the caller's frame (update)
     glm::vec3 playerLocal_{0.0f};
+    glm::vec3 collisionProbeLocal_{0.0f};
+    bool collisionProbeActive_ = false;
     uint32_t residentBytes_ = 0, textureBytes_ = 0, collisionBytes_ = 0;
     uint32_t inFlight_ = 0;
     bool doodadsChanged_ = false;
+    glm::vec3 lastPlayerPlan_{1e9f};
     glm::vec3 lastCam_{1e9f}, prevCam_{0.0f}, vel_{0.0f};
     uint32_t planFrame_ = 0;
     PortalVisibility vis_;
@@ -221,9 +253,13 @@ private:
         uint16_t cell;
         uint16_t batch;
         uint8_t blend;
-        uint8_t interior;   // a chunk of an interior group (MOGP 0x2000) - its baked light only
+        uint8_t interior;   // a chunk of an interior group (MOGP 0x2000)
+        uint16_t group;     // source WMO group, for per-section lighting corrections
+        uint16_t depthBand; // fills existing padding; calculated once per chunk
         float dist;
     };
+    WmoBatchCache drawCache_;
+    uint32_t batchSaved_=0, batchBuildFrame_=0;
     std::vector<DrawItem> items_;
     std::vector<ScePspFMatrix4> cellMtx_;
     std::vector<uint32_t> cellMtxFrame_;

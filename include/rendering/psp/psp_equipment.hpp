@@ -14,8 +14,11 @@
 
 #include "platform/psp/psp_pak.hpp"
 #include "platform/psp/psp_pak_index.hpp"  // the sorted items.pak
+#include "platform/psp/psp_npc_asset_loader.hpp"
+#include <memory>
 #include "rendering/psp/psp_body_rules.hpp"  // body rules
 #include "rendering/psp/psp_item_format.hpp"
+#include "rendering/psp/psp_item_lookup_cache.hpp"
 
 #include <cstdint>
 #include <unordered_map>
@@ -105,6 +108,19 @@ public:
 
     bool open(const char* path);
     bool isOpen() const { return index_.isOpen() || pak_.isOpen(); }
+    bool prepareNpcRecord(uint32_t displayId);
+    bool equipmentRecordCached(uint32_t id) const {return !id || slotOf_.count(id) || missing_.count(id);}
+    bool equipmentLayerCached(uint16_t id) const {
+        uint32_t bytes=0;
+        return id==kNoItemLayer || layers_.count(id) || peekNpcEntry('q',id,bytes)!=nullptr;
+    }
+    bool warmEquipmentRecord(uint32_t id);
+    bool warmEquipmentLayer(uint16_t id);
+    bool prepareNpcEntry(char prefix,uint32_t id);
+    const void* peekNpcEntry(char prefix,uint32_t id,uint32_t& size) const;
+    bool npcStreaming() const {return npcLoader_!=nullptr;}
+    void setNpcNoIo(bool on) {npcNoIo_=on;npcDeferred_=false;}
+    bool npcDeferred() const {return npcDeferred_;}
     // The baked record, or nullptr when the display id was not baked.
     const ItemDisplay* get(uint32_t displayId);
     // A layer blob ("q_<n>", WLAY) for the caller to blit; free with pakFree.
@@ -127,6 +143,7 @@ public:
     // data's Item.dbc has no such item (a server's custom item: ask the
     // server, SMSG_ITEM_QUERY_SINGLE_RESPONSE) or the pak predates the table.
     bool itemDisplay(uint32_t itemId, uint32_t& displayId, uint8_t& inventoryType);
+    void logLookupStats() const;
     // Budgets (before or after open; a smaller budget applies at the next read).
     void setBudget(uint32_t recordSlots, uint32_t layerCacheBytes);
     // RAM held now: the TOC index (or Pak's TOC) and every cache, bytes.
@@ -135,6 +152,7 @@ public:
     void logStats(const char* at) const;
     // The pak's descriptor goes back after idleMs without a read (the card's few files).
     void releaseIfIdle(uint32_t nowMs, uint32_t idleMs) {
+        trimNpcWarm(nowMs);
         index_.releaseIfIdle(nowMs, idleMs);
         pak_.releaseIfIdle(nowMs, idleMs);
         if (emblemsState_ > 0) emblems_.releaseIfIdle(nowMs, idleMs);  // data/emblems.pak
@@ -188,6 +206,14 @@ public:
     bool emblemsAvailable();  // data/emblems.pak opens (tried once per open())
 
 private:
+    struct NpcWarm {uint32_t key=0,size=0,tick=0,lastMs=0;char name[32]{};void* blob=nullptr;};
+    std::unique_ptr<platform::psp::NpcAssetLoader> npcLoader_;
+    NpcWarm npcWarm_[32];
+    uint32_t npcWarmTick_=0;
+    bool npcNoIo_=false,npcDeferred_=false;
+    void startNpcStreaming(const char* path);
+    void* takeNpcWarm(const char* name,uint32_t& size,bool& known);
+    void trimNpcWarm(uint32_t now);
     struct Slot {
         uint32_t displayId = 0;
         uint32_t lastUse = 0;
@@ -224,6 +250,8 @@ private:
     std::unordered_map<uint16_t, Layer> layers_;
     uint32_t layerBytes_ = 0;
     TableBlock table_[kTableBlocks];
+    ItemLookupCache itemLookup_;
+    uint32_t itemLookupHits_ = 0, itemLookupMisses_ = 0;
     std::unordered_set<uint32_t> tableMissing_;  // blocks the pak has not
     uint32_t recordSlots_ = kRecordSlots, layerBudget_ = kLayerCacheBytes;
     uint32_t tick_ = 0;

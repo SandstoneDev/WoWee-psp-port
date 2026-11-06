@@ -367,7 +367,7 @@ void WorldScreen::achUpdate(float dtSec) {
         if (a.t < 0.0f) continue;
         if (a.focus) a.outAt = std::max(a.outAt, a.t + 1.0f);
         a.focus = false;
-        a.t += dtSec;
+        if(windows_.empty() && !settings_.isOpen() && !session_.logoutPending())a.t += dtSec;
         if (a.t > a.outAt + 1.5f) a.t = -1.0f;
         alerting = alerting || a.t >= 0.0f;
     }

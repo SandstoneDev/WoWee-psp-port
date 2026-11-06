@@ -2,6 +2,8 @@
 
 #include "core/geoset_rules.hpp"
 #include "platform/psp/psp_log.hpp"
+#include "platform/psp/psp_config.hpp"
+#include "platform/psp/psp_bigheap.hpp"
 
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
@@ -29,6 +31,100 @@ uint32_t locationKey(char prefix, uint32_t id) {
 }
 }  // namespace
 
+void ItemBank::startNpcStreaming(const char* path) {
+#if defined(WOWEE_PLATFORM_PSP) || defined(WOWEE_TEST_NPC_ASYNC)
+    if(!pp::configGetInt("npcasync",1)) return;
+    auto loader=std::make_unique<pp::NpcAssetLoader>();
+    if(loader->start(path,pak_.isOpen()?&pak_:nullptr)) npcLoader_=std::move(loader);
+    PSP_LOGI(pp::tag::Gfx,"npc_equipment_async enabled=%d",npcLoader_?1:0);
+#else
+    (void)path;
+#endif
+}
+
+void ItemBank::trimNpcWarm(uint32_t now) {
+    if(npcLoader_) npcLoader_->trim(now);
+    for(auto& warm:npcWarm_)
+        if(warm.key && static_cast<uint32_t>(now-warm.lastMs)>2000u) {
+            if(warm.blob) pp::pakFree(warm.blob);
+            warm=NpcWarm{};
+        }
+}
+
+bool ItemBank::prepareNpcEntry(char prefix,uint32_t id) {
+    if(!npcLoader_) return true;
+    if(prefix=='h' && npcRaceHelms_.count(id)) return true;
+#if defined(WOWEE_PLATFORM_PSP) || defined(WOWEE_TEST_NPC_ASYNC)
+    const uint32_t now=pp::logUptimeMs(),key=locationKey(prefix,id);
+    trimNpcWarm(now);
+    for(auto& warm:npcWarm_)
+        if(warm.key==key) {warm.tick=++npcWarmTick_;warm.lastMs=now;return true;}
+    char name[32];
+    if(prefix=='h') std::snprintf(name,sizeof(name),"hr_%u",static_cast<unsigned>(id));
+    else std::snprintf(name,sizeof(name),"%c_%u",prefix,static_cast<unsigned>(id));
+    pp::NpcAssetLoader::Result result;
+    auto status=npcLoader_->request(key,name,0,result,now);
+    if(status==pp::NpcAssetLoader::Status::Pending && npcLoader_->mayQueue(key)) {
+        const uint32_t limit=std::max<uint32_t>((prefix=='i' || prefix=='h')?64u*1024u:2u*1024u*1024u,result.size);
+        const uint64_t free=pp::heapFreeBytes(),reserve=1536u*1024u+npcLoader_->reservedBytes();
+        const uint32_t allowance=free>reserve?static_cast<uint32_t>(std::min<uint64_t>(free-reserve,limit)):0;
+        status=npcLoader_->request(key,name,allowance,result,now);
+    }
+    if(status!=pp::NpcAssetLoader::Status::Ready && status!=pp::NpcAssetLoader::Status::Missing) return false;
+    NpcWarm* target=&npcWarm_[0];
+    for(auto& warm:npcWarm_) {if(!warm.key){target=&warm;break;}if(warm.tick<target->tick)target=&warm;}
+    if(target->blob) pp::pakFree(target->blob);
+    *target=NpcWarm{};target->key=key;target->tick=++npcWarmTick_;target->lastMs=now;target->size=result.size;
+    std::snprintf(target->name,sizeof(target->name),"%s",name);
+    if(status==pp::NpcAssetLoader::Status::Ready) target->blob=npcLoader_->take(key);
+    return true;
+#else
+    (void)prefix;(void)id;return true;
+#endif
+}
+
+bool ItemBank::prepareNpcRecord(uint32_t id) {
+    if(!id || !npcLoader_ || slotOf_.count(id) || missing_.count(id)) return true;
+    if(!prepareNpcEntry('i',id)) return false;
+    npcDeferred_=false;
+    slotFor(id); // cached record, or a confirmed absent record; no card read
+    return true;
+}
+
+bool ItemBank::warmEquipmentRecord(uint32_t id) {
+    if(equipmentRecordCached(id) || !isOpen())return true;
+    if(npcStreaming())return prepareNpcRecord(id);
+    slotFor(id);return true; // worker disabled: at most this one record per frame
+}
+
+bool ItemBank::warmEquipmentLayer(uint16_t id) {
+    if(equipmentLayerCached(id) || !isOpen())return true;
+    // Keep worker results staged until composition consumes them. Moving every
+    // prepared layer through the smaller layer cache would evict earlier ones.
+    if(npcStreaming())return prepareNpcEntry('q',id);
+    uint32_t bytes=0;void* copy=loadLayer(id,bytes);
+    if(copy)pp::pakFree(copy); // loadLayer retained its normal bounded cache copy
+    return true; // missing/uncacheable assets retain the normal dress fallback
+}
+
+const void* ItemBank::peekNpcEntry(char prefix,uint32_t id,uint32_t& size) const {
+    const uint32_t key=locationKey(prefix,id);
+    for(const auto& warm:npcWarm_) if(warm.key==key) {size=warm.size;return warm.blob;}
+    size=0;return nullptr;
+}
+
+void* ItemBank::takeNpcWarm(const char* name,uint32_t& size,bool& known) {
+    known=false;
+    for(auto& warm:npcWarm_) {
+        if(!warm.key || std::strcmp(warm.name,name)!=0) continue;
+        known=true;size=warm.size;
+        void* blob=warm.blob;
+        if(blob) warm=NpcWarm{}; // confirmed missing entries remain until the cache ages out
+        return blob;
+    }
+    return nullptr;
+}
+
 bool ItemBank::open(const char* path) {
     close();
     // data/emblems.pak beside items.pak (the guild tabard emblems, opened when a guild tabard is dressed).
@@ -39,6 +135,7 @@ bool ItemBank::open(const char* path) {
     if (index_.open(path)) {
         // Where entries are on the card, remembered (the TOC is there too).
         locations_ = static_cast<Location*>(std::calloc(kLocations, sizeof(Location)));
+        startNpcStreaming(path);
         loadBodyRules();
         logStats("open");
         return true;
@@ -46,6 +143,7 @@ bool ItemBank::open(const char* path) {
     // An older items.pak (unsorted, no "~fence").
     const bool ok = pak_.open(path);
     if (ok) {
+        startNpcStreaming(path);
         loadBodyRules();  // the body rules
         logStats("open");
     }
@@ -53,6 +151,9 @@ bool ItemBank::open(const char* path) {
 }
 
 void ItemBank::close() {
+    npcLoader_.reset();
+    for(auto& warm:npcWarm_) {if(warm.blob) pp::pakFree(warm.blob);warm=NpcWarm{};}
+    npcNoIo_=npcDeferred_=false;
     index_.close();
     pak_.close();
     freeCaches();
@@ -99,6 +200,8 @@ void ItemBank::freeCaches() {
         t = TableBlock{};
     }
     tableMissing_.clear();
+    itemLookup_.clear();
+    itemLookupHits_ = itemLookupMisses_ = 0;
     tick_ = 0;
     recordReads_ = recordHits_ = layerReads_ = layerHits_ = tableReads_ = tableHits_ = 0;
     // the location cache
@@ -154,6 +257,10 @@ bool ItemBank::locate(char prefix, uint32_t id) {
 }
 
 void* ItemBank::loadEntry(char prefix, uint32_t id, uint32_t& size) {
+    char stagedName[24];std::snprintf(stagedName,sizeof(stagedName),"%c_%u",prefix,static_cast<unsigned>(id));
+    bool staged=false;void* stagedBlob=takeNpcWarm(stagedName,size,staged);
+    if(staged) return stagedBlob;
+    if(npcNoIo_) {npcDeferred_=true;return nullptr;}
     if (index_.isOpen() && locations_) {
         const uint32_t key = locationKey(prefix, id);
         const Location& l = locations_[locationSlot(key)];
@@ -210,7 +317,7 @@ void ItemBank::prefetchLayers(const uint16_t* layerIds, uint32_t count) {
     uint32_t n = 0;
     for (uint32_t i = 0; i < count && n < 64; ++i) {
         const uint16_t id = layerIds[i];
-        if (id == kNoItemLayer || layers_.count(id)) continue;
+        if (equipmentLayerCached(id)) continue;
         if (std::find(want, want + n, id) != want + n) continue;
         want[n++] = id;
     }
@@ -229,6 +336,9 @@ void ItemBank::setBudget(uint32_t recordSlots, uint32_t layerCacheBytes) {
 
 // A blob by name from whichever pak is open (64-byte aligned, free with pakFree).
 void* ItemBank::loadNamed(const char* name, uint32_t& size) {
+    bool staged=false;void* blob=takeNpcWarm(name,size,staged);
+    if(staged) return blob;
+    if(npcNoIo_) {npcDeferred_=true;return nullptr;}
     if (index_.isOpen()) {
         pp::PakEntry e{};
         if (!index_.find(name, e)) return nullptr;
@@ -254,6 +364,7 @@ ItemBank::Slot* ItemBank::slotFor(uint32_t displayId) {
     void* blob = loadEntry('i', displayId, size);  // its place remembered
     if (!blob || size < sizeof(ItemDisplay) || std::memcmp(blob, "WITM", 4) != 0) {
         if (blob) pp::pakFree(blob);
+        if(npcDeferred_) return nullptr;
         if (missing_.size() >= kMissingMax) missing_.clear();
         missing_.insert(displayId);
         return nullptr;
@@ -356,9 +467,23 @@ void* ItemBank::loadTexture(uint16_t id, uint32_t& size) {
 }
 
 bool ItemBank::itemDisplay(uint32_t itemId, uint32_t& displayId, uint8_t& inventoryType) {
+    uint8_t sheath = kSheathUnknown;
+    return itemDisplay(itemId, displayId, inventoryType, sheath);
+}
+
+bool ItemBank::itemDisplay(uint32_t itemId, uint32_t& displayId, uint8_t& inventoryType, uint8_t& sheath) {
     displayId = 0;
     inventoryType = 0;
+    sheath = kSheathUnknown;
     if (!itemId || !isOpen()) return false;
+    if (const auto* cached = itemLookup_.find(itemId)) {
+        ++itemLookupHits_;
+        displayId = cached->displayId;
+        inventoryType = cached->inventoryType;
+        sheath = cached->sheath;
+        return displayId != 0;
+    }
+    ++itemLookupMisses_;
     const uint32_t block = itemId / kItemTableBlock;
     TableBlock* t = nullptr;
     for (TableBlock& c : table_)
@@ -366,7 +491,10 @@ bool ItemBank::itemDisplay(uint32_t itemId, uint32_t& displayId, uint8_t& invent
     if (t) {
         ++tableHits_;
     } else {
-        if (tableMissing_.count(block)) return false;
+        if (tableMissing_.count(block)) {
+            itemLookup_.store(itemId, 0, 0, kSheathUnknown);
+            return false;
+        }
         uint32_t size = 0;
         void* blob = loadEntry('u', block, size);  // its place remembered (a crowd re-reads blocks)
         ItemTableHeader th{};
@@ -393,31 +521,29 @@ bool ItemBank::itemDisplay(uint32_t itemId, uint32_t& displayId, uint8_t& invent
     ItemTableHeader th;
     std::memcpy(&th, t->blob, sizeof(th));
     const uint32_t k = itemId - th.firstItem;
-    if (k >= th.count) return false;
+    if (k >= th.count) {
+        itemLookup_.store(itemId, 0, 0, kSheathUnknown);
+        return false;
+    }
     uint32_t v;
     std::memcpy(&v, static_cast<const uint8_t*>(t->blob) + sizeof(th) + k * 4u, 4);
-    if (!v) return false;
+    if (!v) {
+        itemLookup_.store(itemId, 0, 0, kSheathUnknown);
+        return false;
+    }
     displayId = v & 0xFFFFFFu;
     inventoryType = static_cast<uint8_t>(v >> 24);
+    if ((th.reserved & kItemTableSheath) && t->size >= sizeof(th) + th.count * 5u)
+        sheath = static_cast<const uint8_t*>(t->blob)[sizeof(th) + th.count * 4u + k];
+    itemLookup_.store(itemId, displayId, inventoryType, sheath);
     return displayId != 0;
 }
 
-// + the Item.dbc SheatheType from the table block's u8 tail (psp_item_format.hpp
-// kItemTableSheath) - the block itemDisplay just cached.
-bool ItemBank::itemDisplay(uint32_t itemId, uint32_t& displayId, uint8_t& inventoryType, uint8_t& sheath) {
-    sheath = kSheathUnknown;
-    if (!itemDisplay(itemId, displayId, inventoryType)) return false;
-    const uint32_t block = itemId / kItemTableBlock;
-    for (const TableBlock& t : table_) {
-        if (!t.blob || t.block != block) continue;
-        ItemTableHeader th;
-        std::memcpy(&th, t.blob, sizeof(th));
-        const uint32_t k = itemId - th.firstItem;
-        if ((th.reserved & kItemTableSheath) && k < th.count && t.size >= sizeof(th) + th.count * 5u)
-            sheath = static_cast<const uint8_t*>(t.blob)[sizeof(th) + th.count * 4u + k];
-        break;
-    }
-    return true;
+// Kept on a separate short log line: the general item_bank line can be truncated.
+void ItemBank::logLookupStats() const {
+    PSP_LOGI(pp::tag::Gfx, "item_lookup hits=%u misses=%u block_reads=%u block_hits=%u",
+             static_cast<unsigned>(itemLookupHits_), static_cast<unsigned>(itemLookupMisses_),
+             static_cast<unsigned>(tableReads_), static_cast<unsigned>(tableHits_));
 }
 
 uint32_t ItemBank::ramBytes() const {

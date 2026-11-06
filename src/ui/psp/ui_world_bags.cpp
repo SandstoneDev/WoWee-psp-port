@@ -12,18 +12,23 @@
 //   - the slots in the original's order: slot 1 top left, the last bottom
 //     right (ContainerFrameItemButtonTemplate: icon, count);
 //   - the bag bar under them: CharacterBag3..0Slot and the backpack button,
-//     Cross shows / hides that container, Square moves bags as before;
-//   - Cross on an item: UseContainerItem (equip / sell at a merchant ...),
-//     Square: pick up / put down; Circle closes them all; the X one frame.
+//     Cross shows / hides that container or places a held item into it;
+//   - Circle uses/equips/sells, Cross picks up/places, Square confirms deletion,
+//     Triangle cycles to the next equipped bag. L+Square splits half.
 #include "ui/psp/ui_world_screen.hpp"
+#include "ui/psp/ui_world_bank_mail.hpp"
+#include "ui/psp/ui_psp_layout.hpp"
+#include "game/inventory_slots.hpp"
 
 #include "platform/psp/psp_fs.hpp"
 #include "platform/psp/psp_log.hpp"
 #include "platform/psp/psp_pak.hpp"
+#include "platform/psp/psp_display.hpp"
 #include "platform/psp/psp_prof.hpp"
 #include "platform/psp/psp_strings.hpp"  // the client's GlobalStrings
 #include "platform/psp/psp_texture.hpp"
 
+#include <pspctrl.h>
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -37,7 +42,7 @@ namespace {
 constexpr float kS = 0.55f;                       // tools/psp/build_ui_pak.py BAG_S
 constexpr float kW = 192.0f;                      // CONTAINER_WIDTH
 constexpr float kRight = 478.0f, kBottom = 240.0f;  // the stack's corner: right edge, above the bag bar
-constexpr float kTop = 2.0f;
+constexpr float kTop = 26.0f;
 constexpr int kColumns = 4;                       // NUM_CONTAINER_COLUMNS
 
 // ContainerFrame_GenerateFrame for a bag (not the backpack): the piece heights in frame units and
@@ -81,7 +86,7 @@ WorldScreen::BagArt::~BagArt() { release(); }
 void WorldScreen::BagArt::release() {
     for (pp::Texture* t : {&backpack, &comps, &backpackBtn, &emptyBag})
         if (t->pixels) pp::textureRelease(*t);
-    tried = false;
+    tried = barTried = false;
 }
 
 void WorldScreen::loadBagArt() {
@@ -91,10 +96,11 @@ void WorldScreen::loadBagArt() {
     UiArtPak art("bags");  // ui_art_fail when the pak / a texture finds no memory
     art.load("bag_backpack", bagArt_.backpack);
     art.load("bag_comps", bagArt_.comps);
-    art.load("bag_btn_backpack", bagArt_.backpackBtn);
-    art.load("pd_slot_bag", bagArt_.emptyBag);
+    if(!bagArt_.backpackBtn.pixels)art.load("bag_btn_backpack", bagArt_.backpackBtn);
+    if(!bagArt_.emptyBag.pixels)art.load("pd_slot_bag", bagArt_.emptyBag);
     if (art.failed()) bagArt_.artRetry.fail();
     art.close();
+    bagArt_.barTried=true;
     PSP_LOGI(pp::tag::Gfx, "bag_art backpack=%d comps=%d retry=%d", bagArt_.backpack.pixels ? 1 : 0,
              bagArt_.comps.pixels ? 1 : 0, art.failed() ? 1 : 0);
 }
@@ -111,6 +117,33 @@ void WorldScreen::openBags(bool all) {
     bagOpen_[0] = true;
     for (int b = 0; b < 4; ++b) bagOpen_[b + 1] = all && inv.getBagSize(b) > 0;
     if (!windowOpen(kWinBags)) openWindow(kWinBags);
+}
+
+// Containers restack at the fixed bottom-right anchor while Bags remains open.
+void WorldScreen::closeBag(int container) {
+    if(container<0 || container>4)return;
+    bagOpen_[container]=false;
+    for(int step=1;step<=5;++step) {
+        const int next=(container+step)%5;
+        if(!bagOpen_[next])continue;
+        invBag_=next;winFocus_.setFocus(kIdBagSlot0+static_cast<uint32_t>(next*36));
+        winFocus_.cancelPresses();return;
+    }
+    closeWindow(kWinBags);  // Last container: return focus to the remaining window or gameplay.
+}
+
+bool WorldScreen::closeFocusedBag() {
+    int container=invBag_,slot=0;
+    const uint32_t id=winFocus_.focused();
+    if(!bagSlotId(id,container,slot)) {
+        if(id>=kIdBagClose0 && id<kIdBagClose0+5)container=id-kIdBagClose0;
+        else if(id==0x6030u)container=0;
+        else if(id>=0x6010u+game::Inventory::FIRST_BAG_EQUIP_SLOT && id<0x6010u+game::Inventory::FIRST_BAG_EQUIP_SLOT+4)
+            container=id-(0x6010u+game::Inventory::FIRST_BAG_EQUIP_SLOT)+1;
+    }
+    if(container<0 || container>4 || !bagOpen_[container])
+        for(int i=0;i<5;++i)if(bagOpen_[i]){container=i;break;}
+    closeBag(container);return true;
 }
 
 void WorldScreen::drawContainerFrames(UiRenderer& ui, bool focusable) {
@@ -223,6 +256,18 @@ void WorldScreen::drawContainerFrames(UiRenderer& ui, bool focusable) {
 
     drawBankBagFrames(ui, focusable, colRight, bottom, shown);  // the bank's bags (ToggleBag 5..11)
 
+}
+
+void WorldScreen::drawBagBar(UiRenderer& ui, bool focusable) {
+    if(!windowOpen(kWinBags))return;
+    // Bag buttons belong to the open inventory window, not the gameplay HUD.
+    if(!bagArt_.barTried || ((!bagArt_.backpackBtn.pixels || !bagArt_.emptyBag.pixels) && bagArt_.artRetry.due())) {
+        bagArt_.barTried=true;UiArtPak art("bagbar");
+        if(!bagArt_.backpackBtn.pixels)art.load("bag_btn_backpack",bagArt_.backpackBtn);
+        if(!bagArt_.emptyBag.pixels)art.load("pd_slot_bag",bagArt_.emptyBag);
+        if(art.failed())bagArt_.artRetry.fail();
+    }
+    const auto& inv=session_.getInventory();
     // The bag bar (MainMenuBarBagButtons): CharacterBag3Slot .. CharacterBag0Slot, then the backpack.
     const float by = 248.0f, bs = 18.0f, bp = 22.0f;  // right of the action bar (it ends at x 377)
     float bx = 478.0f - bp;
@@ -260,5 +305,17 @@ void WorldScreen::drawContainerFrames(UiRenderer& ui, bool focusable) {
         if (bagOpen_[b + 1] && inv.getBagSize(b) > 0) ui.fill(Rect{r.x, r.y + r.h + 1, r.w, 1}, kColGold);
     }
 }
+
+void WorldScreen::drawBagControlHints(UiRenderer& ui) {
+    if(pspLayoutActive())return; // full-screen inventory owns its right-side hints
+    if(!uiMode_ || settings_.isOpen() || session_.logoutPending() || activeWindow()!=kWinBags || dragWin_)return;
+    const Font& fs=kit_.font(kFontSmall);
+    const float h=static_cast<float>(fs.lineHeight());
+    const auto it=winRect_.find(kWinBags);
+    const float y=it!=winRect_.end() && it->second.y<2*h+6?pp::kScreenH-2*h-6:2.f;
+    kit_.controlHint(ui,fs,8,y+1,invHeld_.active?OWN_STR(INV_HELD_HINT):OWN_STR(INV_PAD_HINT),kColGold);
+    kit_.controlHint(ui,fs,8,y+1+h,OWN_STR(INV_PAD_EXTRA_HINT),kColGold);
+}
+
 
 }  // namespace wowee::ui::psp

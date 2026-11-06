@@ -68,6 +68,7 @@ public:
 
     // Upstream knobs (LightingManager setters), same defaults.
     float fogSkyBlend = 0.7f;
+    bool preferAuthoredColors = false;
     float fogStrength = 0.4f;
     bool indoors = false;
     // PSP (wowee.cfg lightdefault, off = upstream): outside every volume use

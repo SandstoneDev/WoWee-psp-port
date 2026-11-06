@@ -27,15 +27,16 @@ ItemIconDb::~ItemIconDb() {
 }
 
 bool ItemIconDb::open() {
+    if (isOpen()) return true;
     char path[256];
     fsPath(path, sizeof(path), "data/itemicons.pak");
     Pak pak;
     transient_ = false;
     if (!pak.open(path)) {
-        // on the card but not opened (no memory for the TOC, no descriptor) - not "missing".
-        transient_ = fsExists(path);
-        if (transient_) PSP_LOGW(tag::Fs, "itemicons_pak open_failed (items without icons until the next window open)");
-        else PSP_LOGW(tag::Fs, "itemicons_pak missing (items drawn without icons)");
+        // Getstat can fail under the same descriptor pressure as open. It
+        // cannot prove that the pack is missing; all open failures are retried.
+        transient_ = true;
+        PSP_LOGW(tag::Fs, "itemicons_pak open_failed retry=1");
         return false;
     }
     const PakEntry* eh = pak.find("ihdr");
@@ -84,9 +85,27 @@ bool ItemIconDb::ensureOpen() {
 }
 
 bool ItemIconDb::readRaw(uint32_t offset, void* dst, uint32_t size) {
-    if (!ensureOpen()) return false;
-    lastReadMs_ = logUptimeMs();
-    return pakRead(fd_, offset, dst, size);
+    const uint32_t now = logUptimeMs();
+    if (nextReadRetryMs_ && static_cast<int32_t>(now - nextReadRetryMs_) < 0) return false;
+    lastReadMs_ = now;
+    if (ensureOpen() && pakRead(fd_, offset, dst, size)) {
+        // Loaded pixels/mappings stay cached; only the idle file is released.
+        // Under pressure, do not pin a slot for the normal three-second timeout.
+        if (pakFdTight()) {
+            pakNoteClose(fd_);
+            sceIoClose(fd_);
+            fd_ = -1;
+        }
+        nextReadRetryMs_ = 0;
+        return true;
+    }
+    if (fd_ >= 0) {
+        pakNoteClose(fd_);
+        sceIoClose(fd_);
+        fd_ = -1;
+    }
+    nextReadRetryMs_ = now + 1000u;
+    return false;
 }
 
 void ItemIconDb::tick(uint32_t nowMs) {
@@ -106,11 +125,13 @@ const Texture* ItemIconDb::byDisplay(uint32_t displayId, uint32_t frame) {
     } else {
         if (displayId > 0 && displayId <= maxDisplay_) {
             uint16_t s = 0xFFFF;
-            if (readRaw(dmapOff_ + displayId * 2u, &s, 2) && s != 0xFFFF && s < iconCount_) slot = s;
+            if (!readRaw(dmapOff_ + displayId * 2u, &s, 2)) return bySlot(kQuestionMark, frame);
+            if (s != 0xFFFF && s < iconCount_) slot = s;
         }
         if (slotOf_.size() < 4096) slotOf_[displayId] = slot;
     }
-    return bySlot(slot, frame);
+    const Texture* icon = bySlot(slot, frame);
+    return icon || slot == kQuestionMark ? icon : bySlot(kQuestionMark, frame);
 }
 
 const Texture* ItemIconDb::bySlot(uint16_t slot, uint32_t frame) {
@@ -118,7 +139,10 @@ const Texture* ItemIconDb::bySlot(uint16_t slot, uint32_t frame) {
     auto it = icons_.find(slot);
     if (it != icons_.end()) {
         it->second.lastFrame = frame;
-        return it->second.failed ? nullptr : &it->second.tex;
+        if (!it->second.failed) return &it->second.tex;
+        if (static_cast<int32_t>(logUptimeMs() - it->second.retryAfterMs) < 0) return nullptr;
+        textureRelease(it->second.tex);
+        icons_.erase(it);  // retry transient read/allocation failures instead of caching a blank forever
     }
     if (icons_.size() >= kMaxIcons) {  // evict the oldest not drawn in the last two frames
         auto victim = icons_.end();
@@ -135,12 +159,14 @@ const Texture* ItemIconDb::bySlot(uint16_t slot, uint32_t frame) {
     if (!block || !readRaw(iconsOff_ + slot * iconStride_, block, iconStride_)) {
         std::free(block);
         ic.failed = true;
+        ic.retryAfterMs = logUptimeMs() + 2000u;
         return nullptr;
     }
     sceKernelDcacheWritebackRange(block, iconStride_);
     if (!textureFromBlob(block, iconStride_, ic.tex, true)) {
         std::free(block);
         ic.failed = true;
+        ic.retryAfterMs = logUptimeMs() + 2000u;
         return nullptr;
     }
     ++iconsLoaded_;

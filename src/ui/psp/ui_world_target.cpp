@@ -36,6 +36,8 @@
 #include "platform/psp/psp_log.hpp"
 #include "platform/psp/psp_strings.hpp"
 #include "platform/psp/psp_prof.hpp"
+#include "rendering/psp/psp_lighting_ge.hpp"
+#include "rendering/psp/psp_portrait_camera.hpp"
 
 #include <pspthreadman.h>
 
@@ -277,22 +279,27 @@ bool WorldScreen::projectHud(const glm::vec3& p, float& sx, float& sy) const {
 // step: +1 next / -1 previous; filter: -1 = the menu's "Targets" (targetall),
 // 0 = enemies only, 1 = every living unit (controls=2: combat / travel mode).
 void WorldScreen::tabTarget(int step, int filter) {
+    tabTargetCandidate(step, filter, true);
+}
+
+// PSP: preview shares the exact filters, cycle order and timeout of the real press.
+// Preview uses temporary candidates: only an actual press updates the cycle cache.
+uint64_t WorldScreen::tabTargetCandidate(int step, int filter, bool select) {
     PROF_SCOPE("target");
     constexpr uint32_t kCycleResetMs = 4000;
     const uint32_t nowMs = pp::logUptimeMs();
-    if (nowMs - lastTabMs_ > kCycleResetMs) tabStale_ = true;
-    lastTabMs_ = nowMs;
-    // upstream: the list goes stale when entities come or go.
-    if (session_.entityVersion() != tabVersion_) tabStale_ = true;
     // factions - upstream isValidTabTarget: hostile by faction
     // (FactionTemplate via dbc.pak) or attacking us (isAggressiveTowardPlayer).
     // Menu "Targets" = targetall: 1 = every living unit (the PSP rule before);
     // without dbc.pak the same (log factions_missing).
     const int targetAll = filter >= 0 ? filter : settings_.values().targetall;
-    if (targetAll != lastTargetAll_) {
-        lastTargetAll_ = targetAll;
-        tabStale_ = true;
-    }
+    const bool stale = tabStale_ || nowMs - lastTabMs_ > kCycleResetMs ||
+                       session_.entityVersion() != tabVersion_ || targetAll != lastTargetAll_;
+    std::vector<uint64_t> previewList;
+    auto& list = select ? tabList_ : previewList;
+    if (!select && !stale) list = tabList_;
+    int index = stale ? -1 : tabIndex_;
+    if (select) { lastTabMs_ = nowMs; lastTargetAll_ = targetAll; }
     const bool hostileOnly = targetAll == 0 && factionsOk_;
     const uint16_t fFlags = game::fieldIndex(game::UF::UNIT_FIELD_FLAGS);
     auto valid = [&](uint64_t guid) {
@@ -302,10 +309,9 @@ void WorldScreen::tabTarget(int step, int filter) {
         if (!e || (e->getField(fFlags) & game::UNIT_FLAG_NOT_SELECTABLE)) return false;
         return !hostileOnly || session_.isHostileUnit(guid) || session_.isHostileAttacker(guid);
     };
-    if (tabStale_) {
-        tabList_.clear();
-        tabIndex_ = -1;
-        tabVersion_ = session_.entityVersion();
+    if (stale) {
+        list.clear();
+        if (select) { tabIndex_ = -1; tabVersion_ = session_.entityVersion(); }
         struct Cand {
             uint64_t guid;
             float distSq;
@@ -331,32 +337,33 @@ void WorldScreen::tabTarget(int step, int filter) {
             if (a.inCone != b.inCone) return a.inCone;
             return a.distSq < b.distSq;
         });
-        for (const auto& c : cands) tabList_.push_back(c.guid);
-        tabStale_ = false;
-        if (++targetFilterLogs_ <= 60)  // factions
+        for (const auto& c : cands) list.push_back(c.guid);
+        if (select) tabStale_ = false;
+        if (select && ++targetFilterLogs_ <= 60)  // factions
             PSP_LOGI(pp::tag::Gfx, "target_filter hostile=%d all=%d factions=%d n=%u", hostileOnly ? 1 : 0, targetAll,
-                     factionsOk_ ? 1 : 0, static_cast<unsigned>(tabList_.size()));
+                     factionsOk_ ? 1 : 0, static_cast<unsigned>(list.size()));
     }
-    if (tabList_.empty()) {
-        clearTarget();
-        return;
+    if (list.empty()) {
+        if (select) clearTarget();
+        return 0;
     }
     const uint64_t cur = session_.target();
     if (cur != 0)
-        for (size_t i = 0; i < tabList_.size(); ++i)
-            if (tabList_[i] == cur) tabIndex_ = static_cast<int>(i);
-    int tries = static_cast<int>(tabList_.size());
+        for (size_t i = 0; i < list.size(); ++i)
+            if (list[i] == cur) index = static_cast<int>(i);
+    int tries = static_cast<int>(list.size());
     while (tries-- > 0) {
-        const int n = static_cast<int>(tabList_.size());
-        tabIndex_ = tabIndex_ < 0 && step < 0 ? n - 1 : ((tabIndex_ + step) % n + n) % n;
-        const uint64_t guid = tabList_[static_cast<size_t>(tabIndex_)];
+        const int n = static_cast<int>(list.size());
+        index = index < 0 && step < 0 ? n - 1 : ((index + step) % n + n) % n;
+        const uint64_t guid = list[static_cast<size_t>(index)];
         if (valid(guid)) {
-            session_.setTarget(guid);
-            return;
+            if (select) { tabIndex_ = index; session_.setTarget(guid); }
+            return guid;
         }
     }
-    tabStale_ = true;
-    clearTarget();
+    if (select) tabStale_ = true;
+    if (select) clearTarget();
+    return 0;
 }
 
 // upstream CombatHandler::clearTarget.
@@ -438,9 +445,9 @@ void WorldScreen::drawUnitFrame(UiRenderer& ui, const UnitView& u, float x, floa
     const Rect port = R(126, 12, 64, 64);
     const uint32_t portTint = tappedByOther ? 0xFF808080u : kColWhite;
     const pp::Texture* face = (u.player && u.race < 12 && u.sex < 2) ? &ufArt_.portrait[u.race][u.sex] : nullptr;
-    if (const pp::Texture* live = !u.player && !isSelf ? portraitOf(guid) : nullptr) {
+    if (const pp::Texture* live = portraitOf(guid)) {
         // The NPC's own model (SetPortraitTexture), under the round hole of the art.
-        const float in = port.w * 0.08f;
+        const float in = u.player ? 0.0f : port.w * 0.08f;
         ui.imageCircle(*live, Rect{port.x + in, port.y + in, port.w - 2 * in, port.h - 2 * in}, portTint);
     } else if (face && face->pixels) {
         ui.imageCircle(*face, port, portTint);
@@ -480,13 +487,13 @@ void WorldScreen::drawUnitFrame(UiRenderer& ui, const UnitView& u, float x, floa
     // icon + its glow; auto-attack (PlayerFrame.inCombat): red + crossed swords + glow + attack
     // background; on the hate list: the swords alone. Status and glows pulse (PlayerFrame_OnUpdate:
     // alpha 55..255 over 0.5 s and back), drawn ADD. PSP: the combat mode of controls=2 shows the
-    // swords (the control scheme) and wins over resting.
+    // swords only while not resting; actual combat retains priority.
     enum class St : uint8_t { None, Rest, Attack, Swords };
     St st = St::None;
     if (mirrored && isSelf) {
         const bool resting = (session_.selfField(game::fieldIndex(UF::PLAYER_FLAGS)) & 0x20u) != 0;  // PLAYER_FLAGS_RESTING
         const bool modeSwords = controlsScheme_ >= 2 && combatMode_;
-        if (resting && !modeSwords) st = St::Rest;
+        if (resting && !session_.inCombat() && !session_.autoAttacking()) st = St::Rest;
         else if (session_.autoAttacking()) st = St::Attack;
         else if (modeSwords || session_.inCombat()) st = St::Swords;
     }
@@ -687,24 +694,60 @@ void WorldScreen::drawSelectionCircle(const rendering::psp::TerrainCamera& cam) 
     if (!blend) sceGuDisable(GU_BLEND);
 }
 
+// Basic contact shadow: one soft radial fan, no shadow maps or extra assets.
+void WorldScreen::drawPlayerShadow(const rendering::psp::TerrainCamera& cam) {
+    static const bool enabled=pp::configGetInt("playershadow",1)!=0;
+    if(!player_.loaded() || !enabled || ownSwimming())return;
+    const uint32_t now=pp::logUptimeMs();
+    if(!airborne_)shadowFloor_=playerZ_;
+    else if(static_cast<int32_t>(now-shadowNextMs_)>=0) {
+        shadowFloor_=floorAt(playerX_,playerY_,playerZ_+.6f);shadowNextMs_=now+100;
+    }
+    const float gap=std::max(0.f,shownZ_-shadowFloor_);
+    if(shadowFloor_<-1e29f || gap>4.f)return;
+    struct V {uint32_t c;float x,y,z;};
+    constexpr int sides=16;
+    auto* v=static_cast<V*>(sceGuGetMemory((sides+2)*sizeof(V)));
+    const uint32_t alpha=static_cast<uint32_t>(72.f*(1.f-gap/4.f));
+    const float x=playerX_-cam.pos.x,y=playerY_-cam.pos.y,z=shadowFloor_-cam.pos.z+.025f;
+    v[0]={alpha<<24,x,y,z};
+    const float cs=std::cos(facing_),sn=std::sin(facing_);
+    for(int i=0;i<=sides;++i) {
+        const float a=i*6.283185307f/sides,dx=std::cos(a)*.7f,dy=std::sin(a)*.45f;
+        v[i+1]={0,x+cs*dx-sn*dy,y+sn*dx+cs*dy,z};
+    }
+    const int light=sceGuGetStatus(GU_LIGHTING),texture=sceGuGetStatus(GU_TEXTURE_2D),blend=sceGuGetStatus(GU_BLEND);
+    const int alphaTest=sceGuGetStatus(GU_ALPHA_TEST),cull=sceGuGetStatus(GU_CULL_FACE),depth=sceGuGetStatus(GU_DEPTH_TEST);
+    sceGuDisable(GU_LIGHTING);sceGuDisable(GU_TEXTURE_2D);sceGuDisable(GU_ALPHA_TEST);sceGuDisable(GU_CULL_FACE);
+    sceGuEnable(GU_DEPTH_TEST);sceGuDepthMask(GU_TRUE);sceGuEnable(GU_BLEND);
+    sceGuBlendFunc(GU_ADD,GU_SRC_ALPHA,GU_ONE_MINUS_SRC_ALPHA,0,0);
+    sceGuShadeModel(GU_SMOOTH);
+    sceGumMatrixMode(GU_MODEL);sceGumLoadIdentity();
+    sceGumDrawArray(GU_TRIANGLE_FAN,GU_COLOR_8888|GU_VERTEX_32BITF|GU_TRANSFORM_3D,sides+2,nullptr,v);
+    sceGuDepthMask(GU_FALSE);
+    if(light) sceGuEnable(GU_LIGHTING);
+    if(texture) sceGuEnable(GU_TEXTURE_2D);
+    if(!blend) sceGuDisable(GU_BLEND);
+    if(alphaTest) sceGuEnable(GU_ALPHA_TEST);
+    if(cull) sceGuEnable(GU_CULL_FACE);
+    if(!depth) sceGuDisable(GU_DEPTH_TEST);
+}
+
 // --- Portraits ---------------------------------------------------------
 namespace {
-constexpr uint32_t kGlowBytes = 128u * 72u * 2u;  // psp_lighting_ge.cpp kGlowStride x kGlowRows, 16 bpp
 constexpr uint32_t kPortraitBytes = 64u * 64u * 2u;
 constexpr uint32_t kPdModelBytes = 128u * 128u * 2u;  // CharacterModelFrame
-constexpr uint32_t kInspModelBytes = 128u * 128u * 2u;  // InspectModelFrame (between the glow and it)
+constexpr uint32_t kInspModelBytes = 128u * 128u * 2u;  // InspectModelFrame (below the character preview)
 constexpr uint32_t kPetPortraitBytes = 64u * 64u * 2u;  // PetPortrait (below the inspect model's)
 }  // namespace
 
 void WorldScreen::initPortrait() {
     if (portraitVram_ || pp::configGetInt("portraits", 1) == 0) return;
-    // One block at the top of eDRAM: the glow at its start (glowReserve asks
-    // for less and gets the same start), the portrait in its last 8 KB.
-    // + the character window's model below it (pdModelVram_).
-    // + PetPortrait's 8 KB (the block's start stays the glow's: glowReserve runs after this).
-    if (pp::vramReserveTop(kGlowBytes + kPetPortraitBytes + kInspModelBytes + kPdModelBytes + kPortraitBytes) != 0) {  // + inspect
+    // Portrait, pet, inspect and character-preview buffers share one VRAM reservation.
+    if (pp::vramReserveTop(kPetPortraitBytes + kInspModelBytes + kPdModelBytes + 2*kPortraitBytes) != 0) {  // + inspect
         portraitVram_ = sceGeEdramGetSize() - kPortraitBytes;
-        pdModelVram_ = portraitVram_ - kPdModelBytes;
+        ownPortraitVram_ = portraitVram_ - kPortraitBytes;
+        pdModelVram_ = ownPortraitVram_ - kPdModelBytes;
         pdModelTex_ = pp::Texture{};
         pdModelTex_.pixels = static_cast<const uint8_t*>(sceGeEdramGetAddr()) + pdModelVram_;
         pdModelTex_.mip[0] = pdModelTex_.pixels;
@@ -719,7 +762,11 @@ void WorldScreen::initPortrait() {
         portraitTex_.psm = GU_PSM_5650;
         portraitTex_.flags = pp::kTexLinear;
         portraitTex_.name = "portrait";
-        // InspectFrame's model below the character window's (the glow keeps the block's start).
+        ownPortraitTex_=portraitTex_;
+        ownPortraitTex_.pixels=static_cast<const uint8_t*>(sceGeEdramGetAddr())+ownPortraitVram_;
+        ownPortraitTex_.mip[0]=ownPortraitTex_.pixels;
+        ownPortraitTex_.name="own_portrait";
+        // InspectFrame's model below the character window's (below the character preview).
         inspModelVram_ = pdModelVram_ - kInspModelBytes;
         inspModelTex_ = pdModelTex_;
         inspModelTex_.pixels = static_cast<const uint8_t*>(sceGeEdramGetAddr()) + inspModelVram_;
@@ -736,6 +783,20 @@ void WorldScreen::initPortrait() {
              static_cast<unsigned>(pdModelVram_));
 }
 
+void WorldScreen::renderOwnPortrait(const rendering::psp::TerrainCamera& cam) {
+    const uint64_t guid = session_.playerGuid();
+    if (ownPortraitGuid_ != guid || !player_.loaded()) ownPortraitOk_ = false;
+    ownPortraitGuid_ = guid;
+    if (!ownPortraitVram_ || !guid || !player_.loaded()) return;
+    if (ownPortraitOk_ && ownPortraitRevision_ == player_.portraitRevision()) return;
+    if (renderCharacterHead(player_, ownPortraitVram_, cam)) {
+        ownPortraitOk_ = true;
+        ownPortraitRevision_ = player_.portraitRevision();
+        PSP_LOGI(pp::tag::Gfx, "own_portrait revision=%u attachments=%u",
+                 static_cast<unsigned>(ownPortraitRevision_), static_cast<unsigned>(player_.attachmentCount()));
+    }
+}
+
 void WorldScreen::renderPortrait(const rendering::psp::TerrainCamera& cam) {
     if (!portraitVram_) return;
     // The target, or the NPC of an open conversation (usually the same unit).
@@ -745,6 +806,14 @@ void WorldScreen::renderPortrait(const rendering::psp::TerrainCamera& cam) {
     else if (windowOpen(kWinQuestProgress)) g = session_.getQuestRequestItems().npcGuid;
     else if (windowOpen(kWinQuestReward)) g = session_.getQuestOfferReward().npcGuid;
     auto e = g ? session_.entities().getEntity(g) : nullptr;
+    auto remote=remotes_.find(g);
+    if (remote!=remotes_.end() && remote->second.model) {
+        creatures_.setPortraitUnit(0);
+        if (renderCharacterHead(*remote->second.model,portraitVram_,cam)) {
+            portraitGuid_=g; portraitOk_=true;
+        } else if (portraitGuid_!=g) portraitOk_=false;
+        return;
+    }
     if (!e || e->getType() != game::ObjectType::UNIT || !creaturesOn_) {
         creatures_.setPortraitUnit(0);
         portraitOk_ = false;
@@ -783,3 +852,64 @@ void WorldScreen::drawTargetOutline(const rendering::psp::TerrainCamera& cam) {
 }
 
 }  // namespace wowee::ui::psp
+
+namespace wowee::ui::psp {
+
+bool WorldScreen::renderCharacterHead(rendering::psp::CharacterModel& model, uint32_t vram, const rendering::psp::TerrainCamera& cam) {
+    if (!model.loaded() || pp::displayListFree()<pp::kListReserveNpc+16384u) return false;
+    const auto framing = rendering::psp::characterPortraitCamera(model.height(), model.portraitHead());
+    const glm::vec3 feet(0), centre = framing.centre, eye = framing.eye;
+    const float yaw=0;
+    sceGuDrawBufferList(GU_PSM_5650, reinterpret_cast<void*>(static_cast<uintptr_t>(vram)), 64);
+    sceGuOffset(2048 - 32, 2048 - 32);
+    sceGuViewport(2048, 2048, 64, 64);
+    sceGuScissor(0, 0, 64, 64);
+    sceGuEnable(GU_SCISSOR_TEST);
+    sceGuDepthMask(GU_FALSE);
+    sceGuDepthFunc(GU_GEQUAL);
+    sceGuDisable(GU_LIGHTING);
+    sceGuDisable(GU_FRAGMENT_2X);
+    sceGuPixelMask(0);
+    sceGuClearColor(0xFF0D0D0Du);  // neutral studio backdrop
+    sceGuClearDepth(0);
+    sceGuClear(GU_COLOR_BUFFER_BIT | GU_DEPTH_BUFFER_BIT);
+    sceGumMatrixMode(GU_PROJECTION);
+    sceGumLoadIdentity();
+    sceGumPerspective(framing.fovy, 1.0f, framing.nearZ, framing.farZ);
+    sceGumMatrixMode(GU_VIEW);
+    sceGumLoadIdentity();
+    rendering::psp::TerrainCamera mc = cam;
+    mc.pos = eye;
+    mc.forward = glm::normalize(centre - eye);
+    mc.up = glm::vec3(0, 0, 1);
+    mc.nearZ = framing.nearZ;
+    mc.farZ = framing.farZ;
+    mc.fovyDeg = framing.fovy;
+    ScePspFVector3 e = {0.0f, 0.0f, 0.0f};
+    ScePspFVector3 t = {centre.x - eye.x, centre.y - eye.y, centre.z - eye.z};
+    ScePspFVector3 up = {0.0f, 0.0f, 1.0f};
+    sceGumLookAt(&e, &t, &up);
+    sceGumUpdateMatrix();
+    // the model frame's own light (the PSP model's baked one, no tint of the hour, no fog bands)
+    // and its own Stand pose (PlayerModel plays Stand; the world's animation is left as it is).
+    rendering::psp::FrameLight& fl = rendering::psp::frameLight();
+    const rendering::psp::FrameLight savedLight = fl;
+    fl.tint = rendering::psp::kTintOff;
+    fl.fogBands = false;
+    fl.twoX = false;
+    model.drawStand(mc, feet, yaw, 0xFF0D0D0Du, 0.0f);
+    fl = savedLight;
+    sceGuDisable(GU_FOG);
+    sceGuTexWrap(GU_CLAMP, GU_CLAMP);
+    sceGuTexScale(1.0f, 1.0f);
+    sceGuTexOffset(0.0f, 0.0f);
+    pp::textureResetBinding();
+    sceGuDrawBufferList(GU_PSM_5551, pp::displayDrawBuffer(), 512);
+    sceGuOffset(2048 - pp::kScreenW / 2, 2048 - pp::kScreenH / 2);
+    sceGuViewport(2048, 2048, pp::kScreenW, pp::kScreenH);
+    sceGuScissor(0, 0, pp::kScreenW, pp::kScreenH);
+    sceGuTexFlush();
+    sceGuTexSync();  // texture reads wait for this render target's drawing (GE Users Manual §13.8)
+    return model.batchesDrawn()!=0;
+}
+}

@@ -160,12 +160,18 @@ bool SpellGoParser::parse(network::Packet& packet, SpellGoData& data) {
                 if (out) *out = g;
                 return true;
             };
-            auto skipPackedAndFloats3 = [&]() -> bool {
+            auto skipPackedAndFloats3 = [&](float* out = nullptr, uint64_t* transport = nullptr) -> bool {
                 if (!packet.hasFullPackedGuid()) return false;
-                packet.readPackedGuid(); // transport GUID
+                const uint64_t guid = packet.readPackedGuid();
+                if (transport) *transport = guid;
                 if (!packet.hasRemaining(12)) return false;
-                packet.readFloat(); packet.readFloat(); packet.readFloat();
-                return true;
+                bool finite = true;
+                for (int i=0;i<3;++i) {
+                    const uint32_t bits = packet.readUInt32();
+                    finite &= (bits & 0x7F800000u) != 0x7F800000u;
+                    if (out) std::memcpy(out+i,&bits,4);
+                }
+                return finite;
             };
 
             // UNIT/UNIT_MINIPET/CORPSE_ALLY/GAMEOBJECT share one object target GUID
@@ -182,7 +188,7 @@ bool SpellGoParser::parse(network::Packet& packet, SpellGoData& data) {
             }
             // DEST_LOCATION: PackedGuid (transport) + float x,y,z
             if (targetFlags & 0x0040u) {
-                skipPackedAndFloats3();
+                data.hasDestination = skipPackedAndFloats3(data.destination,&data.destinationTransport);
             }
             // STRING: null-terminated
             if (targetFlags & 0x0200u) {

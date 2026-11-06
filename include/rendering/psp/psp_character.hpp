@@ -145,6 +145,7 @@ public:
     static bool rangedOnBack;  // wowee.cfg rangedback (default 0 = the client: the ranged weapon only for a shot)
     // The weapons with a glow drawn this frame (psp_attachments.hpp WeaponGlow); returns how many (<= max).
     size_t weaponGlows(WeaponGlow* out, size_t max) const { return attach_.glows(out, max); }
+    bool weaponTip(uint8_t slot,float out[3]) const {return attach_.weaponTip(slot,out); }
     // ---- weapons (end) ----
 
 private:
@@ -181,6 +182,7 @@ private:
     Equipment equipment_;
     const uint16_t* geo_ = nullptr;        // per batch: geoset id
     uint16_t bodyLayers_[kBodyLayers];
+    uint16_t faceDetail_[4] = {kNoLayer,kNoLayer,kNoLayer,kNoLayer};
     uint16_t hairScalp_ = 1, facial_[3] = {1, 1, 1};
     bool texFlush_ = false;
     // M10c: worn cloak's texture on geoset group 15 (items.pak "t_"); item displays: held in the
@@ -272,8 +274,24 @@ public:
     // the character window's PlayerModel stands idle while the character runs, sits, rides or dances. The
     // animation in play is untouched (its pose is evaluated again right after). Opaque, no fade.
     void drawStand(const TerrainCamera& cam, const glm::vec3& pos, float yaw, uint32_t fogColorABGR, float standMs);
+    uint32_t portraitRevision() const { return portraitRevision_; }
+    glm::vec3 portraitHead() const {
+        for (const auto& point : attachPoints_) {
+            if (point.id != 11) continue;
+            const auto* m=point.stand;
+            const auto* p=point.position;
+            const glm::vec3 head(m[0]*p[0]+m[3]*p[1]+m[6]*p[2]+m[9],
+                                 m[1]*p[0]+m[4]*p[1]+m[7]*p[2]+m[10],
+                                 m[2]*p[0]+m[5]*p[1]+m[8]*p[2]+m[11]);
+            const float h=height();
+            if (head.z>h*.4f && head.z<h*1.3f && head.x>-h && head.x<h && head.y>-h && head.y<h)
+                return head;
+        }
+        return glm::vec3(0.0f,0.0f,height()*.83f);
+    }
 
 private:
+    uint32_t portraitRevision_ = 0;
     bool view_ = false;  // dressup: modelBlob_ and the block-less textures_ belong to the base model
 };
 

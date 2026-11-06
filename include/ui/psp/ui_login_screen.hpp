@@ -90,6 +90,12 @@ private:
     void enterWorldScreen();
     platform::psp::PadState updateRealmList(const platform::psp::PadState& pad);
     void drawLogin(UiRenderer& ui, const FrameStats& stats, FocusRing& focus);
+    void loadLoginMedia();
+    void updateMenuMusic();
+    platform::psp::Texture loginBackground_, loginLogo_;
+    bool loginMediaTried_ = false, menuMusicOwned_ = false;
+    char menuMusicRel_[192] = {};
+    uint32_t menuMusicRetryMs_ = 0;
     void drawRealmList(UiRenderer& ui, FocusRing& focus);
     static void loadingHook(void* self, float frac);
     static void loadingReadTick(void* self);

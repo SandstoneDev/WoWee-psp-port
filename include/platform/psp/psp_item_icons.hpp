@@ -24,8 +24,8 @@ public:
     ~ItemIconDb();
     bool open();  // false: no pak (callers fall back to their old look)
     bool isOpen() const { return iconsOff_ != 0; }
-    // Memory diet: the last open() failed although the pak is on the card (no memory for its TOC /
-    // header, no descriptor) - worth another try later (WorldScreen::itemIcons, at the next window open).
+    // A failed open is retryable: descriptor pressure can also make Getstat
+    // fail, so it must not be interpreted as proof that the pack is missing.
     bool openFailedTransient() const { return transient_; }
 
     // The icon of an ItemDisplayInfo id (the question mark for an unknown or
@@ -49,6 +49,7 @@ private:
     std::string path_;
     int fd_ = -1;
     uint32_t lastReadMs_ = 0;
+    uint32_t nextReadRetryMs_ = 0;
     uint32_t iconCount_ = 0, iconStride_ = 0, maxDisplay_ = 0;
     uint32_t dmapOff_ = 0, iconsOff_ = 0;
     std::unordered_map<uint32_t, uint16_t> slotOf_;  // display id -> slot, read so far
@@ -56,10 +57,11 @@ private:
         Texture tex;
         uint32_t lastFrame = 0;
         bool failed = false;
+        uint32_t retryAfterMs = 0;
     };
     std::unordered_map<uint16_t, Icon> icons_;
     uint32_t iconsLoaded_ = 0;
-    static constexpr size_t kMaxIcons = 48;
+    static constexpr size_t kMaxIcons = 96;
 };
 
 }  // namespace wowee::platform::psp

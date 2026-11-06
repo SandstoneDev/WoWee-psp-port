@@ -1189,6 +1189,10 @@ void WorldScreen::openWorldMap() {
     auto& w = m.world;
     if (m.mini < 0) m.mini = pp::configGetInt("worldmapmini", 0) != 0 ? 1 : 0;  // GetCVarBool("miniWorldMap")
     openWindow(kWinWorldMap);
+    // Closing the last menu window can leave interface mode before this call.
+    // Restore it before drawing the map's focus stops, including the first open.
+    setUiMode(true);
+    if(!winFocus_.rememberedFocus(kWinWorldMap))winFocus_.setFocus(kIdMapArea);
     if (w.open) return;
     w.open = true;
     w.ddOpen = 0;  // WorldMapFrame_OnShow: CloseDropDownMenus

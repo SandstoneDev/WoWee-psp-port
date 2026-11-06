@@ -86,7 +86,8 @@ bool WorldSession::handleLootPacket(game::LogicalOpcode op, network::Packet& pac
             if (inWorld) {
                 const uint64_t guid = packet.hasRemaining(8) ? packet.readUInt64() : 0;
                 PSP_LOGI(tag::Net, "loot_release guid=%08X src=server open=%d", lo32(guid), lootWindowOpen_ ? 1 : 0);
-                handleLootReleaseResponse();
+                // A delayed release for the previous corpse must not close the new window.
+                if(!guid || guid==currentLoot_.lootGuid)handleLootReleaseResponse();
             }
             return true;
         case LogicalOpcode::SMSG_LOOT_REMOVED:
@@ -173,6 +174,7 @@ void WorldSession::handleLootResponse(network::Packet& packet) {
     }
     game::LootResponseData data;
     if (!game::LootResponseParser::parse(packet, data, wotlkLoot)) return;
+    lootRequests_.reset();
     currentLoot_ = std::move(data);
     const uint64_t lootGuid = currentLoot_.lootGuid;
     PSP_LOGI(tag::Net, "loot_open guid=%08X items=%u money=%u type=%u", lo32(lootGuid),
@@ -199,12 +201,7 @@ void WorldSession::handleLootResponse(network::Packet& packet) {
     }
 
     if (autoLoot_ && state_ == State::InWorld && socket_ && !localLoot.itemAutoLootSent) {
-        for (const auto& item : currentLoot_.items) {
-            if (++lootLogs_ <= 60)
-                PSP_LOGI(tag::Net, "loot_take slot=%u item=%u ok=1 auto=1", static_cast<unsigned>(item.slotIndex),
-                         static_cast<unsigned>(item.itemId));
-            socket_->send(game::AutostoreLootItemPacket::build(item.slotIndex));
-        }
+        lootAll();
         localLoot.itemAutoLootSent = true;
     }
 
@@ -214,8 +211,10 @@ void WorldSession::handleLootResponse(network::Packet& packet) {
 
 // upstream InventoryHandler::handleLootReleaseResponse.
 void WorldSession::handleLootReleaseResponse() {
+    lootRequests_.reset();
     localLootState_.erase(currentLoot_.lootGuid);
     lootWindowOpen_ = false;
+    lootRequests_.reset();
     pendingLootActive_ = false;
     currentLoot_ = game::LootResponseData{};
     ++lootVersion_;
@@ -225,6 +224,7 @@ void WorldSession::handleLootReleaseResponse() {
 // its sound come with SMSG_ITEM_PUSH_RESULT - the inventory's, task C.)
 void WorldSession::handleLootRemoved(network::Packet& packet) {
     const uint8_t slotIndex = packet.readUInt8();
+    lootRequests_.complete(slotIndex);
     for (auto& it : currentLoot_.items) {
         if (it.slotIndex != slotIndex) continue;
         it.looted = true;
@@ -275,7 +275,8 @@ void WorldSession::clearLootMoney() {
 // upstream InventoryHandler::lootTarget.
 void WorldSession::lootTarget(uint64_t guid) {
     if (state_ != State::InWorld || !socket_ || guid == 0) return;
-    currentLoot_.items.clear();
+    if (lootWindowOpen_ && currentLoot_.lootGuid==guid)return;
+    lootRequests_.reset();
     if (++lootLogs_ <= 60) PSP_LOGI(tag::Net, "loot_request guid=%08X", lo32(guid));
     socket_->send(game::LootPacket::build(guid));
 }
@@ -286,8 +287,10 @@ void WorldSession::lootTarget(uint64_t guid) {
 bool WorldSession::lootItem(uint8_t slotIndex, bool confirmed) {
     if (state_ != State::InWorld || !socket_) return false;
     uint32_t itemId = 0;
+    bool valid=false;
     for (const auto& item : currentLoot_.items) {
-        if (item.slotIndex != slotIndex) continue;
+        if (item.slotIndex != slotIndex || item.looted) continue;
+        valid=true;
         itemId = item.itemId;
         const LootItemInfo* info = lootItemInfo(item.itemId);
         if (!confirmed && info && info->bindType == 1) {
@@ -300,12 +303,18 @@ bool WorldSession::lootItem(uint8_t slotIndex, bool confirmed) {
         }
         break;
     }
+    if (!valid || !lootWindowOpen_ || !lootRequests_.request(slotIndex,logUptimeMs()))return false;
     pendingLootActive_ = false;
     if (++lootLogs_ <= 60)
         PSP_LOGI(tag::Net, "loot_take slot=%u item=%u ok=1", static_cast<unsigned>(slotIndex),
                  static_cast<unsigned>(itemId));
     socket_->send(game::AutostoreLootItemPacket::build(slotIndex));
     return true;
+}
+
+void WorldSession::lootAll() {
+    if(!lootWindowOpen_)return;
+    for(const auto& item:currentLoot_.items)if(!item.looted)lootRequests_.enqueue(item.slotIndex);
 }
 
 void WorldSession::confirmPendingLoot() {
@@ -329,6 +338,7 @@ void WorldSession::closeLoot() {
     if (state_ == State::InWorld && socket_) socket_->send(game::LootReleasePacket::build(lootGuid));
     PSP_LOGI(tag::Net, "loot_release guid=%08X src=client", lo32(lootGuid));
     lootWindowOpen_ = false;
+    lootRequests_.reset();
     pendingLootActive_ = false;
     currentLoot_ = game::LootResponseData{};
     ++lootVersion_;
@@ -359,6 +369,10 @@ void WorldSession::queryLootItem(uint32_t entry) {
 
 void WorldSession::updateLoot(float dtSec, bool despawnLooted) {
     if (state_ != State::InWorld) return;
+    if(lootWindowOpen_) {
+        const int next=lootRequests_.next(logUptimeMs());
+        if(next>=0)lootItem(static_cast<uint8_t>(next),true);
+    }
     // upstream tickLootMoneyFallback: a server that sends no money notify.
     if (pendingLootMoneyNotifyTimer_ > 0.0f) {
         pendingLootMoneyNotifyTimer_ -= dtSec;

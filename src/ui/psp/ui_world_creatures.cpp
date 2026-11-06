@@ -1,3 +1,4 @@
+#include "rendering/psp/psp_world_effect_policy.hpp"
 // M10b: creatures and NPCs in the world screen. Kept apart from
 // ui_world_screen.cpp (M10a works there) - that file only calls
 // loadCreatures() after the doodads and creatures_.draw() after them.
@@ -18,7 +19,7 @@
 //   npcprefetchkb=3072  the world-entry prefetch keeps this many KB free in total (the entry's next
 //                   consumers first: a terrain tile, the big WMO the player stands in, window art, Lua)
 //   npcanim=1     skinned NPC animation (0 = the static Stand model, A/B)
-//   npcanimdist=45  pose every frame nearer, every 2nd / 4th frame beyond x1 / x2
+//   npcanimdist=20  full rate nearer; distant moving poses x2/x4, idle x2/x4/x6
 //   npcposes=12   at most this many NPC poses evaluated per frame (0 = no cap)
 //   npcbones=2000 bone matrix uploads per frame for NPCs (display list guard)
 //   npcanimspeed=1 Walk/Run at the spline speed / M2 movingSpeed (0 = upstream 1.0)
@@ -76,41 +77,14 @@ std::optional<float> movingEntityFloor(const rendering::psp::TerrainRenderer& te
     return best;
 }
 
-// An item ENTRY -> its ItemDisplayInfo id (upstream EntitySpawner::tryAttachCreatureVirtualWeapons
-// resolveDisplayInfoId: Item.dbc entry -> DisplayID). The client's Item.dbc table baked into items.pak (ItemBank::itemDisplay, a few cached 2 KB
-// blocks); 0 when the item is not in it (a server's custom item) - the display row itself is checked when
-// the NPC is dressed (ItemBank::get). syncCreatures calls it for every unit with a non-zero virtual item field.
-uint32_t npcItemDisplayId(rendering::psp::ItemBank& items, uint32_t itemEntry) {
-    uint32_t displayId = 0;
-    uint8_t inventoryType = 0;
-    return items.itemDisplay(itemEntry, displayId, inventoryType) ? displayId : 0;
-}
-
-// upstream tryAttachCreatureVirtualWeapons: the main-hand weapon of an NPC from the first non-zero of its
-// candidate fields (3.3.5a UNIT_VIRTUAL_ITEM_SLOT_ID = 56, 57, 58; the other bases are other expansions'),
-// resolved through Item.dbc (npcItemDisplayId); the off hand is never attached (upstream clears it).
-uint32_t npcMainHandDisplay(rendering::psp::ItemBank& items, const game::Entity& e) {
-    static const uint16_t kCandidateBases[] = {56, 57, 58, 70, 148, 149, 150, 151, 152};
-    for (uint16_t base : kCandidateBases) {
-        const uint32_t v = e.getField(base);
-        if (!v) continue;
-        if (const uint32_t display = npcItemDisplayId(items, v)) return display;
-    }
-    return 0;
-}
-
 // Every virtual item of an NPC as the original 3.3.5a client hangs them -
 // UNIT_VIRTUAL_ITEM_SLOT_ID 56 / 57 / 58 = the main hand, the off hand (a weapon, a shield, a held item) and the
-// ranged weapon, each through Item.dbc (its DisplayID and InventoryType: where it hangs). PSP: upstream's candidate
-// scan above (the first resolvable of the bases of several expansions as the main hand, the off hand cleared) put a
-// shield-only NPC's shield in its right hand on a 3.3.5a realm; the 3.3.5a layout is the one these servers send. The
-// candidate scan stays for a unit without any of the three (another core's layout): its main hand as before.
+// ranged weapon, each through Item.dbc (its DisplayID and InventoryType: where it hangs).
+// Zero in all three slots means unarmed. Other update fields are not item IDs:
+// probing them caused bogus weapons and repeated item-table reads in crowds.
 void npcVirtualItems(rendering::psp::ItemBank& items, const game::Entity& e, rendering::psp::CreatureUnit& u) {
     const uint32_t entries[3] = {e.getField(56), e.getField(57), e.getField(58)};
-    if (!entries[0] && !entries[1] && !entries[2]) {
-        u.mainHand = npcMainHandDisplay(items, e);
-        return;
-    }
+    if (!entries[0] && !entries[1] && !entries[2]) return;
     uint32_t* const display[3] = {&u.mainHand, &u.offHand, &u.ranged};
     uint8_t* const inv[3] = {&u.mainHandInv, &u.offHandInv, &u.rangedInv};
     for (int k = 0; k < 3; ++k) {
@@ -142,7 +116,7 @@ void WorldScreen::loadCreatures(int tileX, int tileY) {
     creatures_.heapReserveKb = static_cast<uint32_t>(std::clamp(pp::configGetInt("npcheapkb", 1536), 0, 8192));
     creatures_.prefetchReserveKb = static_cast<uint32_t>(std::clamp(pp::configGetInt("npcprefetchkb", 3072), 0, 16384));
     creatures_.setAnimate(pp::configGetInt("npcanim", 1) != 0);  // creature anim
-    creatures_.animDistance = static_cast<float>(pp::configGetInt("npcanimdist", 45));
+    creatures_.animDistance = static_cast<float>(pp::configGetInt("npcanimdist", 20));
     creatures_.maxPoses = static_cast<uint32_t>(pp::configGetInt("npcposes", 12));
     creatures_.maxBoneUploads = static_cast<uint32_t>(pp::configGetInt("npcbones", 2000));
     creatures_.moveAnimRate = pp::configGetInt("npcanimspeed", 1) != 0;  // walk/run
@@ -186,6 +160,7 @@ void WorldScreen::loadCreatures(int tileX, int tileY) {
 
 void WorldScreen::syncCreatures() {
     if (!creatures_.isOpen()) return;
+    creatures_.setPriorityOrigin(glm::vec3(playerX_,playerY_,playerZ_));
     creatures_.update(lastDt_);  // creature anim clocks
     const uint16_t fDisplay = game::fieldIndex(game::UF::UNIT_FIELD_DISPLAYID);
     const uint16_t fScale = game::fieldIndex(game::UF::OBJECT_FIELD_SCALE_X);
@@ -200,6 +175,7 @@ void WorldScreen::syncCreatures() {
     liveUnits_.clear();
     for (const auto& [guid, e] : session_.entities().getEntities()) {
         if (e->getType() != game::ObjectType::UNIT) continue;
+        if(rendering::psp::isHallowsFireHelper(e->getField(game::fieldIndex(game::UF::OBJECT_FIELD_ENTRY))))continue;
         rendering::psp::CreatureUnit u;
         u.guid = guid;
         u.displayId = e->getField(fDisplay);

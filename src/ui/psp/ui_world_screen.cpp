@@ -1,4 +1,7 @@
 #include "ui/psp/ui_world_screen.hpp"
+#include "platform/psp/psp_osk.hpp"
+#include "rendering/psp/psp_collision_math.hpp"
+#include "rendering/psp/psp_fog_policy.hpp"
 #include "platform/psp/psp_prof.hpp"
 
 #include "core/character_paths.hpp"
@@ -68,7 +71,7 @@ WorldScreen::WorldScreen(const UiKit& kit, pp::WorldSession& session, std::strin
     // graphics settings menu's keys: SettingsMenu::load + applySettings.
     settings_.load();
     loadingStep(0.02f);  // the loading screen's bar follows these stages (ui_loading_screen.hpp)
-    initLighting();  // lighting (light.pak, glow buffer before the models take eDRAM)
+    initLighting();  // lighting and portrait VRAM before models
     charAnimated_ = pp::configGetInt("charanim", 1) != 0;
     models_.loadForestConfig();  // treelod, treelod2dist, impostors, impostordist
     // KB of mip level 0 from which a doodad texture loads at half size (0 = full).
@@ -105,6 +108,7 @@ WorldScreen::WorldScreen(const UiKit& kit, pp::WorldSession& session, std::strin
 // the sounds), except these plain ones: three textures (pp::Texture has no destructor) and the zone music table.
 // The GE has finished with all of it: the LoginScreen destroys the world in update(), after frameEnd's sceGuSync.
 WorldScreen::~WorldScreen() {
+    spellFx_.reset(); // cancel tagged cast audio while WorldSounds and its bank still exist
     // the session outlives this screen and goes on reading packets through the transfer's loading - the
     // hooks into this screen go with it (was: SMSG_WHO during a transfer -> sortWhoList -> lk.zoneName on a freed
     // WorldScreen; the spell data likewise). Every user checks them (empty / nullptr = without).
@@ -141,6 +145,13 @@ void WorldScreen::mapDataMissing(uint32_t mapId, const char* what) {
 // few assignments.
 void WorldScreen::applySettings() {
     const GraphicsSettings& s = settings_.values();
+    configureSpellFx(s.spellfx, s.spellfxreal != 0);
+    configureWorldFx(s.particles != 0, s.weather != 0);
+    camFollow_ = s.camfollow != 0;
+    camSmartFollow_ = s.camsmartfollow != 0;
+    winFocus_.setEnhancedNavigation(s.uinavigation != 0);
+    winFocus_.cancelPresses();
+    watchRebuildMs_=0; // layout change updates tracker bounds immediately
     pp::musicSetVolume(static_cast<float>(s.musicvol) / 100.0f);  // MUSIC_VOLUME
     session_.setAutoLoot(s.autoloot != 0);  // AUTO_LOOT_DEFAULT_TEXT
     models_.viewDistance = static_cast<float>(s.m2view);
@@ -153,11 +164,18 @@ void WorldScreen::applySettings() {
     terrain_.sharpFloor = s.terrainsharp != 0;
     terrain_.sharpDistance = static_cast<float>(s.sharpdist);
     terrain_.detail = s.terraindetail != 0;
-    const int interval = s.framecap <= 30 ? 2 : 1;
+    if (s.adaptive30) {
+        if (!beforeAdaptiveClock_) beforeAdaptiveClock_ = pp::systemInfo().cpuMHz;
+        if (pp::systemInfo().cpuMHz != 333) pp::systemSetClock(333);
+    } else if (beforeAdaptiveClock_>0) {
+        pp::systemSetClock(beforeAdaptiveClock_); beforeAdaptiveClock_=0;
+    }
+    const int interval = pp::frameIntervalForTarget(s.framecap);
     if (interval != pp::displayFrameInterval()) {
         pp::displaySetFrameInterval(interval);
         PSP_LOGI(pp::tag::Gfx, "frame_cap fps=%d interval=%d", s.framecap, interval);
     }
+    updateFrameBudget(0);
     remotePredict_ = s.remotepredict != 0;
     perfHud_ = s.perfhud != 0;
     afkSec_ = static_cast<float>(s.afksit);
@@ -171,8 +189,11 @@ void WorldScreen::applySettings() {
 // floor) change these without the menu.
 GraphicsSettings WorldScreen::liveSettings() const {
     GraphicsSettings s = settings_.values();
-    s.m2view = static_cast<int>(models_.viewDistance + 0.5f);
-    s.terrainsharp = terrain_.sharpFloor ? 1 : 0;
+    // Adaptive runtime reductions are not manual edits to the saved preset.
+    if(!s.adaptive30){
+        s.m2view = static_cast<int>(models_.viewDistance + 0.5f);
+        s.terrainsharp = terrain_.sharpFloor ? 1 : 0;
+    }
     return s;
 }
 
@@ -278,6 +299,7 @@ void WorldScreen::loadTerrain() {
         loadCreatures(tx, ty);  // M10b hook (ui_world_creatures.cpp)
         return;
     }
+    terrain_.loadHoleOverrides(dir);
     int loaded = 0;
     int step = 0;  // the loading bar, 0.05 .. 0.35 over the 9 tiles
     // The chunk-texture window - the tiles' heads now,
@@ -444,13 +466,16 @@ float WorldScreen::floorAt(float x, float y, float maxZ, bool* onTerrain) const 
     bool terrainFloor = false;
     float tz = 0;
     if (terrain_.heightAt(x, y, tz) && tz <= maxZ) {
-        float zx0 = tz, zx1 = tz, zy0 = tz, zy1 = tz;
-        terrain_.heightAt(x - 0.5f, y, zx0);
-        terrain_.heightAt(x + 0.5f, y, zx1);
-        terrain_.heightAt(x, y - 0.5f, zy0);
-        terrain_.heightAt(x, y + 0.5f, zy1);
-        const float slope = std::sqrt((zx1 - zx0) * (zx1 - zx0) + (zy1 - zy0) * (zy1 - zy0));
-        if (!(slope > kMaxSlope && tz > playerZ_ + 0.01f)) {
+        float slope2 = 0.0f;
+        if (tz > playerZ_ + 0.01f) {
+            float zx0 = tz, zx1 = tz, zy0 = tz, zy1 = tz;
+            terrain_.heightAt(x - 0.5f, y, zx0);
+            terrain_.heightAt(x + 0.5f, y, zx1);
+            terrain_.heightAt(x, y - 0.5f, zy0);
+            terrain_.heightAt(x, y + 0.5f, zy1);
+            slope2 = (zx1 - zx0) * (zx1 - zx0) + (zy1 - zy0) * (zy1 - zy0);
+        }
+        if (slope2 <= kMaxSlope * kMaxSlope) {
             ground = tz;
             terrainFloor = true;
         }
@@ -478,6 +503,23 @@ float WorldScreen::floorAt(float x, float y, float maxZ, bool* onTerrain) const 
     return ground;
 }
 
+// Never move or apply gravity into known pending collision. A floor that has
+// not arrived is different from a loaded ledge. The streamer keeps progressing.
+bool WorldScreen::collisionReadyAt(float x, float y, float z) {
+    collisionProbe_=glm::vec3(x,y,z);
+    collisionWaitReason_=0;
+    if (!wmoOnly_ && !transportRiding() && !terrain_.tileLoadedAt(x, y)) { collisionWaitReason_=1; return false; }
+    if (!wmoOnly_ && stream_.active() && !stream_.doodadsInAt(x, y)) { collisionWaitReason_=2; return false; }
+    if (!models_.collisionReadyAt(x,y,z) || !goModels_.collisionReadyAt(x,y,z) || !transportCollisionReady(x,y,z)) {
+        collisionWaitReason_=4; return false;
+    }
+    bool inside = false, ready = false;
+    uint32_t resident = 0, wanted = 0;
+    bigWmoLanding(x, y, z, inside, ready, resident, wanted);
+    if (inside && !ready) collisionWaitReason_=3;
+    return !inside || ready;
+}
+
 // Movement with collision, gravity and jump:
 //  - face buttons walk relative to the camera;
 //    walls push the target out, the floor is the highest reachable one
@@ -492,11 +534,27 @@ void WorldScreen::updateMovement(const pp::PadState& pad, float dtSec) {
         tpHold_.entryDone = true;
         startTeleportHold("entry");
     }
+    // A supported rider follows the transport clock even during a terrain or
+    // collision hold; holding player physics must not leave the lift behind.
+    if (transportCarry(dtSec)) return;
     if (teleportHold()) return;  // the floor under the player is not loaded yet: no gravity, no input
     if (taxiMovement(dtSec)) return;  // the flight / the landing clamp moves the player
+    glm::vec3 forcedPosition;float forcedFacing=0;bool forcedMoving=false;
+    if(session_.takeForcedMovement(forcedPosition,forcedFacing,forcedMoving)) {
+        animator_.setCharging(forcedMoving);forcedRunAnim_=forcedMoving;
+        playerX_=forcedPosition.x;playerY_=forcedPosition.y;playerZ_=forcedPosition.z;facing_=forcedFacing;
+        if(sitting_)setSitting(false,false);
+        airborne_=false;vz_=0;jumpReq_=false;wantMove_=forcedMoving;moving_=forcedMoving;
+        moveFlags_=forcedMoving?static_cast<uint32_t>(game::MovementFlags::FORWARD):0;
+        animBackward_=false;animStrafe_=0;idleSec_=0;
+        const uint32_t now=pp::logUptimeMs();
+        if(!forcedMoving || now>=nextHeartbeatMs_){sendMove(game::Opcode::MSG_MOVE_HEARTBEAT,forcedMoving);nextHeartbeatMs_=now+200;}
+        transportAfterMove();
+        return; // Stick input and local collision/gravity cannot override a server-authored rush.
+    }
+    if(forcedRunAnim_){animator_.setCharging(false);forcedRunAnim_=false;}
     // carried by the transport we ride (held still while it changes map), and after the
     // step below (every return): boarding / leaving, the place in its frame.
-    if (transportCarry(dtSec)) return;
     if (classBarMovement(dtSec)) return;  // a vehicle passenger (the seat carries us) / no control
     struct TransportAfter {
         WorldScreen& w;
@@ -504,6 +562,32 @@ void WorldScreen::updateMovement(const pp::PadState& pad, float dtSec) {
     } transportAfter{*this};
     // the water and the air - swimming / flying move in 3D there (ui_world_flying.cpp); take-off,
     // landing, the swim's start and end decide here first.
+    auto holdForCollision = [&]() {
+        // A local hold must stop the server/animation too. The old early return
+        // kept the previous movement packet active while the camera stayed put.
+        moveFlags_ = 0;
+        wantMove_ = false;
+        jumpReq_ = false;
+        if (moving_) sendMove(game::Opcode::MSG_MOVE_STOP, false);
+        moving_ = false;
+        const uint32_t now = pp::logUptimeMs();
+        if (now >= nextCollisionWaitLogMs_) {
+            nextCollisionWaitLogMs_ = now + 5000u;
+            bool inside = false, ready = false;
+            uint32_t resident = 0, wanted = 0;
+            bigWmoLanding(collisionProbe_.x, collisionProbe_.y, collisionProbe_.z, inside, ready, resident, wanted);
+            PSP_LOGW(pp::tag::Gfx,"collision_probe x=%.2f y=%.2f z=%.2f reason=%u",
+                     collisionProbe_.x,collisionProbe_.y,collisionProbe_.z,static_cast<unsigned>(collisionWaitReason_));
+            PSP_LOGW(pp::tag::Gfx, "collision_wait x=%.2f y=%.2f z=%.2f wmo=%d ready=%d col=%u/%u",
+                     playerX_, playerY_, playerZ_, inside ? 1 : 0, ready ? 1 : 0,
+                     static_cast<unsigned>(resident), static_cast<unsigned>(wanted));
+            const bool terrainReady = wmoOnly_ || transportRiding() || terrain_.tileLoadedAt(playerX_, playerY_);
+            const bool doodadsReady = wmoOnly_ || !stream_.active() || stream_.doodadsInAt(playerX_, playerY_);
+            PSP_LOGW(pp::tag::Gfx, "collision_wait_inputs terrain=%d doodads=%d",
+                     terrainReady ? 1 : 0, doodadsReady ? 1 : 0);
+        }
+    };
+    if (!collisionReadyAt(playerX_, playerY_, playerZ_)) { holdForCollision(); return; }
     if (flightMovement(pad, dtSec)) return;
     // Mounts - the server's speeds (upstream CameraController's
     // runSpeedOverride_ etc. from MovementHandler: 7 / 4.5 / 2.5 until the
@@ -534,7 +618,8 @@ void WorldScreen::updateMovement(const pp::PadState& pad, float dtSec) {
     const float side = stick ? moveX_
                              : ((pad.held & PSP_CTRL_CIRCLE) ? 1.0f : 0.0f) - ((pad.held & PSP_CTRL_SQUARE) ? 1.0f : 0.0f);
     // controls=2 autorun runs along the facing (the camera stays free).
-    const float yawBase = stickAutorun ? facing_ : camYaw_;
+    const float yawBase = reverseStickTurn_.basis(camYaw_,facing_,stickAutorun,
+        stick && camSmartFollow_ && camFollow_,moveX_,moveY_,(lastRawHeld_ & PSP_CTRL_RTRIGGER)!=0);
     const glm::vec2 f(std::cos(yawBase), std::sin(yawBase));
     const glm::vec2 r(f.y, -f.x);  // x north, y west: right of north is east = -y
     glm::vec2 dir = f * fwd + r * side;
@@ -578,6 +663,7 @@ void WorldScreen::updateMovement(const pp::PadState& pad, float dtSec) {
         vz_ = mountedNow ? 6.0f : kJumpVelocity;
         jumpVelocity_ = vz_;
         fallStartMs_ = nowMs;
+        fallStartZ_ = playerZ_;
         // LocomotionFSM ignores a new take-off while JUMP_END plays (up to
         // 1.1 s); its own JUMP event restarts JUMP_START on every jump.
         if (!mountedNow) animator_.onEvent(rendering::AnimEvent::JUMP);
@@ -585,73 +671,110 @@ void WorldScreen::updateMovement(const pp::PadState& pad, float dtSec) {
         sendMove(game::Opcode::MSG_MOVE_JUMP, wantMove);
     }
 
-    // Horizontal step with walls.
-    float nx = playerX_, ny = playerY_;
+    // Integrate horizontal motion, walls AND floors together. Checking only the
+    // final XY missed thin walls, intermediate stair treads and narrow floors.
+    float speed = (nowBackward && !nowForward && drivesFacing) ? kBackSpeed : kRunSpeed;
+    if (stick && stickWalk_) speed = kWalkSpeed;
     if (wantMove) {
         dir = glm::normalize(dir);
         if (!drivesFacing) facing_ = std::atan2(dir.y, dir.x);
-        // Upstream: backpedal at WOW_BACK_SPEED when only going backwards.
-        float speed = (nowBackward && !nowForward && drivesFacing) ? kBackSpeed : kRunSpeed;
-        if (stick && stickWalk_) speed = kWalkSpeed;  // controls=2: a light tilt walks (WALKING)
-        glm::vec3 to(playerX_ + dir.x * speed * dtSec, playerY_ + dir.y * speed * dtSec, playerZ_);
-        models_.collideWalls(to, playerZ_);
-        bigWmoWalls(to, playerZ_);
-        transportWalls(to, playerZ_);  // hulls, lift cages, WMO objects
-        float tz = 0;
-        // a dungeon has no terrain - the floor search below decides (no floor: stay).
-        // so does a deck at sea (no terrain tile under a ship between continents).
-        if (terrain_.heightAt(to.x, to.y, tz) || wmoOnly_ || transportRiding()) {  // else: off the loaded tiles, stay
-            nx = to.x;
-            ny = to.y;
-        }
-    }
-
-    // Vertical.
+    } else speed = 0.0f;
+    const auto slices = rendering::psp::movementSlices(dtSec, std::max(speed, std::fabs(vz_) + kGravity * dtSec));
+    float nx = playerX_, ny = playerY_;
     const float oldZ = playerZ_;
-    if (!airborne_) {
-        const float ground = floorAt(nx, ny, playerZ_ + kMaxStepUp);
-        if (ground < -1e29f) {
-            nx = playerX_;  // a wall of rock or a step too high: stay
-            ny = playerY_;
-        } else if (ground < playerZ_ - kMaxStepUp) {
-            airborne_ = true;  // walked off a ledge: fall
-            vz_ = 0.0f;
-            jumpVelocity_ = 0.0f;
-            fallStartMs_ = nowMs;
-        } else {
-            playerZ_ = ground;
+    const float oldX = playerX_, oldY = playerY_;
+    uint8_t blockMask=0;
+    bool collisionHeld = false;
+    for (int step = 0; step < slices.count; ++step) {
+        float sx = nx, sy = ny;
+        if (wantMove) {
+            glm::vec3 to(nx + dir.x * speed * slices.dt, ny + dir.y * speed * slices.dt, playerZ_);
+            if (!collisionReadyAt(to.x, to.y, playerZ_)) { collisionHeld = true; break; }
+            const glm::vec3 beforeM2=to;
+            models_.collideWalls(to, playerZ_);
+            if (glm::dot(to-beforeM2,to-beforeM2)>0.00000001f) blockMask|=1;
+            const glm::vec3 beforeWmo=to;
+            bigWmoWalls(to, playerZ_);
+            if (glm::dot(to-beforeWmo,to-beforeWmo)>0.00000001f) blockMask|=2;
+            const glm::vec3 beforeTransport=to;
+            transportWalls(to, playerZ_);
+            if (glm::dot(to-beforeTransport,to-beforeTransport)>0.00000001f) blockMask|=4;
+            // Geometry queries do not install/unload collision mid-step.
+            // Recheck only if a wall changed the already-validated position.
+            if ((to.x != beforeM2.x || to.y != beforeM2.y) &&
+                !collisionReadyAt(to.x, to.y, playerZ_)) { collisionHeld = true; break; }
+            sx = to.x;
+            sy = to.y;
         }
-    }
-    if (airborne_) {
-        vz_ -= kGravity * dtSec;
-        float z = playerZ_ + vz_ * dtSec;
-        // Land on the highest floor between the old and the new height.
-        const float ground = floorAt(nx, ny, std::max(playerZ_, z) + 0.05f);
-        if (vz_ <= 0.0f && ground > -1e29f && z <= ground) {
-            z = ground;
-            airborne_ = false;
-            vz_ = 0.0f;
-        } else if (ground < -1e29f && z < oldZ - 200.0f) {
-            // Nothing below at all (hole in the data): put the feet back on
-            // the terrain rather than falling forever.
-            float tz = 0;
-            if (terrain_.heightAt(nx, ny, tz)) z = tz;
-            // PSP: no terrain in a dungeon - back to the last floor stood on (upstream's void-fall
-            // unstuck is off by default; the server hears the place with MSG_MOVE_FALL_LAND below).
-            else if (wmoOnly_ && wmoSafeValid_) {
-                nx = wmoSafePos_.x;
-                ny = wmoSafePos_.y;
-                z = wmoSafePos_.z;
-                if (++wmoVoidFalls_ <= 10)
-                    PSP_LOGW(pp::tag::Gfx, "wmo_void_fall back x=%.1f y=%.1f z=%.1f", nx, ny, z);
+        if (!airborne_) {
+            const float ground = floorAt(sx, sy, playerZ_ + kMaxStepUp);
+            if (ground < -1e29f) {
+                blockMask|=8;
+                sx = nx;
+                sy = ny;
+            } else if (ground < playerZ_ - kMaxStepUp) {
+                // The old floor_drop log only covered grounded-to-grounded
+                // snaps; a missed floor starts a fall and escaped that log.
+                if(playerZ_-ground>1.5f && ++dropLogs_<=20)
+                    PSP_LOGW(pp::tag::Gfx,"floor_leave x=%.2f y=%.2f z=%.2f floor=%.2f",
+                             sx,sy,playerZ_,ground);
+                airborne_ = true;
+                vz_ = 0.0f;
+                jumpVelocity_ = 0.0f;
+                fallStartMs_ = nowMs;
+                fallStartZ_ = playerZ_;
+            } else {
+                playerZ_ = ground;
             }
-            airborne_ = false;
-            vz_ = 0.0f;
         }
-        playerZ_ = z;
+        if (airborne_) {
+            const float before = playerZ_;
+            const float nextVz = vz_ - kGravity * slices.dt;
+            float z = before + nextVz * slices.dt;
+            // Vertical motion needs the same loading barrier as horizontal
+            // motion, including a jump/fall with no analog input.
+            if (!collisionReadyAt(sx,sy,z)) { collisionHeld = true; break; }
+            vz_ = nextVz;
+            const float probe=rendering::psp::landingFloorProbe(before,z,sx-nx,sy-ny);
+            const float ground = floorAt(sx, sy, probe);
+            if (vz_ <= 0.0f && ground > -1e29f && z <= ground) {
+                z = ground;
+                airborne_ = false;
+                vz_ = 0.0f;
+            } else if (ground < -1e29f && z < fallStartZ_ - 200.0f) {
+                // The old test used the previous FRAME's Z: with dt capped at
+                // 0.1 it could never reach 200. Track the start of the fall.
+                float tz = 0;
+                if (terrain_.heightAt(sx, sy, tz)) z = tz;
+                else if (wmoOnly_ && wmoSafeValid_) {
+                    sx = wmoSafePos_.x;
+                    sy = wmoSafePos_.y;
+                    z = wmoSafePos_.z;
+                    if (++wmoVoidFalls_ <= 10)
+                        PSP_LOGW(pp::tag::Gfx, "wmo_void_fall back x=%.1f y=%.1f z=%.1f", sx, sy, z);
+                } else {
+                    nx = sx;
+                    ny = sy;
+                    playerZ_ = z;
+                    break; // no valid recovery position: do not manufacture a landing
+                }
+                airborne_ = false;
+                vz_ = 0.0f;
+            }
+            playerZ_ = z;
+        }
+        nx = sx;
+        ny = sy;
     }
     playerX_ = nx;
     playerY_ = ny;
+    if (collisionHeld) { holdForCollision(); return; }
+    if (wantMove && !airborne_ && (nx-oldX)*(nx-oldX)+(ny-oldY)*(ny-oldY)<0.000001f &&
+        nowMs>=nextCollisionWaitLogMs_) {
+        nextCollisionWaitLogMs_=nowMs+5000u;
+        PSP_LOGW(pp::tag::Gfx,"movement_block x=%.2f y=%.2f z=%.2f mask=%u",
+                 nx,ny,playerZ_,static_cast<unsigned>(blockMask));
+    }
     if (wmoOnly_ && !airborne_) {  // the last floor stood on
         wmoSafePos_ = glm::vec3(playerX_, playerY_, playerZ_);
         wmoSafeValid_ = true;
@@ -1035,6 +1158,31 @@ void WorldScreen::syncRemotePlayers() {
             look.hairStyle = a.hairStyleId;
             look.hairColor = a.hairColorId;
             look.facial = static_cast<uint8_t>(e->getField(fBytes2) & 0xFF);
+            // Health/combat/entity updates do not change the outfit. Reuse its
+            // resolved item IDs until an appearance field changes or a custom
+            // item's pending query needs another check.
+            const auto prior = remotes_.find(guid);
+            if (prior != remotes_.end() && prior->second.wantUnresolved == 0) {
+                RemotePlayer& old = prior->second;
+                const auto& oldLook = old.dressWanted ? old.wantLook : old.look;
+                bool unchanged = std::memcmp(&oldLook, &look, sizeof(look)) == 0 &&
+                                 old.seenFlags == (e->getField(fFlags) & 0xC00u);
+                for (int slot = 0; unchanged && slot < 19; ++slot)
+                    unchanged = old.seenEntry[slot] == e->getField(static_cast<uint16_t>(kVisibleItem + slot * 2)) &&
+                                old.seenEnchant[slot] == e->getField(static_cast<uint16_t>(kVisibleItem + slot * 2 + 1));
+                if (unchanged) {
+                    const auto& worn = old.dressWanted ? old.wantEquip : old.equip;
+                    rendering::psp::Equipment emblem = worn;
+                    const uint16_t fEnd = game::fieldIndex(game::UF::UNIT_END);
+                    fillGuildEmblem(fEnd != 0xFFFF ? e->getField(static_cast<uint16_t>(fEnd + 3)) : 0u, worn, emblem);
+                    if (!(emblem == worn)) {
+                        old.wantLook = look;
+                        old.wantEquip = emblem;
+                        old.dressWanted = true;
+                    }
+                    continue;
+                }
+            }
             rendering::psp::Equipment equip;
             int unresolved = 0;
             // the client's Item.dbc first (items.pak "u_", ItemBank::itemDisplay) -
@@ -1144,13 +1292,13 @@ void WorldScreen::remoteCapTurn(uint32_t nowMs) {
         // a model held counts 5 yd nearer (no swapping at the edge), a race whose model is resident 8 yd (fewer
         // race models in memory)
         const bool resident = rendering::psp::CharacterModel::raceBlobResident(charPak_, r.wantLook, true);
-        remoteCapRank_.emplace_back(r.dist - (r.model ? 5.0f : 0.0f) - (resident ? 8.0f : 0.0f), guid);
+        remoteCapRank_.emplace_back(guid==session_.target() ? -1e20f : r.dist - (r.model ? 5.0f : 0.0f) - (resident ? 8.0f : 0.0f), guid);
     }
     std::sort(remoteCapRank_.begin(), remoteCapRank_.end());
     uint32_t in = 0, out = 0, models = 0;
     for (size_t i = 0; i < remoteCapRank_.size(); ++i) {
         RemotePlayer& r = remotes_[remoteCapRank_[i].second];
-        const bool inCap = i < remoteCapMem_;
+        const bool inCap = i < std::min(remoteCapMem_,performancePlayerMax_);
         if (r.inCap && !inCap) r.outSinceMs = nowMs;
         r.inCap = inCap;
         in += inCap ? 1u : 0u;
@@ -1191,7 +1339,7 @@ float WorldScreen::remoteDistance(uint64_t guid, const RemotePlayer& r) const {
 }
 
 // the dresses the scan asked for, nearest first. PSP: at most one new model a frame
-// (its body: the race / sex model from characters.pak), re-dresses while the frame's budget lasts (at least one);
+// (its body: the race / sex model from characters.pak), with one dependency or commit stage per frame;
 // a new player's item models come in a later frame (AttachDeferScope), nearest first - the crowd that walks in is
 // spread over frames, not one long stop. Logs remote_player / remote_equip / remote_attach with ms= and dist=.
 void WorldScreen::dressRemoteQueue(uint32_t nowMs) {
@@ -1205,11 +1353,9 @@ void WorldScreen::dressRemoteQueue(uint32_t nowMs) {
     PROF_SCOPE("remote.dress");
     std::sort(dressJobs_.begin(), dressJobs_.end());
     dressQueueMax_ = std::max(dressQueueMax_, static_cast<uint32_t>(dressJobs_.size()));
-    constexpr uint64_t kBudgetUs = 6000;  // re-dresses after the first one this frame while under 6 ms
-    const uint64_t t0 = sceKernelGetSystemTimeWide();
     int loads = 0, done = 0;
     for (const auto& [dist, guid] : dressJobs_) {
-        if (done > 0 && sceKernelGetSystemTimeWide() - t0 >= kBudgetUs) break;
+        if(done>0)break; // body composition or attachments, never several outfits in one frame
         auto it = remotes_.find(guid);
         if (it == remotes_.end()) continue;
         RemotePlayer& r = it->second;
@@ -1217,6 +1363,10 @@ void WorldScreen::dressRemoteQueue(uint32_t nowMs) {
         const char* kind = nullptr;
         bool again = false;  // the model could not be read now (memory): the dress stays wanted
         if (r.dressWanted) {
+            if(!r.inCap)continue;
+            if(!r.equipmentWarmup.step(r.wantEquip,r.wantLook.race,r.wantLook.sex,items_,[&] {
+                return rendering::psp::equipmentLayers(r.wantEquip,r.wantLook.race,r.wantLook.sex,items_);
+            })){++dressPrepareYields_;break;}
             const bool newModel = !r.model || std::memcmp(&r.look, &r.wantLook, sizeof(r.look)) != 0;
             if (newModel) {
                 if (!r.inCap) continue;   // playermax: not among the nearest - waits (dressWanted stays)
@@ -1259,11 +1409,14 @@ void WorldScreen::dressRemoteQueue(uint32_t nowMs) {
                              r.wantUnresolved, static_cast<unsigned>((sceKernelGetSystemTimeWide() - j0) / 1000u),
                              static_cast<double>(dist));
             } else {
-                // What changed shows at once: the body, and the item models (a new weapon's model is read now).
-                r.model->setEquipment(charPak_, r.wantEquip, &items_);
+                // Commit the prepared body now; attachments get a separate queue turn.
+                {
+                    rendering::psp::AttachDeferScope defer;
+                    r.model->setEquipment(charPak_, r.wantEquip, &items_);
+                }
                 r.equip = r.wantEquip;
                 r.equipChangeMs = 0;
-                r.attachWanted = false;
+                r.attachWanted = true; // attachment installation gets a later frame
                 kind = "equip";
                 if (++dressLogs_ <= 200)
                     PSP_LOGI(pp::tag::Gfx, "remote_equip guid=%08X unresolved=%d ms=%u dist=%.0f capped=%u",
@@ -1439,6 +1592,7 @@ void WorldScreen::updateRemotePlayers() {
         r.visible = false;
         auto e = session_.entities().getEntity(guid);
         if (!e || !r.model) continue;
+        if (!r.inCap && guid!=session_.target()) continue; // no floor queries or bone work for capped-out crowds
         const bool inOverrun = e->isEntityMoving() && !e->isActivelyMoving();
         const glm::vec3 canonical(inOverrun ? e->getLatestX() : e->getX(), inOverrun ? e->getLatestY() : e->getY(),
                                   inOverrun ? e->getLatestZ() : e->getZ());
@@ -1499,6 +1653,15 @@ void WorldScreen::updateRemotePlayers() {
             r.moveActive = false;
         }
         r.yaw = usePrediction ? predYaw : core::coords::canonicalToServerYaw(e->getOrientation());  // orientation sync
+        const float visibleRange = std::min(remoteView_, std::max(30.0f, remoteView_ * performanceDistance_));
+        if (guid != session_.target() && glm::length(r.pos - smoothedCam_) > visibleRange) {
+            // The draw pass rejects this player by the same camera-distance
+            // limit. Keep network position/cache current, but defer bone,
+            // mount, and animation work until the player can be seen again.
+            r.anim = ~0u;
+            session_.takeJumpHint(guid);
+            continue;
+        }
         const bool walking = session_.isWalking(guid);
         // PSP: npc-walk - backpedalling (BACKWARD without FORWARD) is WalkBackwards (13) in the original client, walking
         // or not; upstream runs forward. wowee.cfg remoteback=0 = upstream.
@@ -1548,7 +1711,7 @@ void WorldScreen::updateRemotePlayers() {
             const uint32_t want = isMovingNow ? gaitAnim() : rendering::anim::JUMP_END;
             r.model->playAnimation(want, isMovingNow);
             r.anim = want;
-        } else if (!r.airborne && (isMovingNow != r.wasMoving ||
+        } else if (!r.airborne && (r.anim == ~0u || isMovingNow != r.wasMoving ||
                                    ((walking != r.wasWalking || backward != r.wasBackward) && isMovingNow))) {
             r.wasMoving = isMovingNow;
             r.wasWalking = walking;
@@ -1601,7 +1764,8 @@ void WorldScreen::drawRemotePlayers(const rendering::psp::TerrainCamera& cam) {
         r.visible = false;
         if (!r.model || !session_.entities().getEntity(guid)) continue;
         const glm::vec3 d = r.pos - cam.pos;
-        if (glm::dot(d, d) > remoteView_ * remoteView_) continue;  // was 120 yd, now wowee.cfg playerview
+        const float range=std::min(remoteView_,std::max(30.f,remoteView_*performanceDistance_));
+        if (guid!=session_.target() && glm::dot(d,d)>range*range) continue;  // was 120 yd, now wowee.cfg playerview
         if (!r.inCap) continue;  // playermax: only the nearest N are drawn
         r.visible = true;
         if (classBarRemoteHidden(guid)) continue;  // drawn as its form's creature (appendClassBarUnits)
@@ -1611,7 +1775,52 @@ void WorldScreen::drawRemotePlayers(const rendering::psp::TerrainCamera& cam) {
     }
 }
 
+void WorldScreen::updateFrameBudget(float dtSec) {
+    if(pp::oskActive() || (pspLayoutActive() && uiMode_ && (windowOpen(kWinBags)||windowOpen(kWinBank))))return; // do not learn scene quality from an opaque system/inventory backdrop
+    if (settings_.isOpen() && dtSec>0) return;
+    const bool changed=frameBudget_.sample(dtSec>0 ? pp::lastFrameWorkUs() : 0,dtSec,
+                                         settings_.values().adaptive30!=0,settings_.values().framecap);
+    performanceDistance_=frameBudget_.distance();
+    performanceCosmetic_=frameBudget_.cosmetic();
+    performanceSpells_=1.0f;  // spell settings, not adaptive load, control effect density
+    models_.performanceScale=performanceDistance_;
+    terrain_.performanceLod=frameBudget_.terrain();
+    creatures_.keepViewportNpcs=settings_.values().adaptive30!=0 && settings_.values().npcmax>0;
+    creatures_.performanceScale=creatures_.keepViewportNpcs ? 1.0f : performanceDistance_;
+    creatures_.performanceLodScale=performanceDistance_;
+    creatures_.performanceMax=static_cast<uint32_t>(settings_.values().npcmax);
+    creatures_.importantGuid=session_.target();
+    creatures_.performancePoses=frameBudget_.level()>=5 ? 1u : frameBudget_.level()>=3 ? 2u : 0u;
+    performancePlayerMax_=frameBudget_.crowdLimit(remoteMax_,4);
+    if (settings_.values().perfhud && dtSec>0 && pp::logUptimeMs()>=nextFrameCostLogMs_) {
+        nextFrameCostLogMs_=pp::logUptimeMs()+5000u;
+        const auto& npc=creatures_.stats();
+        items_.logLookupStats();
+        models_.logWallCacheStats();
+        PSP_LOGI(pp::tag::Gfx,"equipment_staging yields=%u commits=%u queued=%u",
+                 static_cast<unsigned>(dressPrepareYields_),static_cast<unsigned>(dressCount_),
+                 static_cast<unsigned>(dressJobs_.size()));
+        PSP_LOGI(pp::tag::Gfx,"frame_cost work_us=%u terrain_us=%u models_us=%u crowd_sync_us=%u npc_us=%u npc_drawn=%u poses=%u loads=%u",
+                 static_cast<unsigned>(pp::lastFrameWorkUs()),static_cast<unsigned>(terrainCpuUs_),
+                 static_cast<unsigned>(modelsCpuUs_),static_cast<unsigned>(crowdSyncCpuUs_),static_cast<unsigned>(npcCpuUs_),
+                 static_cast<unsigned>(npc.drawn),static_cast<unsigned>(npc.posed),static_cast<unsigned>(npc.loads));
+    }
+    if (changed) {
+        remoteCapNextMs_=0;
+        PSP_LOGI(pp::tag::Gfx,"npc_visibility all_viewport=%d near_first=1 range=%d",
+                 creatures_.keepViewportNpcs ? 1 : 0, static_cast<int>(creatures_.viewDistance));
+        PSP_LOGI(pp::tag::Gfx,"npc_detail lod_scale=%d%% lod_start=%.1f preserve_visible=1",
+                 static_cast<int>(creatures_.performanceLodScale*100.f),
+                 creatures_.lodDistance*creatures_.performanceLodScale);
+        PSP_LOGI(pp::tag::Gfx,"adaptive enabled=%d target_fps=%d level=%d work_us=%u distance=%d%% cosmetic=%d%% npc=%u players=%u",
+                 settings_.values().adaptive30!=0 ? 1 : 0,frameBudget_.targetFps(),frameBudget_.level(),static_cast<unsigned>(frameBudget_.workUs()),
+                 static_cast<int>(performanceDistance_*100),static_cast<int>(performanceCosmetic_*100),
+                 static_cast<unsigned>(creatures_.performanceMax),static_cast<unsigned>(performancePlayerMax_));
+    }
+}
+
 void WorldScreen::update(const pp::PadState& keyPad, float dtSec) {
+    updateFrameBudget(dtSec);
     PROF_SCOPE("world.update");
     // breadcrumbs for the hardware crash at world entry
     const bool firstUpdate = firstUpdates_ == 0;
@@ -1648,7 +1857,20 @@ void WorldScreen::update(const pp::PadState& keyPad, float dtSec) {
     const bool wasUi = uiMode_;
     const bool wasSettings = settings_.isOpen();
     const bool selectKey = (rawPad.pressed & PSP_CTRL_SELECT);
-    if (settings_.isOpen()) {
+    if(armed.pressed & PSP_CTRL_START) {
+        toggleGameMenu();
+        suppress_|=rawPad.held;
+        armed=pp::PadState{};
+        winFocus_.update(armed,dtSec);
+    } else if (session_.logoutPending()) {
+        if (session_.logoutCountdownVisible()) {
+            if (!logoutWasPending_) { logoutFocus_.setFocus(0x57AA); setUiMode(true); }
+            logoutFocus_.update(armed,dtSec);
+            if (logoutFocus_.activated()==0x57AA || (armed.pressed & (PSP_CTRL_CIRCLE|PSP_CTRL_START))) session_.cancelLogout();
+            else if (logoutFocus_.activated()==0x57AB && session_.logoutExitsGame()) pp::systemRequestExit();
+        }
+        idleSec_=0;
+    } else if (settings_.isOpen()) {
         // Graphics settings (Menu -> Graphics, cloud task 1): its own rows and
         // cursor; the world keeps running without input, the AFK timer stops.
         // Interface rule: Circle = back (to the windows), SELECT = to the game.
@@ -1666,11 +1888,18 @@ void WorldScreen::update(const pp::PadState& keyPad, float dtSec) {
             if (settings_.update(p, dtSec)) applySettings();
         }
         idleSec_ = 0.0f;
+    } else if (tutorialPad(armed)) {
+        // The same Circle press cannot also cast/use an item after dismissal.
+        suppress_ |= rawPad.held & PSP_CTRL_CIRCLE;
+        armed.held &= ~PSP_CTRL_CIRCLE;
+        armed.pressed &= ~PSP_CTRL_CIRCLE;
+        armed.released &= ~PSP_CTRL_CIRCLE;
     } else if (selectKey) {
         setUiMode(!uiMode_);
     } else if (uiMode_) {
         updateWindows(armed, dtSec);
     }
+    logoutWasPending_=session_.logoutCountdownVisible();
     if (uiMode_ != wasUi || settings_.isOpen() != wasSettings) {
         suppress_ |= rawPad.held & ~PSP_CTRL_SELECT;
         armed.held &= ~suppress_;  // this very frame too
@@ -1680,7 +1909,16 @@ void WorldScreen::update(const pp::PadState& keyPad, float dtSec) {
     // While the interface has the controls the game sees an idle pad
     // (physics, network and animation keep running - source-psp lesson).
     static const pp::PadState kIdle{};
-    const pp::PadState& gamePad = (uiMode_ || settings_.isOpen()) ? kIdle : armed;
+    pp::PadState gamePad = (uiMode_ || settings_.isOpen() || session_.logoutPending()) ? kIdle : armed;
+    if ((gamePad.held & PSP_CTRL_LTRIGGER) && (gamePad.pressed & (PSP_CTRL_LEFT | PSP_CTRL_RIGHT))) {
+        actionBarPage_=(actionBarPage_+((gamePad.pressed & PSP_CTRL_RIGHT) ? 1 : 5))%6;
+        barPage_=0;
+    }
+    if (gamePad.held & PSP_CTRL_LTRIGGER) {
+        gamePad.held &= ~(PSP_CTRL_LEFT|PSP_CTRL_RIGHT);
+        gamePad.pressed &= ~(PSP_CTRL_LEFT|PSP_CTRL_RIGHT);
+        gamePad.released &= ~(PSP_CTRL_LEFT|PSP_CTRL_RIGHT);
+    }
     // Controls with modes (controls=2, ui_world_controls.cpp): acts on the pad
     // and hands the handlers below what is left; controls=1 = the pad as is.
     const pp::PadState& pad = updateControls(gamePad, dtSec);
@@ -1736,9 +1974,13 @@ void WorldScreen::update(const pp::PadState& keyPad, float dtSec) {
     updateTaxi(dtSec);  // TaxiFrame <-> the session, the flight (before the NPC windows: the gossip goes)
     updateNpc(pad, dtSec);  // npc - L + D-pad up talks to the target, NPC windows
     updateMount(dtSec);  // mounts (ui_world_mount.cpp): the own mount field, speeds
-    updateTransports(dtSec);  // the transports' places this frame (before we move with them)
+    // Catch grounded deck contact while collision and transport transforms
+    // still match the player's previous frame, before a fast lift moves away.
+    if (!airborne_ && !transportRiding()) transportAfterMove();
+    updateTransports(dtSec);  // then both platform and rider use this frame's transform
     updateSitting(spellPad(combatPad(pad)), dtSec);
     updateMovement(spellPad(combatPad(pad)), dtSec);
+    updateFollowCamera(dtSec);
     // area triggers (instance portals, the tram, rest areas) - upstream GameHandler::update.
     session_.updateAreaTriggers(dtSec, glm::vec3(playerX_, playerY_, playerZ_));
     updateInstancePopups();  // INSTANCE_BOOT / INSTANCE_LOCK
@@ -1767,6 +2009,17 @@ void WorldScreen::update(const pp::PadState& keyPad, float dtSec) {
 }
 
 void WorldScreen::draw(UiRenderer& ui, const FrameStats& stats) {
+    if(pp::oskActive()) {
+        // The firmware keyboard owns the screen: no 3D/camera/portrait work
+        // or extra snapshot allocation. World simulation and networking stay live.
+        ui.beginFrame();
+        ui.fill(Rect{0,0,480,272},0xFF161310u); // opaque even if optional backdrop art is absent
+        kit_.background(ui,true);ui.endFrame();return;
+    }
+    if(pspLayoutActive() && uiMode_ && (windowOpen(kWinBags) || windowOpen(kWinBank))) {
+        ui.beginFrame();ui.fill(Rect{0,0,480,272},0xFF161310u);ui.endFrame();
+        drawHudLayers(ui,stats);return; // opaque full-screen inventory; simulation remains live
+    }
     if (firstDraws_ < 3) PSP_LOGI(pp::tag::Loop, "world_draw n=%d", firstDraws_++);  // breadcrumbs
     // this GE pass was "sky", but a pass lasts from its signal to the
     // next one, and the camera below is CPU (collision rays, floor, terrain heights) while the GE
@@ -1805,6 +2058,8 @@ void WorldScreen::draw(UiRenderer& ui, const FrameStats& stats) {
     glm::vec3 back(-std::cos(camYaw_) * std::cos(pitch_), -std::sin(camYaw_) * std::cos(pitch_),
                    std::sin(pitch_));
     rendering::psp::TerrainCamera cam;
+    cam.farZ=rendering::psp::worldFarClip(settings_.values().classicfog!=0);
+    if (frameBudget_.level()>=5) cam.farZ=std::min(cam.farZ,100.0f);
     cam.fovyDeg = camFovY_;  // cfg fov x 0.6 (the rule awaits observation: camera_fov)
     shownDist_ = cameraDistance(target, back);
     // First person below MIN_DISTANCE + 0.1 (upstream): the eye at the pivot,
@@ -1836,9 +2091,13 @@ void WorldScreen::draw(UiRenderer& ui, const FrameStats& stats) {
     // Fill test (SPP_EXP idea): same vertices, one pixel of fill. If the
     // frame time collapses the GE is fill/texture bound, not vertex bound.
     if (fillTest_) sceGuScissor(0, 0, 1, 1);
+    // Generate the cached player face before crowd/effect draws spend the GE
+    // list budget. The sky/terrain passes below replace this pass's depth corner.
+    renderOwnPortrait(cam);
+    if (fillTest_) sceGuScissor(0, 0, 1, 1);
     drawLightingSky(cam, kSkyABGR);  // lighting (sky gradient, no-op when off); GE pass "sky"
     const uint64_t t0 = sceKernelGetSystemTimeWide();
-    terrain_.draw(cam, kSkyABGR);
+    terrain_.draw(cam, kSkyABGR);  // chunk topology preserves the original terrain holes
     terrainCpuUs_ = static_cast<uint32_t>(sceKernelGetSystemTimeWide() - t0);
     {
         PROF_SCOPE("draw.target");  // profiler sub-zone (floor under the target)
@@ -1859,16 +2118,21 @@ void WorldScreen::draw(UiRenderer& ui, const FrameStats& stats) {
     // a mount is a creature unit and must stand where its rider is this frame.
     {
         PROF_SCOPE("draw.sync");  // profiler sub-zone (units, NPC floors)
+        const uint64_t syncStart=sceKernelGetSystemTimeWide();
         syncRemotePlayers();
         processEmotes();
         updateRemotePlayers();
         syncCreatures();
+        crowdSyncCpuUs_=static_cast<uint32_t>(sceKernelGetSystemTimeWide()-syncStart);
     }
+    const uint64_t npcStart=sceKernelGetSystemTimeWide();
     if (creaturesOn_) creatures_.draw(cam, kSkyABGR);  // M10b hook: NPCs/creatures (no-op without data/creatures.pak)
+    npcCpuUs_=static_cast<uint32_t>(sceKernelGetSystemTimeWide()-npcStart);
     drawTargetOutline(cam);  // the selected creature's rim
     drawGameObjectPost(cam);  // the objects' one-shot animations, the hovered one's rim
 
     rendering::psp::attachmentNextFrame();  // the glowing weapons drawn from here on are this frame's
+    drawPlayerShadow(cam);
     if (player_.loaded()) {
         // The original client fades the character as the camera closes in and hides it in
         // first person (upstream hides at MIN_DISTANCE + 0.15).
@@ -1895,6 +2159,9 @@ void WorldScreen::draw(UiRenderer& ui, const FrameStats& stats) {
     }
 
     drawRemotePlayers(cam);  // mounts - sync / emotes / movement moved before the creatures
+    drawFishingLine(cam);
+    sounds_.drawWater(cam, kSkyABGR, settings_.values().water != 0); // depth-tested water over submerged actors
+    drawFishingSplash(cam);
     drawWeaponFx(cam);  // the glows on the weapons just drawn (no-op at enchantfx=0)
     drawParticles(cam);  // the world's emitters and ribbons, blended (no-op at particles=0)
     drawSpellFx(cam);  // spell effects, blended over every 3D draw (no-op at spellfx=0)
@@ -1902,7 +2169,16 @@ void WorldScreen::draw(UiRenderer& ui, const FrameStats& stats) {
     // the post pass before the render targets below - they clear the depth buffer's corner (up to
     // 128 x 128) and lighttint=2's multiply tests the frame's depth (cleared = sky = untinted): the top-left
     // square of the world was left untinted while a portrait / the character or inspect window was drawn.
-    drawLightingPost();  // lighting (screen tint / glow, GE pass "glow") - between the 3D and the HUD
+    drawLightingPost();  // lighting (optional screen tint) - between the 3D and the HUD
+    // Scene-only brightness: leave HUD text and menus readable and unchanged.
+    const int brightness = std::clamp(settings_.values().brightness, 50, 150);
+    if (brightness != 100) {
+        const uint32_t alpha = static_cast<uint32_t>(brightness < 100 ? (100-brightness)*255/100 : (brightness-100)*255/200);
+        ui.beginFrame();
+        ui.fill(Rect{0,0,static_cast<float>(pp::kScreenW),static_cast<float>(pp::kScreenH)},
+                (alpha << 24) | (brightness > 100 ? 0xFFFFFFu : 0u));
+        ui.endFrame();
+    }
     {
         PROF_SCOPE("draw.portrait");  // profiler sub-zone
         renderPortrait(cam);  // after every 3D draw (it reuses the depth buffer's corner)
@@ -1923,6 +2199,10 @@ void WorldScreen::draw(UiRenderer& ui, const FrameStats& stats) {
     const uint32_t nowMs = pp::logUptimeMs();
     if (nowMs >= nextStatsMs_) {
         nextStatsMs_ = nowMs + 10000;
+        PSP_LOGI(pp::tag::Gfx, "world_view p=%.2f,%.2f,%.2f c=%.2f,%.2f,%.2f",
+                 playerX_, playerY_, playerZ_, cam.pos.x, cam.pos.y, cam.pos.z);
+        PSP_LOGI(pp::tag::Gfx, "world_camera f=%.3f,%.3f,%.3f dist=%.3f dt=%.4f",
+                 cam.forward.x, cam.forward.y, cam.forward.z, shownDist_, lastDt_);
         PSP_LOGI(pp::tag::Gfx, "world_frame fps=%.1f frame_us=%u ge_us=%u cpu_us=%u chunks=%u culled=%u tris=%u",
                  stats.fps, static_cast<unsigned>(stats.frameUs), static_cast<unsigned>(stats.geWaitUs),
                  static_cast<unsigned>(terrainCpuUs_), static_cast<unsigned>(st.chunksDrawn),

@@ -73,7 +73,8 @@ struct SpellFxRenderer::TexEntry {
     int refs = 0;        // loaded effects using it
     uint32_t triedFrame = 0;
     bool ok = false;
-    bool broken = false;  // read / parse failed: not retried (a full cache is retried while drawn)
+    bool broken = false;  // invalid asset: not retried; temporary I/O is retryable
+    uint32_t retryMs = 0;
     ~TexEntry() {
         if (ok) pp::textureRelease(tex);
     }
@@ -91,6 +92,56 @@ SpellFxRenderer::~SpellFxRenderer() {
         sceIoClose(fd_);
     }
     if (engine_) particleEngine().releaseShared();
+}
+
+bool SpellFxRenderer::loadKits() {
+    const bool haveKits = !kits_.empty();
+    if (haveKits && (!kitStarts_.empty() || kitStartsUnavailable_)) return true;
+    if (kitsUnavailable_) return false;
+    const uint32_t now=pp::logUptimeMs();
+    if(kitsRetryMs_ && static_cast<int32_t>(now-kitsRetryMs_)<0) return haveKits;
+    kitsRetryMs_=(now+2000u)|1u;
+    char path[256]; pp::fsPath(path,sizeof(path),"data/spellfx.pak");
+    pp::Pak pak;
+    if (!pak.open(path)) return haveKits;
+    if (!haveKits) {
+        const auto* entry=pak.find("kits");
+        if (!entry || !entry->size || entry->size>1024u*1024u || entry->size%sizeof(SpellFxKitMeta)) {
+            kitsUnavailable_=true;
+            PSP_LOGW(pp::tag::Gfx,"spell_kits unavailable: missing/invalid kits record in spellfx.pak");
+            return false;
+        }
+        void* data=pak.load(entry);
+        if (!data) return false;
+        const auto* rows=static_cast<const SpellFxKitMeta*>(data);
+        kits_.assign(rows,rows+entry->size/sizeof(*rows));
+        pp::pakFree(data);
+        std::sort(kits_.begin(),kits_.end(),[](const auto& a,const auto& b){return a.visual<b.visual;});
+        PSP_LOGI(pp::tag::Gfx,"spell_kits loaded=%u",static_cast<unsigned>(kits_.size()));
+    }
+    const auto* starts = pak.find("kitstarts");
+    if (starts && starts->size && starts->size <= 1024u * 1024u && starts->size % sizeof(SpellFxKitStarts) == 0) {
+        if(void* data=pak.load(starts)) {
+            const auto* rows=static_cast<const SpellFxKitStarts*>(data);
+            kitStarts_.assign(rows,rows+starts->size/sizeof(*rows));pp::pakFree(data);
+            std::sort(kitStarts_.begin(),kitStarts_.end(),[](const auto& a,const auto& b){return a.visual<b.visual;});
+        }
+    } else {
+        kitStartsUnavailable_ = true;
+    }
+    return !kits_.empty();
+}
+
+const SpellFxKitMeta* SpellFxRenderer::kit(uint32_t visual) const {
+    const auto it=std::lower_bound(kits_.begin(),kits_.end(),visual,
+        [](const auto& row,uint32_t id){return row.visual<id;});
+    return it!=kits_.end() && it->visual==visual ? &*it : nullptr;
+}
+
+uint32_t SpellFxRenderer::kitStart(uint32_t visual,int phase) const {
+    const auto it=std::lower_bound(kitStarts_.begin(),kitStarts_.end(),visual,[](const auto& row,uint32_t id){return row.visual<id;});
+    if(it==kitStarts_.end() || it->visual!=visual)return 0xFFFFFFFFu;
+    return phase==0 ? it->precast : phase==1 ? it->cast : it->channel;
 }
 
 bool SpellFxRenderer::open(const SpellFxConfig& cfg) {
@@ -122,6 +173,17 @@ bool SpellFxRenderer::open(const SpellFxConfig& cfg) {
     visuals_.resize(vt.count);
     std::memcpy(visuals_.data(), static_cast<const uint8_t*>(vb) + sizeof(vt), vt.count * sizeof(SpellFxVisual));
     pp::pakFree(vb);
+    auraEffects_.clear();
+    if (const pp::PakEntry* ae = pak.find("auras")) {
+        void* data = ae->size % sizeof(SpellFxAuraVisual) == 0 ? pak.load(ae) : nullptr;
+        if (data) {
+            const auto* rows = static_cast<const SpellFxAuraVisual*>(data);
+            for (size_t i = 0; i < ae->size / sizeof(*rows); ++i)
+                if (rows[i].state < vt.effectCount) auraEffects_.push_back(rows[i]);
+            pp::pakFree(data);
+        }
+    }
+    std::sort(auraEffects_.begin(), auraEffects_.end(), [](const auto& a, const auto& b) { return a.visual < b.visual; });
     char nm[16];
     effOff_.assign(vt.effectCount, 0);
     effSize_.assign(vt.effectCount, 0);
@@ -181,7 +243,13 @@ bool SpellFxRenderer::readRaw(uint32_t offset, void* dst, uint32_t size) {
         pp::pakNoteOpen(fd_, path_.c_str());  // in the descriptor budget
     }
     lastReadMs_ = pp::logUptimeMs();
-    return pp::pakRead(fd_, offset, dst, size);
+    const bool ok = pp::pakRead(fd_, offset, dst, size);
+    if (!ok || pp::pakFdTight()) {
+        pp::pakNoteClose(fd_);
+        sceIoClose(fd_);
+        fd_ = -1;
+    }
+    return ok;
 }
 
 void SpellFxRenderer::closeIdle(uint32_t nowMs) {
@@ -243,7 +311,12 @@ SpellFxRenderer::Loaded* SpellFxRenderer::load(uint16_t effect, uint32_t visualI
         return nullptr;
     }
     void* blob = memalign(64, (size + 63u) & ~63u);
-    if (!blob || !readRaw(effOff_[effect], blob, size) || !spellFxValid(blob, size)) {
+    if (!blob) return nullptr;
+    if (!readRaw(effOff_[effect], blob, size)) {
+        std::free(blob);
+        return nullptr;  // open/read failure is not evidence of a bad asset
+    }
+    if (!spellFxValid(blob, size)) {
         std::free(blob);
         PSP_LOGW(pp::tag::Gfx, "spellfx_bad effect=%u (rebake spellfx.pak)", static_cast<unsigned>(effect));
         return nullptr;
@@ -305,7 +378,7 @@ bool SpellFxRenderer::readTexture(uint16_t id, TexEntry& te) {
     void* tb = memalign(64, (ts + 63u) & ~63u);
     if (!tb || !readRaw(texOff_[id], tb, ts)) {
         std::free(tb);
-        te.broken = true;
+        te.retryMs = (pp::logUptimeMs() + 1000u) | 1u;
         return false;
     }
     sceKernelDcacheWritebackRange(tb, ts);
@@ -315,6 +388,7 @@ bool SpellFxRenderer::readTexture(uint16_t id, TexEntry& te) {
         return false;
     }
     te.ok = true;
+    te.retryMs = 0;
     te.bytes = ts;
     cacheBytes_ += ts;
     return true;
@@ -325,24 +399,24 @@ const pp::Texture* SpellFxRenderer::texture(uint16_t id) {
     if (it == textures_.end()) return nullptr;
     TexEntry& te = *it->second;
     te.lastFrame = frame_;
-    if (!te.ok && !te.broken && te.triedFrame != frame_) readTexture(id, te);  // the cache was full at load
+    if (!te.ok && !te.broken && te.triedFrame != frame_ &&
+        (!te.retryMs || static_cast<int32_t>(pp::logUptimeMs() - te.retryMs) >= 0)) readTexture(id, te);
     return te.ok ? &te.tex : nullptr;
 }
 
-void SpellFxRenderer::playPrecast(uint32_t visualId, const glm::vec3& feet, uint32_t castMs, uint64_t caster, bool own,
+bool SpellFxRenderer::playPrecast(uint32_t visualId, const glm::vec3& feet, uint32_t castMs, uint64_t caster, bool own,
                                   SpellFxHost& host) {
-    if (!isOpen() || visualId == 0) return;
+    if (!isOpen() || visualId == 0) return false;
     const SpellFxVisual* v = findVisual(visualId);
     if (!v) {
         if (missingLogged_.size() < 64 && missingLogged_.insert(visualId).second)
             PSP_LOGI(pp::tag::Gfx, "spellfx_missing visual=%u (not baked)", static_cast<unsigned>(visualId));
-        return;
+        return false;
     }
     // upstream: no precast kit (or its model failed) -> the cast kit.
     Loaded* L = v->precast != kFxNone ? load(v->precast, visualId, "precast") : nullptr;
     if (!L) {
-        play(visualId, feet, false, caster, own, host);
-        return;
+        return play(visualId, feet, false, caster, own, host);
     }
     uint8_t attach = caster ? L->h->attach : 0;
     glm::vec3 pos;
@@ -364,23 +438,24 @@ void SpellFxRenderer::playPrecast(uint32_t visualId, const glm::vec3& feet, uint
         host.attachmentWorld(caster, kFxAttachLeftHand, left);
         spawn(v->precast, visualId, left, duration, true, own, kFxAttachLeftHand, caster);
     }
+    return true;
 }
 
-void SpellFxRenderer::play(uint32_t visualId, const glm::vec3& feet, bool impact, uint64_t caster, bool own,
+bool SpellFxRenderer::play(uint32_t visualId, const glm::vec3& feet, bool impact, uint64_t caster, bool own,
                            SpellFxHost& host) {
-    if (!isOpen() || visualId == 0) return;
+    if (!isOpen() || visualId == 0) return false;
     const SpellFxVisual* v = findVisual(visualId);
     if (!v) {
         if (missingLogged_.size() < 64 && missingLogged_.insert(visualId).second)
             PSP_LOGI(pp::tag::Gfx, "spellfx_missing visual=%u (not baked)", static_cast<unsigned>(visualId));
-        return;
+        return false;
     }
     // upstream: the cast or impact path, falling back to the other.
     uint16_t effect = impact ? v->impact : v->cast;
     if (effect == kFxNone) effect = impact ? v->cast : v->impact;
-    if (effect == kFxNone) return;
+    if (effect == kFxNone) return false;
     Loaded* L = load(effect, visualId, impact ? "impact" : "cast");
-    if (!L) return;
+    if (!L) return false;
     // Only a cast kit follows the caster's bones (upstream: impacts stay where they land).
     uint8_t attach = (!impact && caster) ? L->h->attach : 0;
     glm::vec3 pos;
@@ -396,6 +471,96 @@ void SpellFxRenderer::play(uint32_t visualId, const glm::vec3& feet, bool impact
         host.attachmentWorld(caster, kFxAttachLeftHand, left);
         spawn(effect, visualId, left, duration, false, own, kFxAttachLeftHand, caster);
     }
+    return true;
+}
+
+bool SpellFxRenderer::launch(uint32_t visualId, const glm::vec3& from, const glm::vec3& to,
+                             uint64_t target, bool own) {
+    const SpellFxVisual* v = findVisual(visualId);
+    if (!target || !v || !v->reserved) return false;
+    const uint16_t effect = static_cast<uint16_t>(v->reserved - 1);
+    if (!load(effect, visualId, "missile")) return false;
+    spawn(effect, visualId, from, 8.0f, false, own, 0, 0);
+    auto& in = active_.back();
+    in.target = target;
+    const glm::vec3 delta = to - from;
+    if (glm::dot(delta, delta) > 1e-6f) in.direction = glm::normalize(delta);
+    return true;
+}
+
+std::pair<SpellFxRenderer::AuraIter, SpellFxRenderer::AuraIter> SpellFxRenderer::auraLayers(uint32_t visual) const {
+    const auto first = std::lower_bound(auraEffects_.begin(), auraEffects_.end(), visual,
+                                      [](const auto& row, uint32_t id) { return row.visual < id; });
+    const auto last = std::upper_bound(first, auraEffects_.end(), visual,
+                                     [](uint32_t id, const auto& row) { return id < row.visual; });
+    return {first, last};
+}
+
+void SpellFxRenderer::keepAuraTargets(const uint64_t* targets,size_t count) {
+    for(size_t i=active_.size();i-- >0;){
+        const uint64_t target=active_[i].auraTarget;
+        bool keep=false;for(size_t k=0;k<count;++k)keep=keep || targets[k]==target;
+        if(target && !keep)removeAt(i);
+    }
+}
+bool SpellFxRenderer::aura(uint32_t spellId, uint32_t visualId, uint64_t caster, uint64_t target,
+                           int32_t remainingMs, bool own, SpellFxHost& host) {
+    bool refreshed = false;
+    for (size_t i = active_.size(); i-- > 0;) {
+        auto& in = active_[i];
+        if (in.auraTarget != target || in.auraSpell != spellId || in.caster != caster) continue;
+        refreshed = true;
+        if (!remainingMs) removeAt(i);
+        else in.duration = remainingMs < 0 ? 1e20f : in.elapsed + remainingMs / 1000.0f;
+    }
+    if (refreshed || !remainingMs || !target) return refreshed;
+    const auto layers = auraLayers(visualId);
+    bool played = false;
+    for (auto it = layers.first; it != layers.second; ++it) {
+        const auto& layer = *it;
+        if ((layer.reserved >> 8) != 0) continue;
+        if (!hasRoom()) break; // Persistent auras must not evict a flying shot or another aura.
+        Loaded* L = load(layer.state, visualId, "aura");
+        if (!L) continue;
+        const uint8_t attach = (layer.reserved & 255) ? (layer.reserved & 255) - 1 : L->h->attach;
+        glm::vec3 at; float scale = 1;
+        if (!host.auraAnchor(target, attach, at, scale)) continue;
+        spawn(layer.state, visualId, at, remainingMs < 0 ? 1e20f : remainingMs / 1000.0f, false, own, 0, caster);
+        auto& in = active_.back();
+        in.auraTarget = target; in.auraSpell = spellId; in.scale = scale; in.auraAttach = attach;
+        played = true;
+    }
+    return played;
+}
+
+bool SpellFxRenderer::auraImpact(uint32_t visualId, uint64_t target, bool own, SpellFxHost& host, uint8_t role) {
+    bool played = false;
+    const auto layers = auraLayers(visualId);
+    for (auto it = layers.first; it != layers.second; ++it) {
+        const auto& layer = *it;
+        if ((layer.reserved >> 8) != role) continue;
+        Loaded* L = load(layer.state, visualId, "aura_flash");
+        if (!L) continue;
+        const uint8_t attach = (layer.reserved & 255) ? (layer.reserved & 255) - 1 : L->h->attach;
+        glm::vec3 at; float scale = 1;
+        if (!host.auraAnchor(target, attach, at, scale)) continue;
+        const float duration = L->h->durationMs > 100 ? std::clamp(L->h->durationMs / 1000.0f, .5f, kMaxDuration) : kDefaultDuration;
+        spawn(layer.state, visualId, at, duration, false, own, 0, 0);
+        auto& in = active_.back(); in.auraTarget = target; in.scale = scale; in.auraAttach = attach;
+        played = true;
+    }
+    if (played || role != 1) return played;
+    const auto* v = findVisual(visualId);
+    if (!v || v->impact == kFxNone) return false;
+    Loaded* L = load(v->impact, visualId, "aura_impact");
+    if (!L) return false;
+    glm::vec3 at; float scale = 1;
+    if (!host.auraAnchor(target, L->h->attach, at, scale)) return false;
+    const float duration = L->h->durationMs > 100 ? std::clamp(L->h->durationMs / 1000.0f, .5f, kMaxDuration) : kDefaultDuration;
+    spawn(v->impact, visualId, at, duration, false, own, 0, 0);
+    auto& in = active_.back(); in.auraTarget = target; in.scale = scale; in.auraAttach = L->h->attach;
+    if (visualId == kFxLevelUpVisual) in.duration = 3.5f;
+    return true;
 }
 
 void SpellFxRenderer::spawn(uint16_t effect, uint32_t visualId, const glm::vec3& pos, float duration, bool precast,
@@ -455,14 +620,19 @@ void SpellFxRenderer::removeAt(size_t i) {
 void SpellFxRenderer::prefetch(uint32_t visualId) {
     const SpellFxVisual* v = isOpen() ? findVisual(visualId) : nullptr;
     if (!v) return;
-    for (uint16_t e : {v->impact, v->cast, v->precast})
+    const auto layers = auraLayers(visualId);
+    for (auto it = layers.first; it != layers.second; ++it)
+        if (!loaded_.count(it->state) && std::find(prefetch_.begin(), prefetch_.end(), it->state) == prefetch_.end()) prefetch_.push_back(it->state);
+    const uint16_t missile = v->reserved ? static_cast<uint16_t>(v->reserved - 1) : kFxNone;
+    for (uint16_t e : {missile, v->impact, v->cast, v->precast})
         if (e != kFxNone && !loaded_.count(e) && std::find(prefetch_.begin(), prefetch_.end(), e) == prefetch_.end())
             prefetch_.push_back(e);
 }
 
-void SpellFxRenderer::cancelAllPrecast() {
+void SpellFxRenderer::cancelAllPrecast() { cancelPrecast(0); }
+void SpellFxRenderer::cancelPrecast(uint64_t caster) {
     for (size_t i = active_.size(); i-- > 0;)
-        if (active_[i].precast) removeAt(i);
+        if (active_[i].precast && (!caster || active_[i].caster == caster)) removeAt(i);
 }
 
 void SpellFxRenderer::reset() {
@@ -491,10 +661,59 @@ void SpellFxRenderer::frame(const TerrainCamera& cam, float dtSec, SpellFxHost& 
     PROF_SCOPE("spellfx");
     const uint32_t t0 = sceKernelGetSystemTimeLow();
     const float dt = std::clamp(dtSec, 0.0f, 0.25f);
+    struct EndedAura { uint32_t visual; uint64_t target; bool own; };
+    EndedAura ended[8]; int endedCount = 0;
+    // Persistent kits and application flashes follow the recipient, including NPCs.
+    for (size_t i = active_.size(); i-- > 0;) {
+        auto& in = active_[i];
+        if (!in.auraTarget) continue;
+        if (in.auraSpell) {
+            const int32_t remaining = host.auraRemaining(in.auraTarget, in.auraSpell, in.caster);
+            if (!remaining) {
+                bool seen = false;
+                for (int j = 0; j < endedCount; ++j)
+                    if (ended[j].visual == in.visual && ended[j].target == in.auraTarget) seen = true;
+                if (!seen) ended[endedCount++] = {in.visual, in.auraTarget, in.own};
+                removeAt(i); continue;
+            }
+            in.duration = remaining < 0 ? 1e20f : in.elapsed + remaining / 1000.0f;
+        }
+        if (!host.auraAnchor(in.auraTarget, in.auraAttach, in.pos, in.scale)) removeAt(i);
+    }
+    for (int i = 0; i < endedCount; ++i) auraImpact(ended[i].visual, ended[i].target, ended[i].own, host, 2);
+    // Arrival queue: play() may evict/reallocate active instances.
+    struct Arrival { uint32_t visual; glm::vec3 feet; bool own; };
+    Arrival arrivals[8];
+    int arrivalCount = 0;
+    for (size_t i = active_.size(); i-- > 0;) {
+        auto& in = active_[i];
+        if (!in.target) continue;
+        glm::vec3 end;
+        if (!host.targetWorld(in.target, end)) { removeAt(i); continue; }
+        const glm::vec3 delta = end - in.pos;
+        const float distance = glm::length(delta), step = 24.0f * dt;
+        if (distance <= std::max(step, 0.05f)) {
+            glm::vec3 feet;
+            if (host.unitFeet(in.target, feet)) arrivals[arrivalCount++] = {in.visual, feet, in.own};
+            removeAt(i);
+        } else {
+            in.direction = delta / distance;
+            in.pos += in.direction * step;
+        }
+    }
+    for (int i = 0; i < arrivalCount; ++i) {
+        play(arrivals[i].visual, arrivals[i].feet, true, 0, arrivals[i].own, host);
+        host.impactSound(arrivals[i].visual,arrivals[i].feet);
+    }
     // Lifetimes (upstream SpellVisualSystem::update).
     for (size_t i = active_.size(); i-- > 0;) {
-        active_[i].elapsed += dt;
-        if (active_[i].elapsed >= active_[i].duration) removeAt(i);
+        auto& in = active_[i];
+        if (in.precast) {
+            const float remaining = host.castRemaining(in.caster);
+            if (remaining >= 0) in.duration = in.elapsed + dt + std::max(.2f, remaining);
+        }
+        in.elapsed += dt;
+        if (in.elapsed >= in.duration) removeAt(i);
     }
     if (active_.empty()) {
         log(nowMs);
@@ -517,14 +736,23 @@ void SpellFxRenderer::frame(const TerrainCamera& cam, float dtSec, SpellFxHost& 
         f = FxInstance{};
         f.fx = &L->view;
         f.pos = in.pos;  // spell effects: no rotation or scale (upstream: the instance at a point)
+        if (in.auraTarget) f.axes[0] = f.axes[4] = f.axes[8] = in.scale;
+        if (in.target) {
+            const glm::vec3 forward = in.direction;
+            const glm::vec3 reference = std::abs(forward.z) > .99f ? glm::vec3(0,1,0) : glm::vec3(0,0,1);
+            const glm::vec3 side = glm::normalize(glm::cross(reference, forward));
+            const glm::vec3 up = glm::cross(forward, side);
+            for (int j = 0; j < 3; ++j) { f.axes[j] = forward[j]; f.axes[3+j] = side[j]; f.axes[6+j] = up[j]; }
+        }
         f.timeMs = in.elapsed * 1000.0f;
         f.acc = in.acc;
         for (int r = 0; r < kFxMaxRibbons; ++r) f.lanes[r] = in.lanes[r];
         f.owner = static_cast<uint8_t>(kSpellOwnerBase + i);
         // upstream: a particle-dominant effect draws no mesh (the converter baked none).
         f.mesh = true;
-        f.rate = 1.0f;
-        f.cap = L->h->emitterCount ? std::max(1, shareEffect / L->h->emitterCount) : 1;
+        const float quality=in.own ? std::max(.7f,performanceScale) : performanceScale;
+        f.rate = quality;
+        f.cap = L->h->emitterCount ? std::max(1, static_cast<int>(shareEffect*quality) / L->h->emitterCount) : 1;
         if (shareEffect <= 0) f.cap = 0;
         f.premultiply = cfg_.premultiply;  // Straight colour
         f.tex = &SpellFxRenderer::texFn;

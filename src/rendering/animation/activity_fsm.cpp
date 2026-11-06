@@ -190,8 +190,8 @@ void ActivityFSM::updateTransitions(const Input& in) {
             if (in.swimming || (in.jumping && !in.grounded) || in.moving) {
                 state_ = State::NONE;
             } else if (in.haveAnimState) {
-                if (in.currentAnimId == anim::KNEEL_END) lootEndAnimSeen_ = true;
-                if (lootEndAnimSeen_ && oneShotComplete(in, anim::KNEEL_END)) {
+                if (in.currentAnimId == anim::LOOT_UP) lootEndAnimSeen_ = true;
+                if (lootEndAnimSeen_ && oneShotComplete(in, anim::LOOT_UP)) {
                     state_ = State::NONE;
                 }
                 // Safety timeout
@@ -294,12 +294,12 @@ AnimOutput ActivityFSM::resolve(const Input& in, const AnimCapabilitySet& /*caps
             break;
 
         case State::LOOT_KNEELING:
-            animId = anim::KNEEL_LOOP;
+            animId = anim::LOOT_HOLD;
             loop = true;
             break;
 
         case State::LOOT_END:
-            animId = anim::KNEEL_END;
+            animId = anim::LOOT_UP;
             loop = false;
             break;
 

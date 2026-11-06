@@ -1076,7 +1076,7 @@ void WorldScreen::lfdUpdate(float dtSec) {
     if (L.alertT >= 0.0f) {
         if (L.alertFocus) L.alertOutAt = std::max(L.alertOutAt, L.alertT + 1.0f);
         L.alertFocus = false;
-        L.alertT += dtSec;
+        if(windows_.empty() && !settings_.isOpen() && !session_.logoutPending())L.alertT += dtSec;
         if (L.alertT > L.alertOutAt + 1.5f) L.alertT = -1.0f;
     }
 
@@ -2345,7 +2345,7 @@ void WorldScreen::updateWotlk() {
 }
 
 void WorldScreen::drawWotlkAlerts(UiRenderer& ui) {
-    if (fullMapOpen()) return;  // UIParent hidden
+    if (fullMapOpen() || !windows_.empty() || settings_.isOpen() || session_.logoutPending()) return;
     float stack = static_cast<float>(pp::kScreenH) - 128.0f * kUiParentScale;  // AlertFrame BOTTOM 0,128 of UIParent
     if (ach_) drawAchievementAlerts(ui, stack);
     if (lfd_) drawLfgCompletionAlert(ui, stack);

@@ -25,12 +25,10 @@ void displayShutdown();
 // Starts the frame's display list and clears colour + depth.
 void frameBegin(uint32_t clearABGR);
 
-// The next frameBegin() leaves the screen
-// uncleared (one-shot; the frame after clears again unless asked anew). For a
-// caller that covers every pixel, colour and depth 0, itself - the world's sky
-// (wowee.cfg skyfast=1): the clear is a whole-screen pass for nothing there.
-// frameCleared() says whether this frame's frameBegin did clear; a caller that
-// asked and then cannot cover the screen must clear itself.
+// Skip only the next frame's colour clear for a caller that replaces every
+// colour pixel (sky/movie). Depth is always cleared after restoring the screen
+// target and full viewport. frameCleared() reports whether colour was cleared;
+// a caller that cannot cover the screen must supply its own colour clear.
 void frameSkipNextClear();
 bool frameCleared();
 
@@ -59,6 +57,7 @@ void textAt(int col, int row, uint32_t abgr, const char* fmt, ...)
 
 // Microseconds the last frame spent waiting for the GE (sceGuSync).
 uint32_t lastGeWaitUs();
+uint32_t lastFrameWorkUs(); // previous complete frame, excluding vblank pacing
 
 // Frame limit: flip no sooner than `vblanks` vblanks after the previous flip
 // (1 = 60 fps, as always; 2 = 30 fps). wowee.cfg framecap, settings menu.

@@ -15,7 +15,8 @@
 //   - SpellBookPrevPageButton / NextPageButton with PREV / NEXT and
 //     SpellBookPageText PAGE_NUMBER; each tab keeps its page
 //     (SPELLBOOK_PAGENUMBERS).
-// Buttons (PSP): Cross / Circle on a spell = SpellButton_OnClick (CastSpell),
+// Buttons (PSP): Cross / Square opens the controller slot picker; Circle casts.
+// Legacy cursor path:
 // Square = SpellButton_OnDrag (PickupSpell: the spell goes on the cursor; Cross
 // or Square on an action button puts it there - PlaceAction, the old one
 // comes onto the cursor; START drops it). Square on an action button picks
@@ -44,6 +45,7 @@ namespace {
 
 // ui_world_spells.cpp ids (the actions stay there).
 constexpr uint32_t kIdSlot0 = 0x5C10;
+constexpr uint32_t kIdAssign0 = 0x6F80; // private overlay focus ring: twelve destinations
 constexpr uint32_t kIdBook0 = 0x5C80;  // + 0..11 SpellButton1..12 in display order
 constexpr uint32_t kIdBookPrev = 0x5CA0, kIdBookNext = 0x5CA1, kIdBookClose = 0x5CA3;
 constexpr uint32_t kIdBookTab0 = 0x6760;  // ui_world_trainer.cpp: + 0..7 skill line tabs
@@ -221,8 +223,8 @@ void WorldScreen::spellWindowPad(const pp::PadState& pad) {
     if (id >= kIdBook0 && id < kIdBook0 + kSpellsPerPage && windowOpen(kWinSpellbook)) {
         const int idx = bookPage_ * kSpellsPerPage + static_cast<int>(id - kIdBook0);
         if (idx < static_cast<int>(bookSpells_.size())) {
-            bookPick_ = bookSpells_[static_cast<size_t>(idx)];  // PickupSpell
-            bookPickItem_ = false;
+            if (settings_.values().barassignment) beginSpellAssignment(bookSpells_[static_cast<size_t>(idx)], id);
+            else { bookPick_=bookSpells_[static_cast<size_t>(idx)]; bookPickItem_=false; }
         }
     } else if (id >= kIdSlot0 && id < kIdSlot0 + 12) {
         // an item held with Square goes on the button (PickupContainerItem + PlaceAction)
@@ -243,11 +245,138 @@ void WorldScreen::drawSpellCursor(UiRenderer& ui) {
             kit_.tooltip(ui, a, tabs[static_cast<size_t>(tipBookTab_ - 1)].name.c_str(), "");
         }
     }
-    if (bookPick_ != 0 && uiMode_ && !settings_.isOpen()) {
+    if (!barAssign_.active() && bookPick_ != 0 && uiMode_ && !settings_.isOpen()) {
         // an item button on the cursor shows the item's icon
         if (const pp::Texture* t = bookPickItem_ ? itemActionIcon(bookPick_) : spellDb_.icon(bookPick_, spellFrame_))
             ui.image(*t, Rect{winFocus_.cursorX() + 6.0f, winFocus_.cursorY() + 6.0f, 18, 18}, 0xD0FFFFFFu);
     }
+}
+
+void WorldScreen::beginSpellAssignment(uint32_t spell, uint32_t origin) {
+    if (!spell) return;
+    if (bookPick_) { uiInfo(OWN_STR(ASSIGN_CLEAR_CURSOR)); return; }
+    if (classBarHidesMainBar()) { uiInfo(OWN_STR(ASSIGN_BAR_UNAVAILABLE)); return; }
+    const auto& bar = session_.actionBar();
+    const int base = mainBarBase();
+    if (base < 0 || base + 12 > static_cast<int>(bar.size())) return;
+    int selected = -1;
+    for (int i=0;i<12;++i)
+        if (bar[base+i].type == game::ActionBarSlot::SPELL && bar[base+i].id == spell) { selected=i; break; }
+    if (selected < 0) for (int i=0;i<12;++i) if (bar[base+i].isEmpty()) { selected=i; break; }
+    if (selected < 0) selected=0;
+    barAssign_.begin(spell, base, selected, origin);
+    barAssignFocus_.setFocus(kIdAssign0+static_cast<uint32_t>(selected));
+}
+
+void WorldScreen::cancelSpellAssignment() {
+    const uint32_t origin = barAssign_.returnFocus;
+    barAssign_.cancel();
+    if (windowOpen(kWinSpellbook)) { winFocus_.focusGroup(kWinSpellbook); winFocus_.setFocus(origin); }
+}
+
+void WorldScreen::updateSpellAssignment(const pp::PadState& pad, float dtSec) {
+    if (!barAssign_.active()) return;
+    if ((pad.pressed & (PSP_CTRL_CIRCLE | PSP_CTRL_START)) ||
+        mainBarBase()!=barAssign_.base || classBarHidesMainBar() || !windowOpen(kWinSpellbook)) {
+        cancelSpellAssignment(); return;
+    }
+    if (pad.pressed & (PSP_CTRL_LTRIGGER | PSP_CTRL_RTRIGGER)) {
+        actionBarPage_ = (actionBarPage_ + ((pad.pressed & PSP_CTRL_RTRIGGER) ? 1 : 5)) % 6;
+        barAssign_.base = mainBarBase();
+        barAssign_.confirming = false;
+    }
+    barAssignFocus_.update(pad,dtSec);
+    const uint32_t focus=barAssignFocus_.focused();
+    if (focus>=kIdAssign0 && focus<kIdAssign0+12) barAssign_.select(static_cast<int>(focus-kIdAssign0));
+    const uint32_t act=barAssignFocus_.activated();
+    if (act<kIdAssign0 || act>=kIdAssign0+12) return;
+    const auto& bar=session_.actionBar();
+    const int slot=barAssign_.base+barAssign_.slot;
+    if (slot<0 || slot>=static_cast<int>(bar.size())) { cancelSpellAssignment(); return; }
+    const auto& old=bar[slot];
+    const bool same=old.type==game::ActionBarSlot::SPELL && old.id==barAssign_.spell;
+    if (barAssign_.activate(!old.isEmpty() && !same)==ActionAssignment::ConfirmReplacement) return;
+    if (!same) session_.setActionBarSlot(slot,game::ActionBarSlot::SPELL,barAssign_.spell);
+    slotFlash_[barAssign_.slot]=.5f;
+    cancelSpellAssignment();
+}
+
+void WorldScreen::drawSpellAssignment(UiRenderer& ui) {
+    if (!barAssign_.active()) return;
+    ui.fill(Rect{0,0,480,272},0xA0000000u);
+    loadPopupArt();
+    // Use the same client metal border and overlapping title tab as Settings.
+    auto panel=[&](const Rect& r,uint32_t background) {
+        ui.fill(Rect{r.x+4,r.y+4,r.w-8,r.h-8},background);
+        if(popupArt_.border.pixels)ui.nineSlice(popupArt_.border,r,.45f);
+        else if(kit_.has(kTexDlgBorder))ui.nineSlice(kit_.tex(kTexDlgBorder),r,.7f);
+    };
+    panel(Rect{16,38,448,206},0xB0000000u);
+    const auto& normal=kit_.font(kFontNormal);
+    const auto& font=kit_.font(kFontSmall);
+    const char* caption=OWN_STR(ASSIGN_HEADER);
+    const float headerWidth=std::clamp(static_cast<float>(normal.measure(caption))+28.f,116.f,300.f);
+    const Rect header{240.f-headerWidth*.5f,26,headerWidth,32};
+    if(popupArt_.header.pixels)ui.image(popupArt_.header,header);
+    else panel(header,0xFF171717u);
+    ui.textShadow(normal,240,header.y+(header.h-normal.lineHeight())*.5f,caption,kColGold,Align::Center);
+    ui.pushClip(Rect{26,59,428,14});
+    ui.textShadow(font,240,61,OWN_STR(ASSIGN_TITLE),kColGold,Align::Center);
+    ui.popClip();
+    panel(Rect{26,73,428,35},0x80000000u);
+    panel(Rect{24,110,432,74},0x40000000u);
+    panel(Rect{26,185,428,19},0x80000000u);
+    const auto* pending=spellDb_.get(barAssign_.spell);
+    if(const auto* icon=spellDb_.icon(barAssign_.spell,spellFrame_))ui.image(*icon,Rect{34,76,30,30});
+    ui.pushClip(Rect{74,76,310,30});
+    ui.textShadow(font,74,85,pending ? pending->name.c_str() : "?",kColWhite);
+    ui.popClip();
+    char pageLabel[16];std::snprintf(pageLabel,sizeof(pageLabel),"%d/6",actionBarPage_+1);
+    ui.textShadow(font,438,85,pageLabel,kColGold,Align::Right);
+    const auto& bar=session_.actionBar();
+    const char* rowNames[]={OWN_STR(ASSIGN_ROW_MAIN),OWN_STR(ASSIGN_ROW_L),OWN_STR(ASSIGN_ROW_R)};
+    constexpr PadGlyph keys[]={kPadSquare,kPadTriangle,kPadCircle,kPadCross};
+    for(int group=0;group<3;++group)kit_.controlHint(ui,font,94.f+group*144.f,112,rowNames[group],kColGold,Align::Center);
+    for(int i=0;i<12;++i) {
+        const int slot=barAssign_.base+i;
+        const Rect button{26.f+i*36.f,128,32,32};
+        const bool focused=barAssignFocus_.addStop(kIdAssign0+i,button);
+        const float frameSide=26.f*66.f/36.f;
+        const Rect slotFrame{button.x+(button.w-frameSide)*.5f,button.y+(button.h-frameSide)*.5f,frameSide,frameSide};
+        bool occupied=false;
+        if(slot>=0 && slot<static_cast<int>(bar.size())) {
+            const auto& action=bar[slot];
+            occupied=!action.isEmpty();
+            const pp::Texture* icon=action.type==game::ActionBarSlot::SPELL ? spellDb_.icon(action.id,spellFrame_) :
+                action.type==game::ActionBarSlot::ITEM ? itemActionIcon(action.id) : nullptr;
+            if(icon)ui.image(*icon,Rect{button.x+3,button.y+3,26,26});
+        }
+        if(occupied && spellArt_.slot.pixels)ui.image(spellArt_.slot,slotFrame);
+        else if(!occupied && spellArt_.empty.pixels)ui.image(spellArt_.empty,slotFrame,0xC0FFFFFFu);
+        else if(!occupied)ui.fill(button,0x80000000u);
+        if(focused && spellArt_.hilite.pixels)ui.image(spellArt_.hilite,button,0x80FFFFFFu,Blend::Add);
+        char number[8];std::snprintf(number,sizeof(number),"%d",i+1);
+        ui.textShadow(font,button.x+2,button.y+1,number,kColWhite);
+        kit_.glyph(ui,keys[i%4],Rect{button.x+9,166,14,14});
+        if(focused) {
+            ui.fill(Rect{button.x,161,button.w,2},kColGold);
+            kit_.glyph(ui,kPadCross,Rect{button.x+24,button.y+24,10,10});
+        }
+    }
+    const int destination=barAssign_.base+barAssign_.slot;
+    std::string existing=OWN_STR(ASSIGN_EMPTY);
+    if (destination>=0 && destination<static_cast<int>(bar.size()) && !bar[destination].isEmpty()) {
+        const auto& action=bar[destination];
+        const auto* info=action.type==game::ActionBarSlot::SPELL ? spellDb_.get(action.id) : nullptr;
+        existing=info ? info->name : OWN_STR(ASSIGN_EXISTING);
+    }
+    const std::string destinationText=OWN_FMT(ASSIGN_DESTINATION,barAssign_.slot+1,existing.c_str());
+    ui.pushClip(Rect{28,186,424,16});
+    ui.textShadow(font,240,188,destinationText.c_str(),kColGold,Align::Center);
+    ui.popClip();
+    kit_.controlHint(ui,font,240,209,barAssign_.confirming ? OWN_STR(ASSIGN_REPLACE) : OWN_STR(ASSIGN_HINT),kColWhite,Align::Center);
+    kit_.controlHint(ui,font,240,228,OWN_STR(ASSIGN_PAGES),kColGold,Align::Center);
+    kit_.cursor(ui,barAssignFocus_);
 }
 
 }  // namespace wowee::ui::psp

@@ -136,6 +136,14 @@ bool WorldSession::handleChatPacket(game::LogicalOpcode op, network::Packet& pac
     using game::LogicalOpcode;
     const bool inWorld = state_ == State::InWorld;
     switch (op) {
+        case LogicalOpcode::SMSG_PLAY_SOUND:
+        case LogicalOpcode::SMSG_PLAY_OBJECT_SOUND: {
+            if(!inWorld || !packet.hasRemaining(4))return true;
+            ServerSound sound;sound.id=packet.readUInt32();
+            if(op==LogicalOpcode::SMSG_PLAY_OBJECT_SOUND && packet.hasRemaining(8))sound.source=packet.readUInt64();
+            if(sound.id){if(serverSounds_.size()>=16)serverSounds_.pop_front();serverSounds_.push_back(sound);}
+            return true;
+        }
         case LogicalOpcode::SMSG_MESSAGECHAT:
             if (inWorld) handleMessageChat(packet);
             return true;

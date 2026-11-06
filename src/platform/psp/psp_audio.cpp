@@ -1,4 +1,6 @@
 #include "platform/psp/psp_audio.hpp"
+#include "platform/psp/psp_audio_io.hpp"
+#include "platform/psp/psp_audio_math.hpp"
 
 #include "platform/psp/psp_log.hpp"
 #include "platform/psp/psp_pak.hpp"  // the descriptor budget counts the track's
@@ -64,9 +66,12 @@ struct Voice {
     uint32_t step = 0;               // 16.16 source frames per output frame
     uint64_t pos = 0;                // 16.16
     bool loop = false;
+    uint32_t tag = 0;
+    volatile bool stopping = false;
     volatile float gainL = 0.0f, gainR = 0.0f;
 };
 Voice g_voices[kVoices];
+const int16_t* volatile g_mixingPcm = nullptr;
 volatile float g_sfxVolume = 1.0f;
 
 AudioStats g_stats;
@@ -90,6 +95,7 @@ struct Track {
     uint32_t frac = 0;     // resampler phase
     int16_t last[2] = {0, 0};
     bool loop = false;
+    bool started = false;
 };
 
 void closeTrack(Track& t) {
@@ -182,9 +188,10 @@ uint32_t mp3AudioStart(SceUID fd, SceOff size) {
 
 bool openTrack(Track& t, const char* path, bool loop) {
     const uint64_t t0 = sceKernelGetSystemTimeWide();
-    t.fd = sceIoOpen(path, PSP_O_RDONLY, 0777);
+    t.fd = audioOpenRead(path,0777);
     if (t.fd < 0) {
-        PSP_LOGW(tag::Sys, "music_open_failed path=%s r=%08X", path, static_cast<unsigned>(t.fd));
+        PSP_LOGW(tag::Sys, "music_open_failed r=%08X", static_cast<unsigned>(t.fd));
+        PSP_LOGW(tag::Sys, "music_file=%s", path);
         if (static_cast<unsigned>(t.fd) == 0x80020320u) pakFdRelieve(1);  // MFILE - the pressure
         t.fd = -1;
         return false;
@@ -215,7 +222,7 @@ bool openTrack(Track& t, const char* path, bool loop) {
         // Init refused the data: start past the ID3v2 tag / at the first frame
         // (also for a rate refusal: a false sync inside a tag parses as any rate).
         const uint32_t start = mp3AudioStart(t.fd, size);
-        PSP_LOGW(tag::Sys, "music_mp3_retry path=%s r=%08X start=%u", path, static_cast<unsigned>(r),
+        PSP_LOGW(tag::Sys, "music_mp3_retry r=%08X start=%u", static_cast<unsigned>(r),
                  static_cast<unsigned>(start));
         if (start > 0) {
             sceMp3ReleaseMp3Handle(t.handle);
@@ -233,7 +240,7 @@ bool openTrack(Track& t, const char* path, bool loop) {
     }
     if (step) {
         static const char* const kStep[] = {"", "reserve", "feed", "init"};
-        PSP_LOGW(tag::Sys, "music_mp3_failed path=%s handle=%d step=%s r=%08X%s", path, t.handle, kStep[step],
+        PSP_LOGW(tag::Sys, "music_mp3_failed handle=%d step=%s r=%08X%s", t.handle, kStep[step],
                  static_cast<unsigned>(r), static_cast<unsigned>(r) == 0x80671302u ? " hint=rate_not_44100" : "");
         ++g_stats.decodeErrors;
         closeTrack(t);
@@ -340,6 +347,7 @@ int decoderThread(SceSize, void*) {
             g_decoding = false;
             continue;
         }
+        if (!t.started) { t.started=true; ++g_stats.musicStarts; }
         pushPcm(t, pcm, bytes / (2 * t.channels));
     }
     closeTrack(t);
@@ -347,14 +355,16 @@ int decoderThread(SceSize, void*) {
 }
 
 // --- feeders ------------------------------------------------------------
-int16_t g_musicOut[kBlock * 2] __attribute__((aligned(64)));
-int16_t g_sfxOut[kBlock * 2] __attribute__((aligned(64)));
+int16_t g_musicOut[2][kBlock * 2] __attribute__((aligned(64)));
+int16_t g_sfxOut[2][kBlock * 2] __attribute__((aligned(64)));
 int32_t g_mix[kBlock * 2];
 
 int musicFeeder(SceSize, void*) {
+    unsigned outputIndex=0;
     uint32_t seenRingGen = 0, seenFade = 0;
     float gain = 0.0f, target = 0.0f, stepPerBlock = 1.0f;
     while (g_running) {
+        auto& output=g_musicOut[outputIndex];
         if (g_ringGen != seenRingGen) {
             seenRingGen = g_ringGen;
             g_rd = g_wr;  // flush: the decoder has moved on
@@ -365,18 +375,20 @@ int musicFeeder(SceSize, void*) {
                 const int gi = static_cast<int>(g_movieGain * 32768.0f);
                 for (int i = 0; i < kBlock; ++i) {
                     const uint32_t r = (g_rd + i) % kRingFrames;
-                    g_musicOut[i * 2] = static_cast<int16_t>((g_ring[r * 2] * gi) >> 15);
-                    g_musicOut[i * 2 + 1] = static_cast<int16_t>((g_ring[r * 2 + 1] * gi) >> 15);
+                    output[i * 2] = static_cast<int16_t>((g_ring[r * 2] * gi) >> 15);
+                    output[i * 2 + 1] = static_cast<int16_t>((g_ring[r * 2 + 1] * gi) >> 15);
                 }
                 asm volatile("" ::: "memory");
                 g_rd = g_rd + kBlock;
                 g_moviePlayed = g_moviePlayed + kBlock;
             } else {
                 g_movieUnderruns = g_movieUnderruns + 1;
-                std::memset(g_musicOut, 0, sizeof(g_musicOut));
+                std::memset(output, 0, sizeof(output));
             }
             g_stats.ringFill = ringUsed();
-            sceAudioOutputBlocking(g_musicCh, PSP_AUDIO_VOLUME_MAX, g_musicOut);
+            sceKernelDcacheWritebackRange(output,sizeof(output));
+            if (sceAudioOutputBlocking(g_musicCh, PSP_AUDIO_VOLUME_MAX, output)<0) ++g_stats.outputErrors;
+            outputIndex^=1u;
             continue;
         }
         if (g_fadeGen != seenFade) {
@@ -390,30 +402,36 @@ int musicFeeder(SceSize, void*) {
         else if (gain > target) gain = std::max(target, gain - stepPerBlock);
         g_musicGain = gain;
         const uint32_t used = ringUsed();
-        const float vol = g_musicVolume;
+        const float vol = g_musicVolume * 0.4f;  // headroom for the separate SFX hardware channel
         if (used >= static_cast<uint32_t>(kBlock) && (gain > 0.0f || g0 > 0.0f)) {
             const float a = g0 * vol * 32768.0f, b = gain * vol * 32768.0f;
             for (int i = 0; i < kBlock; ++i) {
                 const uint32_t r = (g_rd + i) % kRingFrames;
                 const int gi = static_cast<int>(a + (b - a) * (static_cast<float>(i) / kBlock));
-                g_musicOut[i * 2] = static_cast<int16_t>((g_ring[r * 2] * gi) >> 15);
-                g_musicOut[i * 2 + 1] = static_cast<int16_t>((g_ring[r * 2 + 1] * gi) >> 15);
+                output[i * 2] = static_cast<int16_t>((g_ring[r * 2] * gi) >> 15);
+                output[i * 2 + 1] = static_cast<int16_t>((g_ring[r * 2 + 1] * gi) >> 15);
             }
             asm volatile("" ::: "memory");
             g_rd = g_rd + kBlock;
         } else {
             if (used >= static_cast<uint32_t>(kBlock)) g_rd = g_rd + kBlock;  // silent: keep the ring moving
             else if (g_decoding) ++g_stats.underruns;
-            std::memset(g_musicOut, 0, sizeof(g_musicOut));
+            std::memset(output, 0, sizeof(output));
         }
         g_stats.ringFill = ringUsed();
-        sceAudioOutputBlocking(g_musicCh, PSP_AUDIO_VOLUME_MAX, g_musicOut);
+        sceKernelDcacheWritebackRange(output,sizeof(output));
+            if (sceAudioOutputBlocking(g_musicCh, PSP_AUDIO_VOLUME_MAX, output)<0) ++g_stats.outputErrors;
+            outputIndex^=1u;
     }
     return 0;
 }
 
 int sfxFeeder(SceSize, void*) {
+    unsigned outputIndex=0;
+    int mixGain = 32768;
     while (g_running) {
+        auto& output=g_sfxOut[outputIndex];
+        const uint64_t mixStart=sceKernelGetSystemTimeWide();
         std::memset(g_mix, 0, sizeof(g_mix));
         uint32_t playing = 0;
         const float cat = g_sfxVolume;
@@ -422,10 +440,16 @@ int sfxFeeder(SceSize, void*) {
             const uint32_t gen = v.gen;
             // Snapshot (the main thread may restart the voice meanwhile).
             const int16_t* pcm = v.pcm;
+            g_mixingPcm=pcm;
+            asm volatile("" ::: "memory");
             const uint32_t frames = v.frames, step = v.step;
             const int ch = v.channels;
             uint64_t pos = v.pos;
             const bool loop = v.loop;
+            const uint32_t overlap=loop ? loopCrossfadeFrames(frames,static_cast<uint32_t>((static_cast<uint64_t>(step)*kOutRate)>>16)) : 0u;
+            const uint32_t loopFrames=frames-overlap;
+            const uint32_t fadeScale=overlap ? (1u<<24)/overlap : 0u;
+            const bool stopping=v.stopping;
             const int gl = static_cast<int>(v.gainL * cat * 32768.0f), gr = static_cast<int>(v.gainR * cat * 32768.0f);
             if (!pcm || frames == 0) continue;
             ++playing;
@@ -437,13 +461,32 @@ int sfxFeeder(SceSize, void*) {
                         ended = true;
                         break;
                     }
-                    pos -= static_cast<uint64_t>(frames) << 16;
+                    const uint64_t start=static_cast<uint64_t>(overlap)<<16;
+                    pos=start+(pos-(static_cast<uint64_t>(frames)<<16))%(static_cast<uint64_t>(loopFrames)<<16);
                     idx = static_cast<uint32_t>(pos >> 16);
                 }
-                const int16_t* s = pcm + idx * ch;
-                const int l = s[0], r = ch == 2 ? s[1] : s[0];
-                g_mix[i * 2] += (l * gl) >> 15;
-                g_mix[i * 2 + 1] += (r * gr) >> 15;
+                if (stopping && i>=128) { ended=true; break; }
+                const uint32_t next=idx+1<frames ? idx+1 : idx;
+                const int16_t* s=pcm+idx*ch;
+                const int16_t* t=pcm+next*ch;
+                const uint32_t fraction=static_cast<uint32_t>(pos & 0xFFFFu);
+                int l=interpolatePcm(s[0],t[0],fraction);
+                int r=ch==2 ? interpolatePcm(s[1],t[1],fraction) : l;
+                if (overlap && idx>=frames-overlap) {
+                    const uint32_t head=idx-(frames-overlap);
+                    const int16_t* a=pcm+head*ch;
+                    const int16_t* b=a+ch;
+                    const int hl=interpolatePcm(a[0],b[0],fraction);
+                    const int hr=ch==2 ? interpolatePcm(a[1],b[1],fraction) : hl;
+                    l=loopCrossfadePcm(l,hl,head,fadeScale);
+                    r=loopCrossfadePcm(r,hr,head,fadeScale);
+                }
+                int envelope=128;
+                if (!loop) envelope=static_cast<int>(std::min<uint32_t>(128,std::min(idx,frames-idx)));
+                else if (overlap>=128u) envelope=static_cast<int>(std::min<uint32_t>(128,idx));
+                if (stopping) envelope=std::min(envelope,127-i);
+                g_mix[i*2]+=((l*gl)>>15)*envelope/128;
+                g_mix[i*2+1]+=((r*gr)>>15)*envelope/128;
                 pos += step;
             }
             if (v.gen == gen) {  // not restarted meanwhile
@@ -451,9 +494,20 @@ int sfxFeeder(SceSize, void*) {
                 if (ended) v.active = false;
             }
         }
+        g_mixingPcm=nullptr;
         g_stats.sfxVoices = playing;
-        for (int i = 0; i < kBlock * 2; ++i) g_sfxOut[i] = static_cast<int16_t>(std::clamp<int32_t>(g_mix[i], -32768, 32767));
-        sceAudioOutputBlocking(g_sfxCh, PSP_AUDIO_VOLUME_MAX, g_sfxOut);
+        int32_t peak = 0;
+        for (int i = 0; i < kBlock * 2; ++i) peak = std::max(peak, std::abs(g_mix[i]));
+        mixGain = mixBlockGain(peak, mixGain);
+        for (int i = 0; i < kBlock * 2; ++i) output[i] = scaleMixedPcm(g_mix[i], mixGain);
+        // The submitted block remains owned by the audio device. Fill the other
+        // buffer next (the same ping-pong scheme used by PSPSDK pspaudiolib).
+        sceKernelDcacheWritebackRange(output,sizeof(output));
+        const uint32_t mixUs=static_cast<uint32_t>(sceKernelGetSystemTimeWide()-mixStart);
+        g_stats.sfxMixMaxUs=std::max(g_stats.sfxMixMaxUs,mixUs);
+        if (mixUs>static_cast<uint32_t>(kBlock)*1000000u/kOutRate) ++g_stats.sfxLateBlocks;
+        if (sceAudioOutputBlocking(g_sfxCh, PSP_AUDIO_VOLUME_MAX, output)<0) ++g_stats.outputErrors;
+        outputIndex^=1u;
     }
     return 0;
 }
@@ -472,8 +526,8 @@ bool audioInit() {
              static_cast<unsigned>(m2), static_cast<unsigned>(res), g_musicCh, g_sfxCh);
     if (g_musicCh < 0 || g_sfxCh < 0) return false;
     g_running = true;
-    // Priorities: main thread 0x20; feeders above it, the decoder below.
-    g_decoderThread = sceKernelCreateThread("wowee_mp3dec", decoderThread, 0x30, 32 * 1024, PSP_THREAD_ATTR_USER, nullptr);
+    // Feeders first, decoder next, gameplay next: a busy render must not starve MP3 decoding.
+    g_decoderThread = sceKernelCreateThread("wowee_mp3dec", decoderThread, 0x18, 32 * 1024, PSP_THREAD_ATTR_USER, nullptr);
     g_musicFeeder = sceKernelCreateThread("wowee_music", musicFeeder, 0x12, 16 * 1024, PSP_THREAD_ATTR_USER, nullptr);
     g_sfxFeeder = sceKernelCreateThread("wowee_sfx", sfxFeeder, 0x12, 16 * 1024, PSP_THREAD_ATTR_USER, nullptr);
     if (g_decoderThread < 0 || g_musicFeeder < 0 || g_sfxFeeder < 0) {
@@ -493,14 +547,35 @@ bool audioInit() {
 void audioShutdown() {
     if (!g_ok) return;
     g_running = false;
-    for (SceUID t : {g_decoderThread, g_musicFeeder, g_sfxFeeder}) {
+    asm volatile("" ::: "memory");
+    for (SceUID* handle : {&g_decoderThread, &g_musicFeeder, &g_sfxFeeder}) {
+        const SceUID t = *handle;
         if (t < 0) continue;
-        SceUInt timeout = 500 * 1000;
-        sceKernelWaitThreadEnd(t, &timeout);
-        sceKernelDeleteThread(t);
+        SceUInt timeout = 3000 * 1000; // allow an in-flight Memory Stick read to finish
+        const int rc = sceKernelWaitThreadEnd(t, &timeout);
+        if (rc < 0) {
+            PSP_LOGW(tag::Exit, "audio_shutdown thread=%d wait=%08X terminating=1", t, static_cast<unsigned>(rc));
+            sceKernelTerminateDeleteThread(t);
+        } else {
+            sceKernelDeleteThread(t);
+        }
+        *handle = -1;
     }
+    // No mixer may retain a PCM pointer when the screen destroys its sound bank.
+    g_mixingPcm = nullptr;
+    for (auto& voice : g_voices) voice = {};
+    g_decoding = false;
+    g_movie = false;
+    // OutputBlocking queues a hardware block; wait for it before releasing channels.
+    uint32_t drainMs = 0;
+    while ((sceAudioGetChannelRestLen(g_musicCh) > 0 || sceAudioGetChannelRestLen(g_sfxCh) > 0) && drainMs < 500) {
+        sceKernelDelayThread(1000);
+        ++drainMs;
+    }
+    if (drainMs == 500) PSP_LOGW(tag::Exit, "audio_shutdown drain_timeout=1");
     sceAudioChRelease(g_musicCh);
     sceAudioChRelease(g_sfxCh);
+    g_musicCh = g_sfxCh = -1;
     sceMp3TermResource();
     g_ok = false;
 }
@@ -529,9 +604,12 @@ void musicStop(uint32_t fadeOutMs) {
 
 void musicSetVolume(float v) { g_musicVolume = std::clamp(v, 0.0f, 1.0f); }
 
-bool musicActive() { return g_ok && (g_req.gen != g_handledGen || g_decoding || g_musicGain > 0.001f); }
+bool musicActive() {
+    // A completed track can leave fade gain at 1 forever. Gain is not playback state.
+    return g_ok && (g_req.gen != g_handledGen || g_decoding || ringUsed() >= static_cast<uint32_t>(kBlock));
+}
 
-int sfxPlay(const int16_t* pcm, uint32_t frames, int channels, uint32_t rate, float gain, float pan, bool loop) {
+int sfxPlay(const int16_t* pcm, uint32_t frames, int channels, uint32_t rate, float gain, float pan, bool loop, uint32_t tag) {
     if (!g_ok || !pcm || !frames || channels < 1 || channels > 2 || rate == 0) return -1;
     int slot = -1;
     float quietest = 2.0f;
@@ -547,6 +625,13 @@ int sfxPlay(const int16_t* pcm, uint32_t frames, int channels, uint32_t rate, fl
         }
     }
     if (slot < 0 || (g_voices[slot].active && quietest >= gain)) return -1;  // all busy with louder sounds
+    if (g_voices[slot].active) {
+        // Never cut an audible waveform to steal a voice. Fade it and let the
+        // next sound use the released slot on the following mixer block.
+        g_voices[slot].stopping = true;
+        return -1;
+    }
+    gain = std::clamp(gain, 0.0f, 1.0f);
     Voice& v = g_voices[slot];
     v.gen = v.gen + 1;  // before touching fields (the feeder re-checks it)
     v.active = false;
@@ -557,6 +642,7 @@ int sfxPlay(const int16_t* pcm, uint32_t frames, int channels, uint32_t rate, fl
     v.step = static_cast<uint32_t>((static_cast<uint64_t>(rate) << 16) / kOutRate);
     v.pos = 0;
     v.loop = loop;
+    v.tag = tag; v.stopping = false;
     const float p = std::clamp(pan, -1.0f, 1.0f);
     v.gainL = gain * (p > 0.0f ? 1.0f - p : 1.0f);
     v.gainR = gain * (p < 0.0f ? 1.0f + p : 1.0f);
@@ -569,6 +655,11 @@ void sfxStop(int voice) {
     if (voice < 0 || voice >= kVoices) return;
     g_voices[voice].gen = g_voices[voice].gen + 1;
     g_voices[voice].active = false;
+}
+
+void sfxStopTag(uint32_t tag) {
+    if (!tag) return;
+    for (auto& v : g_voices) if (v.active && v.tag==tag) v.stopping=true;
 }
 
 void sfxSetGain(int voice, float gain, float pan) {
@@ -584,6 +675,14 @@ void sfxSetVolume(float v) { g_sfxVolume = std::clamp(v, 0.0f, 1.0f); }
 void sfxStopAll() {
     for (int i = 0; i < kVoices; ++i) sfxStop(i);
 }
+
+bool sfxUsesPcm(const int16_t* pcm) {
+    if (g_mixingPcm==pcm) return true;
+    for (const auto& voice:g_voices) if (voice.active && voice.pcm==pcm) return true;
+    return false;
+}
+
+bool sfxPlayingTag(int voice, uint32_t tag) { return voice>=0 && voice<kVoices && g_voices[voice].active && !g_voices[voice].stopping && g_voices[voice].tag==tag; }
 
 bool sfxPlaying(int voice) { return voice >= 0 && voice < kVoices && g_voices[voice].active; }
 

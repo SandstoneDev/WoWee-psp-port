@@ -43,7 +43,8 @@ uint32_t g_listFullM2 = 0, g_listFullNpc = 0, g_listFullUi = 0;  // frames a pas
 
 void* g_drawBuf = reinterpret_cast<void*>(kFb0);
 bool g_inited = false;
-uint32_t g_geWaitUs = 0;
+uint32_t g_geWaitUs = 0, g_frameWorkUs = 0;
+uint64_t g_lastPresentUs = 0;
 int g_frameInterval = 1;          // vblanks per flip (displaySetFrameInterval)
 unsigned g_lastFlipVcount = 0;
 
@@ -106,12 +107,26 @@ bool frameCleared() { return g_clearedThisFrame; }
 void frameBegin(uint32_t clearABGR) {
     sceGuStart(GU_DIRECT, g_list);
     prof::frameBegin();
+    // Render targets and depth state persist across GU lists. Portraits,
+    // post effects and system dialogs use other targets during the last frame.
+    // Establish the world target before clearing, independent of those passes.
+    sceGuDrawBufferList(GU_PSM_5551, g_drawBuf, kBufWidth);
+    sceGuDepthBuffer(reinterpret_cast<void*>(kZb), kBufWidth);
+    sceGuOffset(2048 - kScreenW / 2, 2048 - kScreenH / 2);
+    sceGuViewport(2048, 2048, kScreenW, kScreenH);
+    sceGuScissor(0, 0, kScreenW, kScreenH);
+    sceGuEnable(GU_SCISSOR_TEST);
+    sceGuDepthRange(65535, 0);
+    sceGuDepthFunc(GU_GEQUAL);
+    sceGuDepthMask(GU_FALSE);
+    sceGuPixelMask(0);
     sceGuClearColor(clearABGR);
     sceGuClearDepth(0);
-    // one-shot - the world's sky lays colour and depth itself.
+    // A sky/movie may replace colour, but previous-frame geometry must never
+    // survive in depth. Fast sky is a colour optimization, not a depth owner.
     g_clearedThisFrame = !g_skipNextClear;
     g_skipNextClear = false;
-    if (g_clearedThisFrame) sceGuClear(GU_COLOR_BUFFER_BIT | GU_DEPTH_BUFFER_BIT);
+    sceGuClear(GU_DEPTH_BUFFER_BIT | (g_clearedThisFrame ? GU_COLOR_BUFFER_BIT : 0));
 }
 
 void drawRect(int x, int y, int w, int h, uint32_t abgr) {
@@ -164,12 +179,15 @@ void frameEnd(OverlayFn overlay, void* user) {
         pspDebugScreenSetBase(reinterpret_cast<u32*>(kVramUncached + reinterpret_cast<uintptr_t>(g_drawBuf)));
         overlay(user);
     }
-    if (g_frameInterval <= 1) {
+    const uint64_t readyUs = sceKernelGetSystemTimeWide();
+    g_frameWorkUs = g_lastPresentUs ? static_cast<uint32_t>(readyUs-g_lastPresentUs) : 0;
+    const int interval=oskActive()?1:g_frameInterval;
+    if (interval <= 1) {
         sceDisplayWaitVblankStart();
     } else {
         // 30 fps cap: a frame that fits in one vblank is held for the next,
         // so the picture keeps an even pace instead of alternating 60/30.
-        const unsigned target = g_lastFlipVcount + static_cast<unsigned>(g_frameInterval);
+        const unsigned target = g_lastFlipVcount + static_cast<unsigned>(interval);
         do {
             sceDisplayWaitVblankStart();
         } while (static_cast<int>(sceDisplayGetVcount() - target) < 0);
@@ -177,7 +195,10 @@ void frameEnd(OverlayFn overlay, void* user) {
     g_lastFlipVcount = sceDisplayGetVcount();
     g_drawBuf = sceGuSwapBuffers();
     prof::frameEnd();
+    g_lastPresentUs = sceKernelGetSystemTimeWide();
 }
+
+uint32_t lastFrameWorkUs() { return g_frameWorkUs; }
 
 void displaySetFrameInterval(int vblanks) { g_frameInterval = vblanks < 1 ? 1 : (vblanks > 4 ? 4 : vblanks); }
 

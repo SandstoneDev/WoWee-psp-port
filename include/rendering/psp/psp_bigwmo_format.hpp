@@ -30,6 +30,7 @@
 #pragma once
 
 #include <cstdint>
+#include <cstring>
 
 namespace wowee::rendering::psp {
 
@@ -85,7 +86,7 @@ struct BigWmoHeader {
     uint32_t cellOffset, chunkOffset, chunkLodOffset, textureOffset;
     uint32_t doodadTotal;   // BigWmoDoodad records in all "dd_" records
     uint32_t chunkNearOffset;  // BigWmoBlobRef chunkNear[chunkCount] ("n_"), after chunkLod
-    uint32_t reserved;
+    uint32_t reserved;      // optional header-local offset: u32 landmark count + BigWmoDoodad[count], <=16
 };
 static_assert(sizeof(BigWmoHeader) == 136, "WBWO header is 136 bytes");
 
@@ -106,6 +107,12 @@ enum BigWmoGroupFlags : uint32_t {
     kWmoGroupAlwaysDraw = 0x10000u, // drawn whatever the portals say (frustum only)
     kWmoGroupAntiportal = 0x4000000u,  // never drawn (upstream skips it too)
 };
+
+// Portal/interior classification does not imply baked indoor lighting. Roofed
+// entrances and throne rooms can explicitly request the outdoor light profile.
+inline bool bigWmoGroupUsesZoneLight(uint32_t flags) {
+    return !(flags&kWmoGroupInterior) || (flags&kWmoGroupExteriorLit)!=0;
+}
 
 struct BigWmoGroup {
     uint32_t flags;         // MOGP flags
@@ -222,5 +229,21 @@ struct BigWmoDoodad {
     float sphere[4];        // local bounding sphere centre, radius
 };
 static_assert(sizeof(BigWmoDoodad) == 76, "WBWO doodad is 76 bytes");
+
+// Optional bounded header extension; old packs have reserved=0.
+inline const BigWmoDoodad* bigWmoLandmarks(const void* blob, uint32_t size, uint32_t& count) {
+    count=0;
+    if (!blob || size<sizeof(BigWmoHeader)) return nullptr;
+    const auto* h=static_cast<const BigWmoHeader*>(blob);
+    const uint32_t off=h->reserved;
+    if (off<sizeof(BigWmoHeader) || (off&3u) || uint64_t{off}+4u>size) return nullptr;
+    const auto* raw=static_cast<const uint8_t*>(blob)+off;
+    uint32_t n=0;
+    std::memcpy(&n,raw,4);
+    if (!n || n>16 || uint64_t{off}+4u+n*sizeof(BigWmoDoodad)>size) return nullptr;
+    count=n;
+    return reinterpret_cast<const BigWmoDoodad*>(raw+4);
+}
+
 
 }  // namespace wowee::rendering::psp

@@ -146,13 +146,14 @@ void WorldScreen::drawHudLayers(UiRenderer& ui, const FrameStats& stats) {
     PROF_SCOPE("hud");
     // Under the full-screen world map the HUD is hidden - the original hides UIParent for a
     // full-screen panel (BlackoutWorld covered it; now the dimmed world shows at the sides, ui_world_map.cpp).
-    const bool hud = !fullMapOpen();
+    const bool hud=!fullMapOpen() && !(pspLayoutActive() && uiMode_ && (windowOpen(kWinBags)||windowOpen(kWinBank)));
     if (hud) {
         PROF_GE_PASS("hud");
         ui.beginFrame();
         drawCombatUnder(ui);  // veil, NPC names, player plates, target marker, combat text
         drawLootHud(ui);       // loot - sparkle over lootable corpses
         drawQuestMarkers(ui);  // npc - ! / ? over questgivers
+        drawUnitHints(ui);     // PSP: interaction / selection buttons above their actual candidates
         drawGameObjectHud(ui);  // the ↑ glyph over the hovered object, quest sparkles
         // XP bar + MainMenuBar art (under the frames, tracker, chat); hidden under
         // VehicleMenuBar (MainMenuBar_ToVehicleArt)
@@ -180,7 +181,7 @@ void WorldScreen::drawHudLayers(UiRenderer& ui, const FrameStats& stats) {
         PROF_GE_PASS("chat");
         ui.beginFrame();
         // UIParent_ManageFramePositions' ChatFrame1 "pet = 35" - the chat box goes up with the pet bar.
-        const float lift = std::max(petChatLift(), classBarChatLift());  // the class bars too
+        const float lift=std::max(petChatLift(),classBarChatLift());  // the class bars too
         if (lift > 0.0f) {
             ui.setOffset(0.0f, -lift);
             winFocus_.setOffset(0.0f, -lift);
@@ -202,11 +203,21 @@ void WorldScreen::drawHudLayers(UiRenderer& ui, const FrameStats& stats) {
         drawWindows(ui);  // stack (Debug on top), bar, cursor
         ui.endFrame();
     }
+    if (session_.logoutPending()) { ui.beginFrame(); drawLogoutCountdown(ui); ui.endFrame(); }
     if (settings_.isOpen()) {
         PROF_GE_PASS("settings");
         PROF_SCOPE("settings.draw");
         ui.beginFrame();
         settings_.draw(ui, kit_, stats);
+        ui.endFrame();
+    }
+    // Affordances belong to the focused control; bag management alone has a
+    // shared strip. Draw this layer after windows/tooltips so hints stay visible.
+    if(uiMode_ && !settings_.isOpen() && !session_.logoutPending()) {
+        ui.beginFrame();
+        drawWindowAffordances(ui);
+        drawBagControlHints(ui);
+        if(!barAssign_.active())kit_.cursor(ui,winFocus_);
         ui.endFrame();
     }
 }

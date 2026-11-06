@@ -109,6 +109,7 @@ private:
     std::string selectedName_;
 
     // CharacterSelect.selectedIndex (0-based here, -1 none), the first row shown, the model.
+    UiDpadRepeat listRepeat_;
     int selected_ = -1;
     int scroll_ = 0;
     bool selectLast_ = false;  // SELECT_LAST_CHARACTER after a create

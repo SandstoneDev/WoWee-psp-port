@@ -92,7 +92,7 @@ void drawBand(UiRenderer& ui, const UiKit& kit, const pp::AutotestView& v) {
     }
     ui.text(small, cx, y, counter.c_str(), kColGrey, Align::Center);
     y += sh + 2.0f;
-    if (hint) ui.textShadow(small, cx, y, hint, v.paused ? kColRed : kColGold, Align::Center);
+    if (hint) kit.controlHint(ui,small,cx,y,hint,v.paused ? kColRed : kColGold,Align::Center);
 }
 
 void drawSummary(UiRenderer& ui, const UiKit& kit, const pp::AutotestView& v) {

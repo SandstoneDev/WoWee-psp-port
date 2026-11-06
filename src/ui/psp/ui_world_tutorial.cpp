@@ -35,6 +35,7 @@
 #include "platform/psp/psp_strings.hpp"
 #include "platform/psp/psp_tutorial_db.hpp"
 #include "ui/psp/ui_tutorial_controls.hpp"
+#include <pspctrl.h>
 
 #include <algorithm>
 #include <cmath>
@@ -156,10 +157,10 @@ static constexpr float kGlyphGap = 3.0f;
 // Word wrap with inline glyphs (PSP: the controls lines).
 static void layoutTutorialText(const UiKit& kit, const Font& f, const std::string& text, float width, float glyphPx,
                                std::vector<std::vector<TutItem>>& lines) {
-    // L / R / SELECT / START are words in the line (no gap, as the text around them).
+    // Measure actual button art; text names are only a missing-art fallback.
     auto glyphW = [&](int g) {
-        const char* label = UiKit::padLabel(static_cast<PadGlyph>(g));
-        return label ? static_cast<float>(f.measure(label)) : glyphPx + kGlyphGap;
+        const char* label = kit.glyphLabel(static_cast<PadGlyph>(g));
+        return label ? static_cast<float>(f.measure(label)) : kit.glyphWidth(static_cast<PadGlyph>(g),glyphPx)+kGlyphGap;
     };
     lines.clear();
     lines.emplace_back();
@@ -304,7 +305,8 @@ void WorldScreen::tutorialNew(uint32_t id) {
     if (!t.frameShown) {
         t.alertShown = true;
         // not InCombatLockdown(); PSP: wowee.cfg tutorialauto=0 leaves it to the alert button
-        if (t.autoOpen && !session_.inCombat()) tutorialAlertClick();
+        if (t.autoOpen && !session_.inCombat() && !uiMode_ && windows_.empty() &&
+            !settings_.isOpen() && !session_.logoutPending()) tutorialAlertClick();
     }
 }
 
@@ -318,6 +320,17 @@ void WorldScreen::tutorialHidden(bool showNext) {
     }
     const uint32_t level = session_.selfField(game::fieldIndex(game::UF::UNIT_FIELD_LEVEL));
     if (t.queue.empty() && level > 5) t.alertShown = false;
+}
+
+// Auto-opened tips may be visible while gameplay owns the pad. Circle must
+// dismiss them even without SELECT or a cursor on the tiny close button.
+bool WorldScreen::tutorialPad(const pp::PadState& pad) {
+    if (!(pad.pressed & PSP_CTRL_CIRCLE) || !tut_ || !tut_->frameShown ||
+        windows_.empty() || windows_.back()!=kWinTutorial) return false;
+    closeWindow(kWinTutorial);
+    playSoundByName("igMainMenuClose");
+    tutorialHidden(false); // remaining tips stay behind the alert, not another instant popup
+    return true;
 }
 
 void WorldScreen::updateTutorial(float dtSec) {
@@ -342,7 +355,7 @@ void WorldScreen::updateTutorial(float dtSec) {
     // Circle closed it through the window stack: TutorialFrame_Hide.
     if (t.frameShown && !windowOpen(kWinTutorial)) {
         playSoundByName("igMainMenuClose");
-        tutorialHidden(true);
+        tutorialHidden(false);
     }
     // Art on demand, here (the GE is idle between frames), never in draw.
     const bool visible = t.frameShown || t.alertShown;
@@ -396,7 +409,7 @@ bool WorldScreen::tutorialWindowAction(uint32_t act) {
         case kIdTutClose:  // TutorialFrame_Hide
             playSoundByName("igMainMenuClose");
             closeWindow(kWinTutorial);
-            tutorialHidden(true);
+            tutorialHidden(false);
             break;
         case kIdTutText: {  // PSP: a page further, back to the top after the end
             const int visible = std::max(1, static_cast<int>(t.text.h / t.lineH));
@@ -543,7 +556,7 @@ bool WorldScreen::drawTutorialWindow(UiRenderer& ui, uint8_t w) {
         for (const TutItem& it : t.lines[i]) {
             const float lx = t.text.x + it.x;
             if (it.glyph < 0) ui.text(f, lx, ly, it.text.c_str(), kColWhite);
-            else if (const char* label = UiKit::padLabel(static_cast<PadGlyph>(it.glyph)))
+            else if (const char* label = kit_.glyphLabel(static_cast<PadGlyph>(it.glyph)))
                 ui.text(f, lx, ly, label, kColGold);  // the button's name, on the text's baseline
             else if (!kit_.glyphFill(ui, static_cast<PadGlyph>(it.glyph),
                                      Rect{lx + kGlyphGap * 0.5f, ly + (f.lineHeight() - t.glyphPx) * 0.5f,

@@ -330,14 +330,20 @@ void CharacterScreen::update(const pp::PadState& padIn, float dtSec) {
         const uint32_t f = focus_.focused();
         if (f >= kIdChar0 && f < kIdChar0 + chars.size()) {
             const int i = static_cast<int>(f - kIdChar0);
-            if ((pad.pressed & PSP_CTRL_DOWN) && i + 1 < static_cast<int>(chars.size())) {
-                focusCharacter(i + 1);
-                pad.pressed &= ~static_cast<uint32_t>(PSP_CTRL_DOWN);
-            } else if ((pad.pressed & PSP_CTRL_UP) && i > 0) {
-                focusCharacter(i - 1);
-                pad.pressed &= ~static_cast<uint32_t>(PSP_CTRL_UP);
-            }
+            constexpr uint32_t vertical=PSP_CTRL_UP | PSP_CTRL_DOWN;
+            uint32_t held=pad.held & vertical;
+            if (held==vertical) held=0;
+            const uint32_t nav=listRepeat_.step(held,pad.pressed & held,dtSec);
+            // This list owns vertical repeat. Never pass the same held press to FocusRing.
+            pad.held &= ~vertical;
+            pad.pressed &= ~vertical;
+            pad.released &= ~vertical;
+            if ((nav & PSP_CTRL_DOWN) && i + 1 < static_cast<int>(chars.size())) focusCharacter(i+1);
+            else if ((nav & PSP_CTRL_UP) && i > 0) focusCharacter(i-1);
+            else { pad.held |= nav; pad.pressed |= nav; } // at the ends, enter other controls once
+
         }
+        else listRepeat_.step(0,0,dtSec);
         // L / R turn the model (CharacterSelectRotateLeft / Right held).
         if (pad.held & PSP_CTRL_LTRIGGER) model_.rotate(-2.0f * dtSec);
         if (pad.held & PSP_CTRL_RTRIGGER) model_.rotate(2.0f * dtSec);

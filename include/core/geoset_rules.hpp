@@ -46,13 +46,13 @@ constexpr uint16_t kGeosetBareFeet         = 2002;  // Group 20: bare feet
 /// one it has. Stock models carry neither and are unaffected.
 constexpr uint16_t kGeosetBareFeetAlt      = 2001;
 
-/// Group 17: the eye-glow overlay - the mesh that makes a night elf's eyes
+/// Group 17: the eye-glow overlay - the mesh that makes a character's eyes
 /// shine rather than sit there pale.
 ///
 /// Off for everyone else, which is why the renderer strips group 17 from any
 /// model drawn without a geoset filter: an NPC given the whole model drew
 /// glowing eyes whatever it was.
-constexpr uint16_t kGeosetEyeGlow          = 1701;
+constexpr uint16_t kGeosetEyeGlow          = 1702;
 
 
 /// The body part a geoset id belongs to: 501 and 505 are both group 5, boots.
@@ -127,18 +127,10 @@ constexpr uint32_t appearanceKey(uint8_t race, uint8_t sex, uint8_t variation) {
            static_cast<uint32_t>(variation);
 }
 
-/// Whether a race's eyes glow.
-///
-/// Night elves', and only theirs among the playable races - it is not an option
-/// they choose, both sexes have it and always have. The NPC path had this rule
-/// and the player path did not, so a night elf player looked out of pale eyes
-/// while every night elf standing next to them glowed.
-///
-/// Death knights glow too, whatever their race, and are not handled here: that
-/// depends on the class rather than the model and the paths that build these
-/// sets do not all know it.
+/// The 3.3.5a racial glow is group 17 variant 2 (1702). Variant 3
+/// is the separate death-knight overlay and must not be enabled by race.
 inline bool raceHasGlowingEyes(uint8_t raceId) {
-    return raceId == 4;  // NightElf
+    return raceId == 4 || raceId == 5 || raceId == 10 || raceId == 11;
 }
 
 /// The geosets a character shows with nothing equipped, before any armour is

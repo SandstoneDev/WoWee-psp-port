@@ -1,6 +1,8 @@
 #include "rendering/psp/psp_terrain.hpp"
 #include "platform/psp/psp_prof.hpp"
 #include "rendering/psp/psp_cpu_fast.hpp"
+#include "rendering/psp/psp_terrain_holes.hpp"
+#include "platform/psp/psp_fs.hpp"
 
 #include "platform/psp/psp_bigheap.hpp"  // pp::heapRoomFor
 #include "platform/psp/psp_config.hpp"   // The terrain pool's keys
@@ -109,6 +111,7 @@ TerrainRenderer::TerrainRenderer() {
         for (int r = 0; r < quads; ++r)
             run([&](int c) { return (r * step) * kGrid + c * step; },
                 [&](int c) { return ((r + 1) * step) * kGrid + c * step; });
+        surfaceCounts_[l] = static_cast<int>(idx.size());
         for (int e = 0; e < 4; ++e)  // skirt walls at this LOD's edge spacing
             run([&](int i) { return edgeVertex(e, i * step); }, [&](int i) { return skirtVertex(e, i * step); });
         lodCounts_[l] = static_cast<int>(idx.size());
@@ -122,6 +125,18 @@ TerrainRenderer::TerrainRenderer() {
 TerrainRenderer::~TerrainRenderer() {
     clear();
     for (auto* p : lodIndices_) std::free(p);
+}
+
+void TerrainRenderer::loadHoleOverrides(const char* mapName) {
+    holePak_.close();
+    char relative[128], path[256];
+    std::snprintf(relative, sizeof(relative), "data/terrain_holes_%s.pak", mapName);
+    pp::fsPath(path, sizeof(path), relative);
+    holePak_.setRare(true);
+    const bool loaded = holePak_.open(path);
+    PSP_LOGI(pp::tag::Gfx, "terrain_hole_overrides map=%s loaded=%d tiles=%u",
+             mapName, loaded ? 1 : 0, loaded ? static_cast<unsigned>(holePak_.count()) : 0u);
+    if (loaded) holePak_.releaseFd();
 }
 
 void TerrainRenderer::loadDetail(pp::Pak& pak, uint16_t id) {
@@ -143,6 +158,7 @@ void TerrainRenderer::loadDetail(pp::Pak& pak, uint16_t id) {
 }
 
 void TerrainRenderer::clear() {
+    holePak_.close();
     for (auto& d : details_)
         if (d.block) pp::textureRelease(d);
     details_.clear();
@@ -161,15 +177,44 @@ void TerrainRenderer::clear() {
 // blocks or null (the window: textures come later per chunk row); detailTable: 256 u16 or null.
 bool TerrainRenderer::buildTile(Tile& tile, const uint8_t* records, const TerrainLayout& layout, const uint8_t* texData,
                                 const uint8_t* detailTable, pp::Pak& pak) {
+    uint16_t holeOverrides[256] = {};
+    char holeName[32];
+    std::snprintf(holeName, sizeof(holeName), "t_%d_%d", tile.tileX, tile.tileY);
+    const auto* holeEntry = holePak_.isOpen() ? holePak_.find(holeName) : nullptr;
+    const bool overrideHoles = holeEntry && holeEntry->size == sizeof(holeOverrides) &&
+                              holePak_.readPart(holeEntry, 0, holeOverrides, sizeof(holeOverrides));
+    if (holePak_.isOpen()) holePak_.releaseFd();
+    if (holeEntry && !overrideHoles) {
+        lastNoMem_ = true;  // an installed override must be retried, never filled with phantom ground
+        return false;
+    }
     if (!tile.vertexBlock)  // A pool tile has its vertex block in its slot already
         tile.vertexBlock = static_cast<TerrainVertex*>(memalign(16, 256 * kChunkVerts * sizeof(TerrainVertex)));
     if (!tile.vertexBlock) {
         lastNoMem_ = true;
         return false;
     }
+    uint32_t holeChunks = 0;
     for (int i = 0; i < 256; ++i) {
         const uint8_t* c = records + i * kChunkBytes;
         Chunk& ch = tile.chunks[i];
+        ch.holes = overrideHoles ? holeOverrides[i] : rd<uint16_t>(c + 12);
+        if (ch.holes) {
+            ++holeChunks;
+            const auto mesh = buildTerrainHoleIndices(ch.holes);
+            ch.holeCount = mesh.count;
+            ch.holeTriangles = mesh.triangles;
+            ch.surfaceCount = mesh.surfaceCount;
+            ch.surfaceTriangles = mesh.surfaceTriangles;
+            if (mesh.count) {
+                const uint32_t bytes = mesh.count * sizeof(uint16_t);
+                ch.holeIndices = static_cast<uint16_t*>(memalign(16, bytes));
+                if (!ch.holeIndices) { lastNoMem_ = true; return false; }
+                std::memcpy(ch.holeIndices, mesh.indices.data(), bytes);
+                sceKernelDcacheWritebackRange(ch.holeIndices, bytes);
+                tile.holeIndexBytes += bytes;
+            }
+        }
         ch.baseX = rd<float>(c + 0);
         ch.baseY = rd<float>(c + 4);
         ch.baseZ = rd<float>(c + 8);
@@ -181,7 +226,7 @@ bool TerrainRenderer::buildTile(Tile& tile, const uint8_t* records, const Terrai
         ch.detail = 0xFFFF;
         if (detailTable) {
             ch.detail = rd<uint16_t>(detailTable + i * 2u);
-            loadDetail(pak, ch.detail);
+            if (ch.holes != 0xFFFFu) loadDetail(pak, ch.detail);
         }
         int16_t hmin = 32767, hmax = -32768;
         for (int r = 0; r < kGrid; ++r) {
@@ -212,6 +257,9 @@ bool TerrainRenderer::buildTile(Tile& tile, const uint8_t* records, const Terrai
     }
     // Written once here, read by the GE from now on.
     sceKernelDcacheWritebackRange(tile.vertexBlock, 256 * kChunkVerts * sizeof(TerrainVertex));
+    if (holeChunks)
+        PSP_LOGI(pp::tag::Gfx, "terrain_holes tile=%d_%d chunks=%u overlay=%d",
+                 tile.tileX, tile.tileY, static_cast<unsigned>(holeChunks), overrideHoles ? 1 : 0);
     return true;
 }
 
@@ -252,7 +300,7 @@ bool TerrainRenderer::loadTile(pp::Pak& pak, int tileX, int tileY) {
         return false;
     }
     tile->blob = blob;  // textures stay here (pak.load wrote the D-cache back)
-    tile->bytes = e->size + 256u * kChunkVerts * sizeof(TerrainVertex);
+    tile->bytes = e->size + 256u * kChunkVerts * sizeof(TerrainVertex) + tile->holeIndexBytes;
     tiles_.push_back(tile);
     return true;
 }
@@ -331,7 +379,7 @@ bool TerrainRenderer::loadTileWindowed(pp::Pak& pak, const pp::PakEntry* e, int 
     tile->fileOffset = e->offset;
     tile->texBase = layout.texBase;
     tile->texBytes = layout.texBytes;
-    tile->bytes = 256u * kChunkVerts * sizeof(TerrainVertex);
+    tile->bytes = 256u * kChunkVerts * sizeof(TerrainVertex) + tile->holeIndexBytes;
     tiles_.push_back(tile);
     return true;
 }
@@ -467,6 +515,7 @@ TerrainRenderer::Tile* TerrainRenderer::newTile() {
 
 void TerrainRenderer::deleteTile(Tile* t) {
     if (!t) return;
+    for (auto& chunk : t->chunks) std::free(chunk.holeIndices);
     if (g_pool.ready() && g_pool.contains(t)) {
         t->~Tile();
         g_pool.freeTile(t);
@@ -533,7 +582,7 @@ uint32_t TerrainRenderer::texInstall(int tileX, int tileY, uint16_t first, uint1
     for (uint32_t k = 0; k < count; ++k) {
         Chunk& ch = t->chunks[first + k];
         if (ch.texState == 2) continue;  // a duplicate read (the tile went and came back meanwhile)
-        if (texWindowWant(ch.cx, ch.cy, ch.rad, texPx_, texPy_, texRule) < 0) {
+        if (ch.holes == 0xFFFFu || texWindowWant(ch.cx, ch.cy, ch.rad, texPx_, texPy_, texRule) < 0) {
             ch.texState = 0;  // the player went away while it was read
             continue;
         }
@@ -579,7 +628,7 @@ bool TerrainRenderer::texStep(float px, float py, uint32_t maxRuns, std::vector<
         bool any = false;
         for (int i = 0; i < 256; ++i) {
             Chunk& ch = t->chunks[i];
-            const int w = texWindowWant(ch.cx, ch.cy, ch.rad, px, py, texRule);
+            const int w = ch.holes == 0xFFFFu ? -1 : texWindowWant(ch.cx, ch.cy, ch.rad, px, py, texRule);
             if (w < 0 && ch.texState == 2) texFree(*t, ch);
             need[i] = w > 0 && ch.texState == 0 ? 1 : 0;
             any = any || need[i];
@@ -791,10 +840,12 @@ bool TerrainRenderer::heightAt(float x, float y, float& z) const {
         const Chunk& ch = t->chunks[i];
         const int r = fr >= 8 ? 7 : static_cast<int>(fr);
         const int c = fc >= 8 ? 7 : static_cast<int>(fc);
+        if (terrainQuadIsHole(ch.holes, r, c)) return false;
         const float ar = fr - r, ac = fc - c;
         auto hz = [&](int rr, int cc) { return ch.verts[rr * kGrid + cc].z / 32.0f; };
-        const float h = (hz(r, c) * (1 - ac) + hz(r, c + 1) * ac) * (1 - ar) +
-                        (hz(r + 1, c) * (1 - ac) + hz(r + 1, c + 1) * ac) * ar;
+        const float a = hz(r, c), b = hz(r + 1, c), d = hz(r, c + 1), e = hz(r + 1, c + 1);
+        const float h = ar + ac <= 1.0f ? a + (b - a) * ar + (d - a) * ac
+                                      : e + (d - e) * (1 - ar) + (b - e) * (1 - ac);
         z = ch.baseZ + h;
         return true;
     }
@@ -875,6 +926,7 @@ void TerrainRenderer::draw(const TerrainCamera& cam, uint32_t fogColorABGR) {
         const float u = t->unit;
         const float half = u * 4.0f;
         for (const Chunk& ch : t->chunks) {
+            if (ch.holes == 0xFFFFu) { ++stats_.chunksCulled; continue; }
             const glm::vec3 center(ch.baseX - half - cam.pos.x, ch.baseY - half - cam.pos.y,
                                    (ch.minZ + ch.maxZ) * 0.5f - cam.pos.z);
             const float radius = half * 1.4143f + (ch.maxZ - ch.minZ) * 0.5f;
@@ -886,7 +938,7 @@ void TerrainRenderer::draw(const TerrainCamera& cam, uint32_t fogColorABGR) {
             // Hardware: ~2.3k triangles cost ~70 us of GE wait at 60 fps,
             // so full detail reaches much further; the old 70/150/280 made the
             // relief visibly change as the camera zoomed out.
-            const int lod = dist < 200.0f ? 0 : dist < 340.0f ? 1 : 2;
+            const int lod = dist < 200.0f*performanceLod ? 0 : dist < 340.0f*performanceLod ? 1 : 2;
 
             // Model matrix sent directly (no gum stack work per chunk):
             // s16 positions arrive as value/32768, grid step 1024 -> unit yd,
@@ -918,14 +970,21 @@ void TerrainRenderer::draw(const TerrainCamera& cam, uint32_t fogColorABGR) {
                 texOn = false;
             }
             prof::count(prof::kDraws, 1);
-            prof::count(prof::kVertices, static_cast<uint32_t>(lodCounts_[lod]));
-            prof::count(prof::kTriangles, static_cast<uint32_t>(lodTriangles_[lod]));
+            const bool skirts = terrainNeedsSkirts(dist, radius, performanceLod);
+            const int indexCount = ch.holes ? (skirts ? ch.holeCount : ch.surfaceCount) :
+                                             (skirts ? lodCounts_[lod] : surfaceCounts_[lod]);
+            const uint16_t* indices = ch.holes ? ch.holeIndices : lodIndices_[lod];
+            const int quads = 8 >> lod;
+            const int triangles = ch.holes ? (skirts ? ch.holeTriangles : ch.surfaceTriangles) :
+                                            (skirts ? lodTriangles_[lod] : quads * quads * 2);
+            prof::count(prof::kVertices, static_cast<uint32_t>(indexCount));
+            prof::count(prof::kTriangles, static_cast<uint32_t>(triangles));
             sceGuDrawArray(GU_TRIANGLE_STRIP,
                            GU_INDEX_16BIT | GU_TEXTURE_8BIT | GU_COLOR_5650 | GU_VERTEX_16BIT | GU_TRANSFORM_3D,
-                           lodCounts_[lod], lodIndices_[lod], ch.verts);
+                           indexCount, indices, ch.verts);
             ++stats_.chunksDrawn;
-            stats_.triangles += static_cast<uint32_t>(lodTriangles_[lod]);
-            if (detail && lod == 0 && ch.detail != 0xFFFF && dist - radius < detailDistance) near_.push_back(&ch);
+            stats_.triangles += static_cast<uint32_t>(triangles);
+            if (detail && lod == 0 && ch.detail != 0xFFFF && dist - radius < detailDistance*performanceLod) near_.push_back(&ch);
         }
     }
     lightEnd();  // Lighting
@@ -964,10 +1023,13 @@ void TerrainRenderer::draw(const TerrainCamera& cam, uint32_t fogColorABGR) {
             m.w = {ch->baseX - cam.pos.x, ch->baseY - cam.pos.y, ch->baseZ - cam.pos.z, 1.0f};
             sceGuSetMatrix(GU_MODEL, &m);
             prof::count(prof::kDraws, 1);
-            prof::count(prof::kVertices, static_cast<uint32_t>(lodCounts_[0]));
+            // Detail belongs to the ground surface; seam walls need no overlay.
+            const int indexCount = ch->holes ? ch->surfaceCount : surfaceCounts_[0];
+            const uint16_t* indices = ch->holes ? ch->holeIndices : lodIndices_[0];
+            prof::count(prof::kVertices, static_cast<uint32_t>(indexCount));
             sceGuDrawArray(GU_TRIANGLE_STRIP,
                            GU_INDEX_16BIT | GU_TEXTURE_8BIT | GU_COLOR_5650 | GU_VERTEX_16BIT | GU_TRANSFORM_3D,
-                           lodCounts_[0], lodIndices_[0], ch->verts);
+                           indexCount, indices, ch->verts);
         }
         stats_.detailChunks = static_cast<uint32_t>(near_.size());
         sceGuDepthMask(GU_FALSE);

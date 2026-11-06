@@ -29,6 +29,7 @@
 #include "game/update_field_table.hpp"
 #include "platform/psp/psp_fs.hpp"
 #include "platform/psp/psp_log.hpp"
+#include "platform/psp/psp_locale.hpp"
 #include "platform/psp/psp_pak.hpp"
 #include "platform/psp/psp_prof.hpp"
 #include "platform/psp/psp_strings.hpp"
@@ -288,7 +289,7 @@ void WorldScreen::loadNpcArt(bool frame) {
 // UIPanelButtonTemplate: the button art in three slices (ends 6 px), the
 // highlight added over it, gold text (grey when disabled).
 void WorldScreen::drawPanelButton(UiRenderer& ui, uint32_t id, const Rect& r, const char* label, bool enabled,
-                                  bool top) {
+                                  bool top,float measuredWidth) {
     const bool focused = enabled && top && winFocus_.addStop(id, r);
     const bool pressed = focused && winFocus_.isPressed(id);
     if (focused && pressed) npc_.guard = false;  // a press seen on the window
@@ -306,8 +307,10 @@ void WorldScreen::drawPanelButton(UiRenderer& ui, uint32_t id, const Rect& r, co
         return;
     }
     const Font& fs = kit_.font(kFontSmall);
-    ui.textShadow(fs, r.x + r.w * 0.5f + (pressed ? 1.0f : 0.0f), r.y + (r.h - fs.lineHeight()) * 0.5f, label,
-                  enabled ? kBtnText : kBtnDis, Align::Center);
+    const float x=r.x+r.w*.5f+(pressed?1.f:0.f);
+    ui.textShadow(fs, measuredWidth>=0 ? x-measuredWidth/(2.f*ui.scale()) : x,
+                  r.y+(r.h-fs.lineHeight())*.5f,label,enabled?kBtnText:kBtnDis,
+                  measuredWidth>=0 ? Align::Left : Align::Center);
 }
 
 bool WorldScreen::drawNpcFrame(UiRenderer& ui, uint8_t w) {
@@ -321,28 +324,6 @@ bool WorldScreen::drawNpcFrame(UiRenderer& ui, uint8_t w) {
     const float lh = static_cast<float>(fs.lineHeight() > 0 ? fs.lineHeight() : 12);
     const uint32_t frameNo = spellFrame_;
 
-    // Text tokens ($N, $C, $R, $G...) as upstream resolveTextTokens.
-    game::TextSubject subject;
-    if (const game::Character* me = session_.activeCharacter()) {
-        subject.name = me->name;
-        // The ruRU names of the player's gender (text.pak), upstream's English without it.
-        const RuText& rt = ruText();
-        const int fem = me->gender == game::Gender::FEMALE ? 1 : 0;
-        const auto ci = static_cast<size_t>(me->characterClass), ri = static_cast<size_t>(me->race);
-        subject.className = ci < 11 && !rt.cls[ci][0].empty()
-                                ? (fem && !rt.cls[ci][1].empty() ? rt.cls[ci][1] : rt.cls[ci][0])
-                                : game::getClassName(me->characterClass);
-        subject.raceName = ri < 12 && !rt.race[ri][0].empty()
-                               ? (fem && !rt.race[ri][1].empty() ? rt.race[ri][1] : rt.race[ri][0])
-                               : game::getRaceName(me->race);
-        subject.gender = me->gender;
-    }
-    auto tokens = [&](const std::string& s) { return declineMarkup(game::resolveTextTokens(s, subject)); };
-    auto itemName = [&](uint32_t id) -> std::string {
-        const pp::NpcItemInfo* info = session_.npcItemInfo(id);
-        return info && !info->name.empty() ? info->name : std::string();
-    };
-
     // --- The frame -------------------------------------------------------------------
     uint64_t npcGuid = 0;
     if (w == kWinGossip) npcGuid = session_.getCurrentGossip().npcGuid;
@@ -354,19 +335,6 @@ bool WorldScreen::drawNpcFrame(UiRenderer& ui, uint8_t w) {
     if (const pp::Texture* face = portraitOf(npcGuid)) ui.imageCircle(*face, FR(7, 6, 60, 60));
     else ui.fillCircle(FR(9, 8, 56, 56), 0xFF101010u);
     ui.image(npcArt_.frame, Rect{kFx, kFy, 384 * kS, 448 * kS});
-    {
-        UnitView u;
-        const std::string name = unitView(npcGuid, u) && !u.name.empty() ? u.name : std::string();
-        const Rect nr = FR(86, 20, 238, 20);  // right of the portrait circle
-        // A long name: the small font, then a marquee (the PSP font is wider than GameFontHighlight).
-        const Font& nf = static_cast<float>(fn.measure(name.c_str())) <= nr.w ? fn : fs;
-        if (static_cast<float>(nf.measure(name.c_str())) <= nr.w) {
-            ui.textShadow(nf, nr.x + nr.w * 0.5f, nr.y + (nr.h - nf.lineHeight()) * 0.5f, name.c_str(), 0xFFFFFFFFu,
-                          Align::Center);
-        } else {
-            ui.textMarquee(fs, nr, name.c_str(), 0xFFFFFFFFu);
-        }
-    }
     {
         const Rect cr = Rect{kFx + (384 - 42) * kS - 10, kFy + 31 * kS - 10, 20, 20};
         const bool f = top && winFocus_.addStop(kIdNpcClose, cr);
@@ -380,172 +348,219 @@ bool WorldScreen::drawNpcFrame(UiRenderer& ui, uint8_t w) {
     // --- The scroll frame's content ------------------------------------------------
     const Rect view = FR(23, 81, 300, 334);
     const float tx = view.x + 10 * kS, tw = 270 * kS;
-    struct Line {
-        enum Kind : uint8_t { Text, Head, Row, Item, Money, Gap } kind;
-        std::string s;
-        uint32_t col = 0;
-        uint32_t id = 0;       // focus id (rows, choices)
-        uint8_t icon = 0;      // row icon
-        uint32_t value = 0;    // money / count
-        uint32_t display = 0;  // item icon
-        bool selected = false;
-        float h = 0;
-        uint32_t itemId = 0;  // the item (its GameTooltip, L + Triangle)
-    };
-    std::vector<Line> lines;
-    lines.reserve(64);
-    auto addText = [&](const std::string& text, uint32_t col, bool head) {
-        const Font& f = head ? fn : fs;
-        for (const std::string& l : wrapText(f, text, tw)) {
-            Line ln{head ? Line::Head : Line::Text, l, col};
-            ln.h = static_cast<float>(f.lineHeight());
-            lines.push_back(std::move(ln));
+    auto& layout=npcLayouts_[w==kWinGossip?0:w==kWinQuestDetails?1:w==kWinQuestProgress?2:3];
+    NpcLayoutKey key;
+    key.character=session_.playerGuid();key.npc=npcGuid;key.dialog=session_.npcDialogVersion();
+    key.fonts=kit_.fontRevision();key.npcNames=session_.creatureInfoVersion();
+    key.locale=pp::localeActive();key.scale=ui.scale();
+    if(const auto* me=session_.activeCharacter()) {
+        key.playerName=me->name;key.race=static_cast<uint8_t>(me->race);
+        key.cls=static_cast<uint8_t>(me->characterClass);key.gender=static_cast<uint8_t>(me->gender);
+    }
+    using Line=NpcFrameLayout::Line;
+    auto& lines=layout.lines;
+    if(!layout.valid || !(layout.key==key)) {
+        PROF_SCOPE("npc.layout");
+        layout.valid=false;lines.clear();lines.reserve(64);
+        // Text tokens ($N, $C, $R, $G...) as upstream resolveTextTokens.
+        game::TextSubject subject;
+        if (const game::Character* me = session_.activeCharacter()) {
+            subject.name = me->name;
+            // The ruRU names of the player's gender (text.pak), upstream's English without it.
+            const RuText& rt = ruText();
+            const int fem = me->gender == game::Gender::FEMALE ? 1 : 0;
+            const auto ci = static_cast<size_t>(me->characterClass), ri = static_cast<size_t>(me->race);
+            subject.className = ci < 11 && !rt.cls[ci][0].empty()
+                                    ? (fem && !rt.cls[ci][1].empty() ? rt.cls[ci][1] : rt.cls[ci][0])
+                                    : game::getClassName(me->characterClass);
+            subject.raceName = ri < 12 && !rt.race[ri][0].empty()
+                                   ? (fem && !rt.race[ri][1].empty() ? rt.race[ri][1] : rt.race[ri][0])
+                                   : game::getRaceName(me->race);
+            subject.gender = me->gender;
         }
-    };
-    auto gap = [&](float h) {
-        Line ln{Line::Gap, std::string(), 0};
-        ln.h = h;
-        lines.push_back(std::move(ln));
-    };
-    auto addMoney = [&](uint32_t copper, const char* label) {
-        if (label) addText(label, kBlack, false);
-        Line ln{Line::Money, std::string(), 0};
-        ln.value = copper;
-        ln.h = lh + 2;
-        lines.push_back(std::move(ln));
-    };
-    // Item buttons two to a line (QuestInfoItem 1..10: left, right).
-    // every item button takes the cursor (QuestInfoItem OnEnter: GameTooltip:SetQuestItem); the
-    // ones that are not a reward choice get the ids 0x6380.. (WorldScreen::dressUpAction: Cross does nothing).
-    uint32_t dressUpItemId = 0x6380;
-    auto addItems = [&](const std::vector<game::QuestRewardItem>& items, bool choose) {
-        for (size_t i = 0; i < items.size(); ++i) {
-            Line ln{Line::Item, itemName(items[i].itemId), 0};
-            const pp::NpcItemInfo* info = session_.npcItemInfo(items[i].itemId);
-            ln.col = questQuality(info ? info->quality : 1);
-            ln.value = items[i].count;
-            ln.display = items[i].displayInfoId;
-            ln.itemId = items[i].itemId;
-            ln.id = choose ? kIdChoice0 + static_cast<uint32_t>(i) : (dressUpItemId < 0x63A0 ? dressUpItemId++ : 0);
-            ln.selected = choose && npc_.rewardChoice == static_cast<int>(i);
-            ln.h = (i % 2 == 1 || i + 1 == items.size()) ? 28.0f : 0.0f;  // the line advances after the right cell
-            lines.push_back(std::move(ln));
-        }
-    };
-    // QuestInfo_ShowRewards.
-    auto addRewards = [&](uint32_t money, uint32_t xp, const std::vector<game::QuestRewardItem>& fixed,
-                          const std::vector<game::QuestRewardItem>& choices, bool chooseMode) {
-        if (money == 0 && xp == 0 && fixed.empty() && choices.empty()) return;
-        gap(8);
-        addText(CLIENT_STR(QUEST_REWARDS), kBlack, true);
-        if (!choices.empty()) {
-            addText(chooseMode ? CLIENT_STR(REWARD_CHOOSE) : CLIENT_STR(REWARD_CHOICES), kParch, false);
-            gap(2);
-            addItems(choices, chooseMode);
-        }
-        if (money || xp || !fixed.empty()) {
-            gap(4);
-            addText(choices.empty() ? CLIENT_STR(REWARD_ITEMS_ONLY) : CLIENT_STR(REWARD_ITEMS), kParch, false);
-            if (money) addMoney(money, nullptr);
-            if (xp) addText(std::string(CLIENT_STR(EXPERIENCE_COLON)) + " " + std::to_string(xp), kParch, false);
-            gap(2);
-            addItems(fixed, false);
-        }
-    };
+        auto tokens = [&](const std::string& s) { return declineMarkup(game::resolveTextTokens(s, subject)); };
+        auto itemName = [&](uint32_t id) -> std::string {
+            const pp::NpcItemInfo* info = session_.npcItemInfo(id);
+            return info && !info->name.empty() ? info->name : std::string();
+        };
 
-    if (w == kWinGossip) {
-        const auto& g = session_.getCurrentGossip();
-        std::string greet = session_.getQuestGreeting();
-        if (greet.empty() && g.titleTextId) greet = session_.getNpcText(g.titleTextId);
-        addText(tokens(greet), kParch, false);
-        gap(10);
-        // GossipFrameUpdate: available quests, then active ones, then the options.
-        auto questRow = [&](size_t i) {
-            const auto& q = g.quests[i];
-            const bool reward = q.questIcon == 5 || q.questIcon == 6 || q.questIcon == 10;
-            const bool incomplete = q.questIcon == 3 || q.questIcon == 4;
-            Line ln{Line::Row, tokens(q.title), kBlack};
-            ln.id = kIdRow0 + static_cast<uint32_t>(i);
-            ln.icon = reward ? (q.isRepeatable ? kNpcIconDailyActive : kNpcIconActive)
-                             : incomplete ? kNpcIconIncomplete
-                                          : (q.isRepeatable ? kNpcIconDaily : kNpcIconAvailable);
-            if (incomplete) ln.col = 0xFF404040u;
-            ln.h = std::max(lh, 12.0f) + 3;
+
+        UnitView u;
+        layout.name=unitView(npcGuid,u)&&!u.name.empty()?u.name:std::string();
+        layout.nameWidth=static_cast<float>(fn.measure(layout.name.c_str()));
+        layout.nameSmall=layout.nameWidth>FR(86,20,238,20).w;
+        if(layout.nameSmall)layout.nameWidth=static_cast<float>(fs.measure(layout.name.c_str()));
+        auto addText = [&](const std::string& text, uint32_t col, bool head) {
+            const Font& f = head ? fn : fs;
+            for (const std::string& l : wrapText(f, text, tw)) {
+                Line ln{head ? Line::Head : Line::Text, l, col};
+                ln.h = static_cast<float>(f.lineHeight());
+                lines.push_back(std::move(ln));
+            }
+        };
+        auto gap = [&](float h) {
+            Line ln{Line::Gap, std::string(), 0};
+            ln.h = h;
             lines.push_back(std::move(ln));
         };
-        bool any = false;
-        for (size_t i = 0; i < g.quests.size() && i < 16; ++i) {
-            const uint32_t ic = g.quests[i].questIcon;
-            if (!(ic == 5 || ic == 6 || ic == 10 || ic == 3 || ic == 4)) {
-                questRow(i);
-                any = true;
-            }
-        }
-        if (any) gap(6);
-        any = false;
-        for (size_t i = 0; i < g.quests.size() && i < 16; ++i) {
-            const uint32_t ic = g.quests[i].questIcon;
-            if (ic == 5 || ic == 6 || ic == 10 || ic == 3 || ic == 4) {
-                questRow(i);
-                any = true;
-            }
-        }
-        if (any) gap(6);
-        for (size_t o = 0; o < g.options.size() && g.quests.size() + o < 16; ++o) {
-            const auto& opt = g.options[o];
-            Line ln{Line::Row, tokens(opt.text), kBlack};
-            ln.id = kIdRow0 + static_cast<uint32_t>(g.quests.size() + o);
-            ln.icon = opt.icon <= 9 ? opt.icon : static_cast<uint8_t>(kNpcIconGossip);  // the client's 10 option icons
-            ln.h = std::max(lh, 12.0f) + 3;
+        auto addMoney = [&](uint32_t copper, const char* label) {
+            if (label) addText(label, kBlack, false);
+            Line ln{Line::Money, std::string(), 0};
+            ln.value = copper;
+            ln.labels={std::to_string(copper/10000u),std::to_string((copper/100u)%100u),std::to_string(copper%100u)};
+            for(size_t i=0;i<3;++i)ln.widths[i]=static_cast<float>(fs.measure(ln.labels[i].c_str()));
+            ln.h = lh + 2;
             lines.push_back(std::move(ln));
-        }
-    } else if (w == kWinQuestDetails) {
-        const auto& d = session_.getQuestDetails();
-        addText(tokens(d.title), kBlack, true);  // QuestInfo_ShowTitle
-        gap(4);
-        addText(tokens(d.details), kParch, false);
-        if (!d.objectives.empty()) {
+        };
+        // Item buttons two to a line (QuestInfoItem 1..10: left, right).
+        // every item button takes the cursor (QuestInfoItem OnEnter: GameTooltip:SetQuestItem); the
+        // ones that are not a reward choice get the ids 0x6380.. (WorldScreen::dressUpAction: Cross does nothing).
+        uint32_t dressUpItemId = 0x6380;
+        auto addItems = [&](const std::vector<game::QuestRewardItem>& items, bool choose) {
+            for (size_t i = 0; i < items.size(); ++i) {
+                Line ln{Line::Item, itemName(items[i].itemId), 0};
+                const pp::NpcItemInfo* info = session_.npcItemInfo(items[i].itemId);
+                ln.col = questQuality(info ? info->quality : 1);
+                ln.value = items[i].count;
+                ln.display = items[i].displayInfoId;
+                ln.itemId = items[i].itemId;
+                ln.id = choose ? kIdChoice0 + static_cast<uint32_t>(i) : (dressUpItemId < 0x63A0 ? dressUpItemId++ : 0);
+                ln.choice=choose?static_cast<int>(i):-1;
+                ln.right=(i%2)==1;
+                ln.labels=wrapText(fs,ln.s,tw*.5f-27);
+                if(ln.labels.size()>2)ln.labels.resize(2);
+                if(ln.value>1){ln.count=std::to_string(ln.value);ln.widths[0]=static_cast<float>(fs.measure(ln.count.c_str()));}
+                ln.h = (i % 2 == 1 || i + 1 == items.size()) ? 28.0f : 0.0f;  // the line advances after the right cell
+                lines.push_back(std::move(ln));
+            }
+        };
+        // QuestInfo_ShowRewards.
+        auto addRewards = [&](uint32_t money, uint32_t xp, const std::vector<game::QuestRewardItem>& fixed,
+                              const std::vector<game::QuestRewardItem>& choices, bool chooseMode) {
+            if (money == 0 && xp == 0 && fixed.empty() && choices.empty()) return;
             gap(8);
-            addText(CLIENT_STR(QUEST_OBJECTIVES), kBlack, true);
-            gap(2);
-            addText(tokens(d.objectives), kParch, false);
-        }
-        addRewards(d.rewardMoney, d.rewardXp, d.rewardItems, d.rewardChoiceItems, false);
-    } else if (w == kWinQuestProgress) {
-        const auto& q = session_.getQuestRequestItems();
-        addText(tokens(q.title), kBlack, true);
-        gap(4);
-        addText(tokens(q.completionText), kParch, false);
-        if (!q.requiredItems.empty()) {
-            gap(8);
-            addText(CLIENT_STR(TURN_IN_ITEMS), kBlack, true);
-            gap(2);
-            addItems(q.requiredItems, false);
-        }
-        if (q.requiredMoney) {
-            gap(6);
-            addMoney(q.requiredMoney, CLIENT_STR(REQUIRED_MONEY));
-        }
-    } else {
-        const auto& q = session_.getQuestOfferReward();
-        addText(tokens(q.title), kBlack, true);
-        gap(4);
-        addText(tokens(q.rewardText), kParch, false);
-        addRewards(q.rewardMoney, q.rewardXp, q.fixedRewards, q.choiceRewards, true);
-    }
+            addText(CLIENT_STR(QUEST_REWARDS), kBlack, true);
+            if (!choices.empty()) {
+                addText(chooseMode ? CLIENT_STR(REWARD_CHOOSE) : CLIENT_STR(REWARD_CHOICES), kParch, false);
+                gap(2);
+                addItems(choices, chooseMode);
+            }
+            if (money || xp || !fixed.empty()) {
+                gap(4);
+                addText(choices.empty() ? CLIENT_STR(REWARD_ITEMS_ONLY) : CLIENT_STR(REWARD_ITEMS), kParch, false);
+                if (money) addMoney(money, nullptr);
+                if (xp) addText(std::string(CLIENT_STR(EXPERIENCE_COLON)) + " " + std::to_string(xp), kParch, false);
+                gap(2);
+                addItems(fixed, false);
+            }
+        };
 
-    // Layout: y of each line; keep the focused row / choice in view.
-    float total = 10 * kS;
-    std::vector<float> ys(lines.size());
-    const uint32_t focusedId = winFocus_.focused();
-    float focusY = -1, focusH = 0;
-    for (size_t i = 0; i < lines.size(); ++i) {
-        ys[i] = total;
-        if (lines[i].id && lines[i].id == focusedId) {
-            focusY = total;
-            focusH = lines[i].kind == Line::Item ? 28.0f : lines[i].h;
+        if (w == kWinGossip) {
+            const auto& g = session_.getCurrentGossip();
+            std::string greet = session_.getQuestGreeting();
+            if (greet.empty() && g.titleTextId) greet = session_.getNpcText(g.titleTextId);
+            addText(tokens(greet), kParch, false);
+            gap(10);
+            // GossipFrameUpdate: available quests, then active ones, then the options.
+            auto questRow = [&](size_t i) {
+                const auto& q = g.quests[i];
+                const bool reward = q.questIcon == 5 || q.questIcon == 6 || q.questIcon == 10;
+                const bool incomplete = q.questIcon == 3 || q.questIcon == 4;
+                Line ln{Line::Row, tokens(q.title), kBlack};
+                ln.id = kIdRow0 + static_cast<uint32_t>(i);
+                ln.icon = reward ? (q.isRepeatable ? kNpcIconDailyActive : kNpcIconActive)
+                                 : incomplete ? kNpcIconIncomplete
+                                              : (q.isRepeatable ? kNpcIconDaily : kNpcIconAvailable);
+                if (incomplete) ln.col = 0xFF404040u;
+                ln.h = std::max(lh, 12.0f) + 3;
+                lines.push_back(std::move(ln));
+            };
+            bool any = false;
+            for (size_t i = 0; i < g.quests.size() && i < 16; ++i) {
+                const uint32_t ic = g.quests[i].questIcon;
+                if (!(ic == 5 || ic == 6 || ic == 10 || ic == 3 || ic == 4)) {
+                    questRow(i);
+                    any = true;
+                }
+            }
+            if (any) gap(6);
+            any = false;
+            for (size_t i = 0; i < g.quests.size() && i < 16; ++i) {
+                const uint32_t ic = g.quests[i].questIcon;
+                if (ic == 5 || ic == 6 || ic == 10 || ic == 3 || ic == 4) {
+                    questRow(i);
+                    any = true;
+                }
+            }
+            if (any) gap(6);
+            for (size_t o = 0; o < g.options.size() && g.quests.size() + o < 16; ++o) {
+                const auto& opt = g.options[o];
+                Line ln{Line::Row, tokens(opt.text), kBlack};
+                ln.id = kIdRow0 + static_cast<uint32_t>(g.quests.size() + o);
+                ln.icon = opt.icon <= 9 ? opt.icon : static_cast<uint8_t>(kNpcIconGossip);  // the client's 10 option icons
+                ln.h = std::max(lh, 12.0f) + 3;
+                lines.push_back(std::move(ln));
+            }
+        } else if (w == kWinQuestDetails) {
+            const auto& d = session_.getQuestDetails();
+            addText(tokens(d.title), kBlack, true);  // QuestInfo_ShowTitle
+            gap(4);
+            addText(tokens(d.details), kParch, false);
+            if (!d.objectives.empty()) {
+                gap(8);
+                addText(CLIENT_STR(QUEST_OBJECTIVES), kBlack, true);
+                gap(2);
+                addText(tokens(d.objectives), kParch, false);
+            }
+            addRewards(d.rewardMoney, d.rewardXp, d.rewardItems, d.rewardChoiceItems, false);
+        } else if (w == kWinQuestProgress) {
+            const auto& q = session_.getQuestRequestItems();
+            addText(tokens(q.title), kBlack, true);
+            gap(4);
+            addText(tokens(q.completionText), kParch, false);
+            if (!q.requiredItems.empty()) {
+                gap(8);
+                addText(CLIENT_STR(TURN_IN_ITEMS), kBlack, true);
+                gap(2);
+                addItems(q.requiredItems, false);
+            }
+            if (q.requiredMoney) {
+                gap(6);
+                addMoney(q.requiredMoney, CLIENT_STR(REQUIRED_MONEY));
+            }
+        } else {
+            const auto& q = session_.getQuestOfferReward();
+            addText(tokens(q.title), kBlack, true);
+            gap(4);
+            addText(tokens(q.rewardText), kParch, false);
+            addRewards(q.rewardMoney, q.rewardXp, q.fixedRewards, q.choiceRewards, true);
         }
-        total += lines[i].h;
+
+        layout.total=10*kS;
+        for(auto& line:lines){line.y=layout.total;layout.total+=line.h;}
+        if(w==kWinGossip)layout.buttons={"",CLIENT_STR(GOODBYE)};
+        else if(w==kWinQuestDetails)layout.buttons={CLIENT_STR(ACCEPT),CLIENT_STR(DECLINE)};
+        else if(w==kWinQuestProgress)layout.buttons={CLIENT_STR(CONTINUE),CLIENT_STR(CANCEL)};
+        else layout.buttons={CLIENT_STR(COMPLETE_QUEST),CLIENT_STR(CANCEL)};
+        for(size_t i=0;i<2;++i)layout.buttonWidths[i]=static_cast<float>(fs.measure(layout.buttons[i].c_str()));
+        layout.key=std::move(key);layout.valid=true;++layout.builds;
+        PSP_LOGI(pp::tag::Gfx,"npc_layout window=%u builds=%u lines=%u",static_cast<unsigned>(w),
+                 static_cast<unsigned>(layout.builds),static_cast<unsigned>(lines.size()));
+    } else ++layout.hits;
+    {
+        const Rect nr=FR(86,20,238,20);
+        const Font& nf=layout.nameSmall?fs:fn;
+        if(layout.nameWidth<=nr.w)
+            ui.textShadow(nf,nr.x+nr.w*.5f-layout.nameWidth/(2.f*ui.scale()),
+                          nr.y+(nr.h-nf.lineHeight())*.5f,layout.name.c_str(),0xFFFFFFFFu);
+        else ui.textMarquee(nf,nr,layout.name.c_str(),0xFFFFFFFFu,layout.nameWidth);
+    }
+    // Focus and scroll use retained positions, without reflowing static text.
+    const float total=layout.total;
+    const uint32_t focusedId=winFocus_.focused();
+    float focusY=-1,focusH=0;
+    for(const auto& line:lines)if(line.id && line.id==focusedId) {
+        focusY=line.y;focusH=line.kind==Line::Item?28.f:line.h;break;
     }
     const float maxScroll = std::max(0.0f, total - view.h + 4);
     float scroll = std::clamp(static_cast<float>(npc_.scroll), 0.0f, maxScroll);
@@ -558,7 +573,7 @@ bool WorldScreen::drawNpcFrame(UiRenderer& ui, uint8_t w) {
     ui.pushClip(view);
     for (size_t i = 0; i < lines.size(); ++i) {
         const Line& ln = lines[i];
-        const float y = view.y + ys[i] - scroll;
+        const float y = view.y + ln.y - scroll;
         const float rowH = ln.kind == Line::Item ? 28.0f : ln.h;
         if (y + rowH < view.y || y > view.y + view.h) continue;
         const bool visible = y >= view.y - 1 && y + rowH <= view.y + view.h + 1;
@@ -582,10 +597,7 @@ bool WorldScreen::drawNpcFrame(UiRenderer& ui, uint8_t w) {
                 break;
             }
             case Line::Item: {
-                // Which cell: count the items of this run before it.
-                size_t k = 0;
-                for (size_t j = i; j > 0 && lines[j - 1].kind == Line::Item; --j) ++k;
-                const bool right = (k % 2) == 1;
+                const bool right=ln.right;
                 const float cy = y;  // the left cell is 0 high: both cells start on one line
                 const float cx = tx + (right ? tw * 0.5f : 0.0f);
                 const Rect icon{cx, cy + 2, 22, 22};
@@ -599,8 +611,9 @@ bool WorldScreen::drawNpcFrame(UiRenderer& ui, uint8_t w) {
                     tipProtoCount_ = std::max<uint32_t>(1u, ln.value);
                     tipProtoRect_ = Rect{icon.x + ui.offsetX(), icon.y + ui.offsetY(), icon.w, icon.h};
                 }
-                if (ln.selected || focused)
-                    ui.fill(Rect{cx - 1, cy, tw * 0.5f - 2, 26}, ln.selected ? 0x6000D1FFu : 0x40FFFFFFu);
+                const bool selected=ln.choice>=0 && ln.choice==npc_.rewardChoice;
+                if (selected || focused)
+                    ui.fill(Rect{cx - 1, cy, tw * 0.5f - 2, 26}, selected ? 0x6000D1FFu : 0x40FFFFFFu);
                 if (const pp::Texture* t = itemIcons().byDisplay(ln.display, frameNo)) ui.image(*t, icon);
                 else ui.fill(icon, 0xFF202020u);
                 if (spellArt_.slot.pixels) {
@@ -608,13 +621,11 @@ bool WorldScreen::drawNpcFrame(UiRenderer& ui, uint8_t w) {
                     ui.image(spellArt_.slot, Rect{icon.x + 11 - c * 0.5f, icon.y + 11 - c * 0.5f, c, c});
                 }
                 if (ln.value > 1) {
-                    char cnt[12];
-                    std::snprintf(cnt, sizeof(cnt), "%u", static_cast<unsigned>(ln.value));
-                    ui.textShadow(fs, icon.x + icon.w - 1, icon.y + icon.h - fs.lineHeight(), cnt, 0xFFFFFFFFu,
-                                  Align::Right);
+                    ui.textShadow(fs, icon.x+icon.w-1-ln.widths[0]/ui.scale(),
+                                  icon.y+icon.h-fs.lineHeight(),ln.count.c_str(),0xFFFFFFFFu);
                 }
                 const float nx = cx + 25, nw = tw * 0.5f - 27;
-                const auto nl = wrapText(fs, ln.s, nw);
+                const auto& nl=ln.labels;
                 ui.pushClip(Rect{nx, cy, nw, 26});
                 const float ny = cy + (26 - lh * static_cast<float>(std::min<size_t>(2, nl.size()))) * 0.5f;
                 for (size_t n = 0; n < nl.size() && n < 2; ++n)
@@ -629,10 +640,8 @@ bool WorldScreen::drawNpcFrame(UiRenderer& ui, uint8_t w) {
                 const uint32_t parts[3] = {g, s, c};
                 for (int p = 0; p < 3; ++p) {
                     if (parts[p] == 0 && !(p == 2 && g == 0 && s == 0)) continue;
-                    char b[12];
-                    std::snprintf(b, sizeof(b), "%u", static_cast<unsigned>(parts[p]));
-                    ui.textShadow(fs, x, y + 1, b, 0xFFFFFFFFu);
-                    x += static_cast<float>(fs.measure(b)) + 1;
+                    ui.textShadow(fs,x,y+1,ln.labels[p].c_str(),0xFFFFFFFFu);
+                    x+=ln.widths[p]+1;
                     if (npcArt_.money.pixels) {
                         const float u0 = npcArt_.money.uw * 0.25f * static_cast<float>(p);
                         ui.image(npcArt_.money, Rect{x, y + 1, 10, 10},
@@ -666,17 +675,17 @@ bool WorldScreen::drawNpcFrame(UiRenderer& ui, uint8_t w) {
     const float by = kFy + 415 * kS, bw = 64, bh = 16;
     const Rect left{kFx + 20 * kS, by, bw, bh}, right{kFx + 346 * kS - bw, by, bw, bh};
     if (w == kWinGossip) {
-        drawPanelButton(ui, kIdGoodbye, right, CLIENT_STR(GOODBYE), true, top);
+        drawPanelButton(ui, kIdGoodbye, right, layout.buttons[1].c_str(), true, top,layout.buttonWidths[1]);
     } else if (w == kWinQuestDetails) {
-        drawPanelButton(ui, kIdAccept, left, CLIENT_STR(ACCEPT), true, top);
-        drawPanelButton(ui, kIdDecline, right, CLIENT_STR(DECLINE), true, top);
+        drawPanelButton(ui, kIdAccept, left, layout.buttons[0].c_str(), true, top,layout.buttonWidths[0]);
+        drawPanelButton(ui, kIdDecline, right, layout.buttons[1].c_str(), true, top,layout.buttonWidths[1]);
     } else if (w == kWinQuestProgress) {
-        drawPanelButton(ui, kIdComplete, left, CLIENT_STR(CONTINUE), session_.getQuestRequestItems().isCompletable(),
-                        top);
-        drawPanelButton(ui, kIdCancel, right, CLIENT_STR(CANCEL), true, top);
+        drawPanelButton(ui, kIdComplete, left, layout.buttons[0].c_str(), session_.getQuestRequestItems().isCompletable(),
+                        top,layout.buttonWidths[0]);
+        drawPanelButton(ui, kIdCancel, right, layout.buttons[1].c_str(), true, top,layout.buttonWidths[1]);
     } else {
-        drawPanelButton(ui, kIdTakeReward, left, CLIENT_STR(COMPLETE_QUEST), true, top);
-        drawPanelButton(ui, kIdCancel, right, CLIENT_STR(CANCEL), true, top);
+        drawPanelButton(ui, kIdTakeReward, left, layout.buttons[0].c_str(), true, top,layout.buttonWidths[0]);
+        drawPanelButton(ui, kIdCancel, right, layout.buttons[1].c_str(), true, top,layout.buttonWidths[1]);
     }
     return true;
 }

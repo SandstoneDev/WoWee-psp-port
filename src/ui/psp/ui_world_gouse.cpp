@@ -281,7 +281,7 @@ void WorldScreen::updateGameObjectUse(float dtSec) {
             if (ev.kind != 1) continue;
             const GoInfo* g = session_.findGameObject(ev.guid);
             if (!g) continue;
-            if (goAnimatedDisplay(g->displayId)) {  // Custom0..3 / Despawn once (after the next draw)
+            if (goAnimatedDisplay(g->displayId) && ev.guid!=session_.fishingBobber()) {  // own bobber uses explicit dip
                 auto it = s.animGos.find(ev.guid);
                 if (it != s.animGos.end()) {
                     it->second.pendingShot = ev.kind == 2 ? 157u : (ev.kind == 1 ? 153u + std::min<uint32_t>(ev.arg, 3u) : 0u);
@@ -432,8 +432,18 @@ void WorldScreen::cycleGameObjectHover() {
 
 // ↑ (interactTarget): the hovered object when it is nearer than the NPC the press would talk to.
 bool WorldScreen::tryUseGameObject(float npcDist) {
-    if (!gou_) return false;
+    if (!gameObjectBeforeNpc(npcDist)) return false;
     GoUseUi& s = *gou_;
+    const bool moving = moving_ || wantMove_;
+    session_.useGameObject(s.hover, s.hoverInReach, moving);
+    s.tipKey = ~0ull;
+    return true;
+}
+
+// PSP: read-only priority check, also used by the NPC interaction hint.
+bool WorldScreen::gameObjectBeforeNpc(float npcDist) const {
+    if (!gou_) return false;
+    const GoUseUi& s = *gou_;
     if (s.hover == 0) return false;
     const GoInfo* g = session_.findGameObject(s.hover);
     if (!g) return false;
@@ -442,9 +452,6 @@ bool WorldScreen::tryUseGameObject(float npcDist) {
     goSphere(*g, c, r);
     const float d = std::max(0.0f, glm::length(c - glm::vec3(playerX_, playerY_, playerZ_)) - r);
     if (d >= npcDist && s.hover != session_.fishingBobber()) return false;
-    const bool moving = moving_ || wantMove_;
-    session_.useGameObject(s.hover, s.hoverInReach, moving);
-    s.tipKey = ~0ull;  // its state may change
     return true;
 }
 
@@ -497,7 +504,8 @@ void WorldScreen::drawGameObjectHud(UiRenderer& ui) {
         ui.fill(Rect{sx - 1.0f, sy - arm, 2.0f, arm * 2.0f}, gold);
         ui.fill(Rect{sx - 1.5f, sy - 1.5f, 3.0f, 3.0f}, white);
     }
-    if (s.hover == 0 || !s.hoverInReach || uiMode_) return;
+    if (s.hover == 0 || !s.hoverInReach || uiMode_ || !settings_.values().worldhints) return;
+    if (hintNpc_ != 0) return; // PSP: drawUnitHints ran first; Up belongs to that NPC, not this object
     float sx = 0.0f, sy = 0.0f;
     if (projectHud(s.hoverTop, sx, sy)) kit_.glyph(ui, kPadUp, Rect{sx - 8, sy - 8, 16, 16});
 }
@@ -691,7 +699,7 @@ void WorldScreen::appendGameObjectUnits(std::vector<rendering::psp::CreatureUnit
         u.displayId = rp::kGoAnimDisplayBase + g.displayId;
         u.x = g.pos.x;
         u.y = g.pos.y;
-        u.z = g.pos.z;
+        u.z = g.pos.z+(g.guid==session_.fishingBobber()?fishingBobberVisualOffset():0.f);
         u.orientation = g.orientation;
         u.scale = g.scale;
         u.emoteAnim = a.loopAnim;

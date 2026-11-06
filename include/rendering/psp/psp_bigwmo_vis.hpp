@@ -556,13 +556,17 @@ int findBigWmoGroupBySurface(const BigWmoTables& t, const glm::vec3& p, SurfaceB
         if (p.x < G.bmin[0] || p.x > G.bmax[0] || p.y < G.bmin[1] || p.y > G.bmax[1]) continue;
         if (!(G.bmin[2] <= p.z)) continue;
         if (!(G.bmax[2] >= p.z - kSurfaceDepth)) continue;
-        if (haveGeometry(g)) {
-            float z = 0.0f;
-            if (surfaceBelow(g, p, z) && (bestH < 0 || z > bestZ)) {
+        float z = 0.0f;
+        if (haveGeometry(g) && surfaceBelow(g, p, z)) {
+            if (bestH < 0 || z > bestZ) {
                 bestH = static_cast<int>(g);
                 bestZ = z;
             }
-        } else if (p.z <= G.bmax[2]) {
+        } else if (!(G.flags & kExterior) && p.z <= G.bmax[2]) {
+            // A camera can be inside a shaft/void with no floor triangle directly
+            // below it (interior lifts are one example). Keep a bounded-group
+            // fallback for that case; otherwise the whole WMO is classified as
+            // exterior and its interior chunks disappear during the descent.
             const float vol = boxVolume(G.bmin, G.bmax);
             if (bestB < 0 || vol < bestVol) {
                 bestB = static_cast<int>(g);

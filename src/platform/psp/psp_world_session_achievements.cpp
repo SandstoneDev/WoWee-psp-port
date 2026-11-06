@@ -58,6 +58,7 @@ bool AchIndex::load() {
     recs_ = reinterpret_cast<const AchIdxRec*>(b + h->achOff);
     strings_ = b + h->strOff;
     strSize_ = h->strSize;
+    PSP_LOGI(tag::Gfx,"ach_index_load entries=%u kb=%u",static_cast<unsigned>(h->achievementCount),static_cast<unsigned>((size+1023u)/1024u));
     return true;
 }
 
@@ -70,6 +71,7 @@ void AchIndex::release() {
     recs_ = nullptr;
     strings_ = nullptr;
     strSize_ = 0;
+    tried_ = false; // deliberate eviction permits the next opening to reload
 }
 
 const AchCatRec* AchIndex::category(uint32_t id) const {

@@ -83,12 +83,18 @@ public:
     void clear();
     int tileCount() const { return static_cast<int>(tiles_.size()); }
 
-    // Height at a server-coords position from loaded tiles (bilinear on the
-    // 9x9 grid), or false when outside every loaded chunk.
+    // Height at a server-coords position from loaded tiles (triangle interpolation on the
+    // 9x9 grid), or false in a terrain hole or outside every loaded chunk.
     bool heightAt(float x, float y, float& z) const;
+    // Optional masks for older WTER packs baked without MCNK hole data.
+    void loadHoleOverrides(const char* mapName);
     // The loaded chunk under (x, y): ADT tile and MCNK index (ADT order), for
     // the area id (M12 zone music). False off the loaded tiles.
     bool chunkAt(float x, float y, int& tileX, int& tileY, int& chunk) const;
+    bool tileLoadedAt(float x, float y) const {
+        int tileX = 0, tileY = 0, chunk = 0;
+        return chunkAt(x, y, tileX, tileY, chunk);
+    }
 
     // Sets GE projection/view for this camera and draws the terrain.
     void draw(const TerrainCamera& cam, uint32_t fogColorABGR);
@@ -107,6 +113,7 @@ public:
     float sharpDistance = 120.0f;
     // The near detail pass (v4 "dt_" textures). wowee.cfg "terraindetail".
     bool detail = true;
+    float performanceLod = 1.f; // adaptive draw LOD only; height/collision unchanged
 
     // Tile streaming (src/ui/psp/ui_world_streaming.cpp).
     bool hasTile(int tileX, int tileY) const;
@@ -192,6 +199,9 @@ public:
 
 private:
     struct Chunk {
+        uint16_t holes = 0, holeCount = 0, holeTriangles = 0;
+        uint16_t surfaceCount = 0, surfaceTriangles = 0;
+        uint16_t* holeIndices = nullptr;
         float baseX, baseY, baseZ;
         float minZ, maxZ;
         const TerrainVertex* verts;  // 117 (81 grid + 36 skirt), inside Tile::vertexBlock
@@ -212,6 +222,7 @@ private:
         TerrainVertex* vertexBlock;  // 256 * 117, 16-byte aligned, written once
         void* blob;                  // pak entry, kept: the GE reads textures from it
         uint32_t bytes;              // blob + vertex block (streaming log / eviction)
+        uint32_t holeIndexBytes = 0;
         // The texture window - no blob kept; where the textures are in the pak file (texture reads).
         bool windowed;
         uint32_t fileOffset, texBase, texBytes;
@@ -224,12 +235,14 @@ private:
         mutable float rowX[16], colY[16];
         mutable float loX, hiX, loY, hiY;  // no chunk passes outside (with a margin)
     };
+    platform::psp::Pak holePak_;
 
     std::vector<Tile*> tiles_;
     std::vector<platform::psp::Texture> details_;  // "dt_<n>" by id (pixels == null: absent)
     std::vector<const Chunk*> near_;
     uint16_t* lodIndices_[4] = {nullptr, nullptr, nullptr, nullptr};
     int lodCounts_[4] = {0, 0, 0, 0};      // strip indices per LOD
+    int surfaceCounts_[4] = {0, 0, 0, 0}; // prefix before seam walls
     int lodTriangles_[4] = {0, 0, 0, 0};   // real triangles per LOD
     TerrainStats stats_;
     void loadDetail(platform::psp::Pak& pak, uint16_t id);

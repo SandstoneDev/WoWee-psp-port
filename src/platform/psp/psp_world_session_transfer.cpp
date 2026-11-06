@@ -438,6 +438,7 @@ void WorldSession::transferResetWorld() {
     closeVendor();
     npcQuestStatus_.clear();
     closeTrainer();
+    ownForcedMove_=false;
     forceClearTaxi("new_world");  // upstream: onTaxiFlight_ / taxiMountActive_ / taxiClientActive_ ... = false
     closeTaxi();
     releaseTaxiData();            // the next taxi window reads the new map's nodes
@@ -553,6 +554,7 @@ void WorldSession::handleNewWorld(network::Packet& packet) {
     if (sameMap) {
         // upstream WorldEntryCallbackHandler: the same map is not reloaded - the player is put there (the world screen
         // takes it as a teleport: takeTeleport -> applyTeleport, the streamer follows).
+        ownForcedMove_=false;
         teleportPending_ = true;
         teleportPos_ = glm::vec3(x, y, z);
         teleportO_ = o;

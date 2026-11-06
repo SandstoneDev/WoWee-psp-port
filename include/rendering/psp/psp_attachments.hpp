@@ -45,6 +45,8 @@ bool attachmentsEnabled();
 void setAttachmentsEnabled(bool on);
 // Bytes of item models and textures in the shared cache.
 uint32_t attachmentCacheBytes();
+// Prewarm NPC item models/skins before replacing any currently visible equipment.
+bool prepareNpcAttachments(ItemBank& items,const std::vector<AttachPick>& picks);
 
 // Item displays: an item texture ("t_<n>" - a cloak's) from the
 // same shared cache, reference counted like the models' skins: one copy for
@@ -105,6 +107,8 @@ public:
     void draw(const BoneMatrix& charModel, const BoneMatrix* pose, uint32_t poseCount, float alpha, const float camPos[3]);
     // The weapons with a glow drawn in this attachmentFrame(); returns how many were written (<= max).
     size_t glows(WeaponGlow* out, size_t max) const;
+    // Current-frame main-hand model tip, for a fishing line.
+    bool weaponTip(uint8_t slot,float out[3]) const;
 
 private:
     struct Entry {

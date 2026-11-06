@@ -7,26 +7,17 @@
 //   3. SMSG_INIT_WORLD_STATES zone, resolved the same way;
 //   4. (coordinator's current zone - kept by the state below);
 //   5. ZoneManager's hand-written tile table.
-// Music - upstream AudioCoordinator::updateZoneAudio: entering a zone starts
-// a random track of it if the switch cooldown ran out (then 6 s); a track
-// that ended is followed by a new random one of the current zone (then 2 s);
-// ZoneManager::getRandomMusic avoids repeating the last track (5 tries).
-// MusicManager's "crossfade" = stop the old track at once, start the new one
-// fadeMs*0.3 = 0.9 s later without a fade-in. Default volume 30 % (upstream
-// settings: music 30); wowee.cfg musicvol 0..100.
-// Taverns/blacksmith overrides are not ported: upstream compares hashed WMO
-// ids against fixed numbers that never match (dead code as written).
-// step 1's grid is the map's own - data/minimap_<map>.pak "agrid" (every ADT
-// tile of the map, compact, psp_worldmap_view.hpp AreaGridView); audio.pak's "a_<x>_<y>" grids are
-// map 0's (psp_audio_conv's default map, no map in their names): on map 1 they named map 0's
-// areas for the same tile numbers. They are read only on map 0 when the minimap pak has no "agrid"; step 5's
-// tile table (no map in its keys either) is used on map 0 only.
+// Authored music: optional audio.pak music_rules/music_tracks preserve area
+// inheritance, day/night pools, and ZoneMusic silence intervals. Older packs
+// use their legacy zone lists with spaced playback. musiccontinuous=1 skips
+// silence; 0 (default) follows the client's intervals. Zone changes fade.
 #include "ui/psp/ui_world_screen.hpp"
 
 #include "platform/psp/psp_audio.hpp"
 #include "platform/psp/psp_config.hpp"
 #include "platform/psp/psp_fs.hpp"
 #include "platform/psp/psp_log.hpp"
+#include "platform/psp/psp_music_path.hpp"
 #include "platform/psp/psp_prof.hpp"
 #include "rendering/psp/psp_audio_format.hpp"
 #include "rendering/psp/psp_worldmap_view.hpp"  // AreaGridView
@@ -87,6 +78,7 @@ bool WorldScreen::ZoneMusic::load(uint32_t mapId) {
     blob = nullptr;
     h = nullptr;
     lastPlayed = nullptr;
+    musicRules.clear(); musicTracks.clear();
     areaParents.clear();
     tileToZone.clear();
     zoneIndex.clear();
@@ -147,8 +139,55 @@ bool WorldScreen::ZoneMusic::load(uint32_t mapId) {
         std::memcpy(dst.data(), g, 512);
         pp::pakFree(g);
     }
+    const auto* ruleEntry=pak.find("music_rules");
+    const auto* trackEntry=pak.find("music_tracks");
+    if (ruleEntry && ruleEntry->size<=1024u*1024u && ruleEntry->size%sizeof(fmt::AudioMusicRule)==0 &&
+        trackEntry && trackEntry->size<=1024u*1024u && trackEntry->size%sizeof(uint16_t)==0) {
+        void* rules=pak.load(ruleEntry); void* tracks=pak.load(trackEntry);
+        if (rules && tracks) {
+            const auto* rr=static_cast<const fmt::AudioMusicRule*>(rules);
+            const auto* tt=static_cast<const uint16_t*>(tracks);
+            musicTracks.assign(tt,tt+trackEntry->size/sizeof(*tt));
+            for (uint32_t i=0;i<ruleEntry->size/sizeof(*rr);++i) {
+                bool valid=true;
+                for (int phase=0;phase<2;++phase)
+                    valid=valid && uint64_t(rr[i].firstTrack[phase])+rr[i].trackCount[phase]<=musicTracks.size();
+                if (valid) musicRules.push_back(rr[i]);
+            }
+            for (uint16_t track : musicTracks) if (track>=h->trackCount) { musicRules.clear(); break; }
+            std::sort(musicRules.begin(),musicRules.end(),[](const auto& a,const auto& b){return a.areaId<b.areaId;});
+        }
+        pp::pakFree(rules); pp::pakFree(tracks);
+    }
     pak.close();
     return true;
+}
+
+const fmt::AudioMusicRule* WorldScreen::ZoneMusic::musicRule(uint32_t areaId) const {
+    for (int depth=0;areaId && depth<16;++depth) {
+        const auto it=std::lower_bound(musicRules.begin(),musicRules.end(),areaId,
+            [](const auto& row,uint32_t id){return row.areaId<id;});
+        if (it!=musicRules.end() && it->areaId==areaId) return &*it;
+        const auto parent=areaParents.find(areaId);
+        if (parent==areaParents.end() || parent->second==areaId) break;
+        areaId=parent->second;
+    }
+    return nullptr;
+}
+
+const char* WorldScreen::ZoneMusic::authoredMusic(const fmt::AudioMusicRule& rule,bool night) {
+    const int phase=night ? 1 : 0;
+    const uint32_t count=rule.trackCount[phase];
+    if (!count) return nullptr;
+    static std::mt19937 rng(pp::logUptimeMs() ^ 0xC0FFEEu);
+    const char* chosen=nullptr;
+    for (int retry=0;retry<5;++retry) {
+        const uint32_t index=std::uniform_int_distribution<uint32_t>(0,count-1)(rng);
+        chosen=names+nameOffsets[musicTracks[rule.firstTrack[phase]+index]];
+        if (!lastPlayed || count==1 || std::strcmp(chosen,lastPlayed)!=0) break;
+    }
+    lastPlayed=chosen;
+    return chosen;
 }
 
 // upstream ZoneManager::resolveAreaZoneId
@@ -204,41 +243,66 @@ void WorldScreen::initAudio() {
     initSounds();  // sounds (sounds.pak read and closed here, before fd_probe)
 }
 
-void WorldScreen::playZoneMusic(const char* track) {
-    char path[256], rel[200];
-    std::snprintf(rel, sizeof(rel), "data/music/%s", track);
-    pp::fsPath(path, sizeof(path), rel);
+bool WorldScreen::playZoneMusic(const char* track) {
+    if (!track || !*track) return false;
+    musicStartCount_=pp::audioStats().musicStarts;
+    char path[256];
+    if (!pp::musicFilePath(path, sizeof(path), track)) {
+        PSP_LOGW(pp::tag::Sys, "zone_music_missing track=%s layout=data/music/<category>/", track);
+        return false;
+    }
     if (pp::musicActive()) {
-        // MusicManager::crossfadeTo: stop now, start 0.9 s later, no fade-in.
-        pp::musicStop(0);
+        // Fade out before changing the streamed MP3, then fade the new track in.
+        pp::musicStop(1200);
         std::snprintf(pendingTrack_, sizeof(pendingTrack_), "%s", path);
-        pendingTrackSec_ = 0.9f;
+        pendingTrackSec_ = 1.3f;
     } else {
-        pp::musicPlay(path, false, 0, 0);
+        pp::musicPlay(path, false, 0, 800);
         pendingTrack_[0] = 0;
     }
     PSP_LOGI(pp::tag::Sys, "zone_music zone=%u track=%s", static_cast<unsigned>(zoneId_), track);
+    return true;
 }
 
 void WorldScreen::updateAudio(float dtSec) {
     updateSounds(dtSec);  // sounds (effects run without the music pak too)
+    updateEnvironmentAudio();  // area/day/night ambience must run even without music
+    const uint8_t mode=session_.life()==pp::WorldSession::Life::Alive?0u:1u;
+    if(mode!=deathAudioMode_) {
+        const bool wasDead=deathAudioMode_==1u;
+        deathAudioMode_=mode;deathAudioRetry_=0;
+        pendingTrack_[0]=0;musicCooldown_=0;musicKey_=0xFFFFFFFFu;musicWasPlaying_=false;
+        if(mode || wasDead)pp::musicStop(0);
+        PSP_LOGI(pp::tag::Sys,"death_audio dead=%u",static_cast<unsigned>(mode));
+    }
+    pp::musicSetVolume(static_cast<float>(mode?settings_.values().ambientvol:settings_.values().musicvol)/100.f);
+    if(mode) {
+        deathAudioRetry_=std::max(0.f,deathAudioRetry_-dtSec);
+        if(!pp::musicActive() && deathAudioRetry_<=0) {
+            char path[256];
+            if(pp::musicFilePath(path,sizeof(path),"ambience/ghoststate.mp3"))pp::musicPlay(path,true,0,800);
+            else PSP_LOGW(pp::tag::Sys,"death_audio_missing path=data/music/ambience/ghoststate.mp3");
+            deathAudioRetry_=5.f;
+        }
+        return; // ordinary zone playlists resume from their authored rules on resurrection
+    }
     if (!musicOk_) return;
     PROF_SCOPE("audio");
     if (musicCooldown_ > 0.0f) musicCooldown_ = std::max(0.0f, musicCooldown_ - dtSec);
     if (pendingTrack_[0]) {
         pendingTrackSec_ -= dtSec;
         if (pendingTrackSec_ <= 0.0f) {
-            pp::musicPlay(pendingTrack_, false, 0, 0);
+            pp::musicPlay(pendingTrack_, false, 0, 800);
             pendingTrack_[0] = 0;
         }
         return;
     }
     // Zone under the player (Renderer::getCurrentZoneId).
-    uint32_t zone = 0;
+    uint32_t zone = 0, musicArea = 0;
     int tx = 0, ty = 0, chunk = 0;
     if (terrain_.chunkAt(playerX_, playerY_, tx, ty, chunk)) {
         const uint32_t area = zoneMusic_.areaAt(tx, ty, chunk);
-        if (area) zone = zoneMusic_.resolveAreaZoneId(area);
+        if (area) { musicArea=area; zone = zoneMusic_.resolveAreaZoneId(area); }
     }
     if (zone) lastResolvedZone_ = zone;
     else zone = lastResolvedZone_;
@@ -252,22 +316,56 @@ void WorldScreen::updateAudio(float dtSec) {
         const int tileY = static_cast<int>(std::floor(32.0f - playerX_ / kTileSize));
         zone = zoneMusic_.zoneOfTile(tileX, tileY);
     }
-    // AudioCoordinator::updateZoneAudio (music part).
-    if (zone != 0 && zone != zoneId_) {
-        zoneId_ = zone;
-        PSP_LOGI(pp::tag::Sys, "zone_enter zone=%u", static_cast<unsigned>(zone));
-        if (musicCooldown_ <= 0.0f) {
-            if (const char* m = zoneMusic_.randomMusic(zone)) {
-                playZoneMusic(m);
-                musicCooldown_ = 6.0f;
-            }
-        }
+    if (zone && zone!=zoneId_) {
+        zoneId_=zone;
+        PSP_LOGI(pp::tag::Sys,"zone_enter zone=%u",static_cast<unsigned>(zone));
     }
-    if (!pp::musicActive() && zoneId_ != 0 && musicCooldown_ <= 0.0f) {
-        if (const char* m = zoneMusic_.randomMusic(zoneId_)) {
-            playZoneMusic(m);
-            musicCooldown_ = 2.0f;
+    if (!musicArea) musicArea=session_.worldStateZoneId() ? session_.worldStateZoneId() : zone;
+    const auto* rule=zoneMusic_.musicRule(musicArea);
+    float hour=session_.getGameTime();
+    if (hour>=0) hour=std::fmod(hour+static_cast<float>(pp::logUptimeMs()-session_.gameTimeReceivedMs())/3600000.f,24.f);
+    const bool night=hour>=0 && (hour<6 || hour>=18);
+    const int phase=night ? 1 : 0;
+    // Preserve explicit authored silence (soundId=0), but a rule whose files
+    // were unavailable must not disable a usable legacy zone playlist.
+    const bool useRule=rule && (!rule->soundId[phase] || rule->trackCount[phase]);
+    const uint32_t key=useRule ? rule->soundId[phase] : (zone|0x80000000u);
+    auto choose=[&]() -> const char* {
+        return useRule ? zoneMusic_.authoredMusic(*rule,night) : zoneMusic_.randomMusic(zone);
+    };
+    if (key!=musicKey_) {
+        musicKey_=key; musicCooldown_=0; musicWasPlaying_=false;
+        if (const char* track=choose()) {
+            musicWasPlaying_=playZoneMusic(track);
+            if (!musicWasPlaying_) musicCooldown_=2.0f;
         }
+        else if (pp::musicActive()) pp::musicStop(1200);
+        return;
+    }
+    if (pp::musicActive()) { musicWasPlaying_=true; return; }
+    if (musicWasPlaying_) {
+        musicWasPlaying_=false;
+        // A queued request is not proof of playback. Failed opens/decodes
+        // retry promptly instead of imposing the authored post-track silence.
+        if (pp::audioStats().musicStarts==musicStartCount_) {
+            musicCooldown_=2.0f;
+            PSP_LOGW(pp::tag::Sys,"music_start_retry seconds=2 check=data/music and music_open_failed");
+            return;
+        }
+        uint32_t low=rule ? rule->silenceMinMs[phase] : 180000;
+        uint32_t high=rule ? rule->silenceMaxMs[phase] : 300000;
+        if (high<low) std::swap(low,high);
+        static std::mt19937 rng(pp::logUptimeMs() ^ 0x51EACEu);
+        musicCooldown_=pp::configGetInt("musiccontinuous",0) ? 0.f :
+            static_cast<float>(std::uniform_int_distribution<uint32_t>(low,high)(rng))/1000.f;
+        PSP_LOGI(pp::tag::Sys,"music_silence ms=%u night=%d",static_cast<unsigned>(musicCooldown_*1000),night ? 1 : 0);
+    }
+    if (musicCooldown_<=0) {
+        if (const char* track=choose()) {
+            musicWasPlaying_=playZoneMusic(track);
+            if (!musicWasPlaying_) musicCooldown_=2.0f;
+        }
+        else musicCooldown_=5.f;
     }
 }
 

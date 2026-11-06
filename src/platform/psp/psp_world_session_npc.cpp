@@ -397,6 +397,17 @@ std::string lowerAscii(std::string s) {
 
 bool WorldSession::handleNpcPacket(LogicalOpcode op, network::Packet& packet) {
     if (state_ != State::InWorld) return false;
+    // Late greeting/item replies refresh visible text; movement does not.
+    switch(op) {
+        case LogicalOpcode::SMSG_GOSSIP_MESSAGE:
+        case LogicalOpcode::SMSG_QUESTGIVER_QUEST_LIST:
+        case LogicalOpcode::SMSG_GOSSIP_COMPLETE:
+        case LogicalOpcode::SMSG_NPC_TEXT_UPDATE:
+        case LogicalOpcode::SMSG_QUESTGIVER_QUEST_DETAILS:
+        case LogicalOpcode::SMSG_QUESTGIVER_REQUEST_ITEMS:
+        case LogicalOpcode::SMSG_QUESTGIVER_OFFER_REWARD: ++npcDialogVersion_;break;
+        default: break;
+    }
     switch (op) {
         // PSP: names for the NPC windows until task C's item cache (the
         // session's own handler below still gets the packet).
@@ -406,6 +417,15 @@ bool WorldSession::handleNpcPacket(LogicalOpcode op, network::Packet& packet) {
             if (game::ItemQueryResponseParser::parse(copy, d) && d.entry != 0 &&
                 (npcItems_.size() < kMaxItemInfos || npcItems_.count(d.entry))) {
                 NpcItemInfo& info = npcItems_[d.entry];
+                if(info.name!=d.name || info.quality!=d.quality) {
+                    auto contains=[&](const std::vector<game::QuestRewardItem>& items) {
+                        return std::any_of(items.begin(),items.end(),[&](const auto& item){return item.itemId==d.entry;});
+                    };
+                    if((questDetailsOpen_ && (contains(currentQuestDetails_.rewardItems)||contains(currentQuestDetails_.rewardChoiceItems))) ||
+                       (questRequestItemsOpen_ && contains(currentQuestRequestItems_.requiredItems)) ||
+                       (questOfferRewardOpen_ && (contains(currentQuestOfferReward_.fixedRewards)||contains(currentQuestOfferReward_.choiceRewards))))
+                        ++npcDialogVersion_;
+                }
                 info.name = d.name;
                 info.quality = d.quality;
                 info.sellPrice = d.sellPrice;
@@ -645,8 +665,9 @@ bool WorldSession::handleNpcPacket(LogicalOpcode op, network::Packet& packet) {
                     const uint32_t required = quest.requiredItemCounts.count(itemId) != 0
                                                   ? quest.requiredItemCounts[itemId]
                                                   : std::numeric_limits<uint32_t>::max();
-                    const uint32_t current = quest.itemCounts[itemId];
-                    quest.itemCounts[itemId] = current >= required - std::min(required, count) ? required : current + count;
+                    // Bag packets can precede this notification. Adding the
+                    // delta again would double-count loot already reconciled.
+                    quest.itemCounts[itemId] = std::min(required,getInventory().countItem(itemId));
                     updatedAny = true;
                     const bool requiredKnown = required != std::numeric_limits<uint32_t>::max();
                     if (!requiredKnown || quest.itemCounts[itemId] >= required) maybeCompletedObjective = true;
@@ -1392,6 +1413,27 @@ bool WorldSession::resyncQuestLogFromServerSlots(bool forceQueryMetadata) {
 
 // upstream applyQuestStateFromFields(lastPlayerFields): the PSP's own-player
 // field store is selfFields_ (the combat block keeps it).
+// Collect-item progress is the current bag contents, not a history of loot
+// notifications. Reconcile on bag rebuilds and when query metadata arrives.
+void WorldSession::syncQuestItemCountsFromInventory() {
+    std::unordered_map<uint32_t,uint32_t> counts;
+    bool changed=false;
+    for (auto& quest : questLog_) {
+        for (const auto& objective : quest.itemObjectives) {
+            if (!objective.itemId || !objective.required) continue;
+            auto it=counts.find(objective.itemId);
+            if (it==counts.end()) it=counts.emplace(objective.itemId,getInventory().countItem(objective.itemId)).first;
+            const uint32_t have=std::min(it->second,objective.required);
+            auto previous=quest.itemCounts.find(objective.itemId);
+            const uint32_t before=previous==quest.itemCounts.end() ? 0u : previous->second;
+            changed=changed || ((before>=objective.required)!=(have>=objective.required));
+            quest.itemCounts[objective.itemId]=have;
+            quest.requiredItemCounts[objective.itemId]=objective.required;
+        }
+    }
+    if (changed) requeryNearbyQuestGiverStatus();
+}
+
 void WorldSession::applyQuestStateFromFields() {
     const uint16_t start = game::fieldIndex(game::UF::PLAYER_QUEST_LOG_START);
     if (start == 0xFFFF) return;
@@ -1590,6 +1632,7 @@ void WorldSession::handleQuestQueryResponse(network::Packet& packet) {
                      static_cast<unsigned>(q.description.size()));
         break;
     }
+    syncQuestItemCountsFromInventory();
     pendingQuestQueryIds_.erase(questId);
 }
 

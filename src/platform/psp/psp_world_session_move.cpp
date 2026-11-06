@@ -167,12 +167,21 @@ void WorldSession::handleMonsterMove(network::Packet& packet) {
             return;
         }
     }
-    if (playerGuid_ != 0 && data.guid == playerGuid_) {  // our own spline (the flight)
-        taxiOwnMonsterMove(data);
-        return;
+    const bool own=playerGuid_!=0 && data.guid==playerGuid_;
+    if(own && (onTaxiFlight_ || taxiActivatePending_ || taxiClientActive_)) {
+        ownForcedMove_=false;taxiOwnMonsterMove(data);return;
     }
-    auto entity = entities_.getEntity(data.guid);
+    if(own && !ownForcedEntity_)ownForcedEntity_=std::make_shared<game::Entity>(playerGuid_);
+    auto entity = own ? ownForcedEntity_ : entities_.getEntity(data.guid);
     if (!entity) return;
+    if(own) {
+        // The local player is normally driven by the stick, but Charge and
+        // similar server splines must start at the packet's authoritative point.
+        const auto start=core::coords::serverToCanonical(glm::vec3(data.x,data.y,data.z));
+        entity->setPosition(start.x,start.y,start.z,entity->getOrientation());
+        ownForcedMove_=data.hasDest || data.moveType==1 || data.moveType==3 || data.moveType==4;
+        PSP_LOGI(tag::Net,"self_spline type=%u ms=%u points=%u",static_cast<unsigned>(data.moveType),static_cast<unsigned>(data.duration),static_cast<unsigned>(data.waypoints.size()));
+    }
     ++monsterMoves_;
 
     noteSplineGait(data);  // PSP: npc-walk - Walk or Run, the animation rate
@@ -246,6 +255,20 @@ void WorldSession::handleMonsterMove(network::Packet& packet) {
                  (unitMoveFlags(data.guid) & kFlag(game::MovementFlags::WALKING)) ? 1 : 0,
                  static_cast<unsigned>(monsterMoves_), static_cast<unsigned>(data.splineFlags),  // walk/run
                  static_cast<double>(unitSplineSpeed(data.guid)), static_cast<double>(unitWalkSpeed(data.guid)));
+}
+
+bool WorldSession::takeForcedMovement(glm::vec3& position,float& facing,bool& moving) {
+    if(!ownForcedMove_)return false;
+    if(teleportPending_ || onTaxiFlight_ || inVehicle()) {ownForcedMove_=false;return false;}
+    const auto entity=ownForcedEntity_;
+    if(!entity){ownForcedMove_=false;return false;}
+    moving=entity->isActivelyMoving();
+    const glm::vec3 canonical=moving?glm::vec3(entity->getX(),entity->getY(),entity->getZ()):
+        glm::vec3(entity->getLatestX(),entity->getLatestY(),entity->getLatestZ());
+    position=core::coords::canonicalToServer(canonical);
+    facing=core::coords::canonicalToServerYaw(entity->getOrientation());
+    if(!moving)ownForcedMove_=false; // publish the exact endpoint once before releasing controls
+    return true;
 }
 
 // upstream MovementHandler::handleCompressedMoves.

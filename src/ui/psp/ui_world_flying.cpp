@@ -21,6 +21,7 @@
 // terrain's MH2O levels in sounds.pak's grids (no WMO liquids: city canals); no ceiling collision; the climb's
 // vertical speed = the mode's speed.
 #include "ui/psp/ui_world_screen.hpp"
+#include "rendering/psp/psp_collision_math.hpp"
 
 #include "platform/psp/psp_flight_rules.hpp"
 #include "platform/psp/psp_log.hpp"
@@ -112,6 +113,7 @@ bool WorldScreen::flightMovement(const pp::PadState& pad, float dtSec) {
         vz_ = 0.0f;
         jumpVelocity_ = 0.0f;
         fallStartMs_ = nowMs;
+        fallStartZ_ = playerZ_;
     };
 
     // The server's toggles since the last frame (the session has ACKed them).
@@ -151,7 +153,11 @@ bool WorldScreen::flightMovement(const pp::PadState& pad, float dtSec) {
     const bool swimmingNow = (flyFlags_ & fr::kSwimming) != 0;
     const bool water =
         fr::inWater(haveLiquid, liquid, playerZ_, haveFloor, floorUnder, swimmingNow) && !transportRiding();
-    if (!swimmingNow && water) {
+    // Jumping out of the water: the feet start ~1.45 yd under the surface, so for the first moments of the jump
+    // they are still "in the water". Do not start a new swim while the jump is still rising (it looped
+    // JUMP / START_SWIM every frame at the surface).
+    const bool risingJump = airborne_ && vz_ > 0.0f;
+    if (!swimmingNow && water && !risingJump) {
         flyFlags_ = (flyFlags_ & ~(fr::kFlying | kClimb)) | fr::kSwimming;  // a flight ends in the water
         airborne_ = false;
         vz_ = 0.0f;
@@ -170,6 +176,7 @@ bool WorldScreen::flightMovement(const pp::PadState& pad, float dtSec) {
             vz_ = mountActive_ ? 6.0f : 7.96f;  // as the ground jump (updateMovement)
             jumpVelocity_ = vz_;
             fallStartMs_ = nowMs;
+            fallStartZ_ = playerZ_;
             if (!mountActive_) animator_.onEvent(rendering::AnimEvent::JUMP);
             moving_ = wantMove_;
             sendMove(game::Opcode::MSG_MOVE_JUMP, wantMove_);
@@ -234,7 +241,8 @@ bool WorldScreen::flightMovement(const pp::PadState& pad, float dtSec) {
                             : (nowForward ? 1.0f : 0.0f) - (nowBackward ? 1.0f : 0.0f);
     const float side = stick ? moveX_
                              : ((pad.held & PSP_CTRL_CIRCLE) ? 1.0f : 0.0f) - ((pad.held & PSP_CTRL_SQUARE) ? 1.0f : 0.0f);
-    const float yawBase = stickAutorun ? facing_ : camYaw_;
+    const float yawBase = reverseStickTurn_.basis(camYaw_,facing_,stickAutorun,
+        stick && camSmartFollow_ && camFollow_,moveX_,moveY_,(lastRawHeld_ & PSP_CTRL_RTRIGGER)!=0);
     const glm::vec2 fdir(std::cos(yawBase), std::sin(yawBase));
     const glm::vec2 rdir(fdir.y, -fdir.x);
     glm::vec2 dir = fdir * fwd + rdir * side;
@@ -295,11 +303,22 @@ bool WorldScreen::flightMovement(const pp::PadState& pad, float dtSec) {
     // structure's floor is there - a tunnel), a swimmer stays under the surface.
     glm::vec3 wallTo(to.x, to.y, playerZ_);
     if (to.x != playerX_ || to.y != playerY_) {
-        models_.collideWalls(wallTo, playerZ_);
-        bigWmoWalls(wallTo, playerZ_);
-        transportWalls(wallTo, playerZ_);
-        float tz0 = 0.0f;
-        if (!(terrain_.heightAt(wallTo.x, wallTo.y, tz0) || wmoOnly_ || transportRiding())) {
+        const glm::vec2 delta(wallTo.x - playerX_, wallTo.y - playerY_);
+        const float travel = glm::length(delta);
+        const auto slices = rendering::psp::movementSlices(dtSec, dtSec > 0 ? travel / dtSec : 0);
+        const float fraction = dtSec > 0 ? slices.dt / dtSec : 0;
+        wallTo.x = playerX_;
+        wallTo.y = playerY_;
+        for (int i = 0; i < slices.count; ++i) {
+            glm::vec3 next(wallTo.x + delta.x * fraction, wallTo.y + delta.y * fraction, playerZ_);
+            if (!collisionReadyAt(next.x, next.y, playerZ_)) break;
+            models_.collideWalls(next, playerZ_);
+            bigWmoWalls(next, playerZ_);
+            transportWalls(next, playerZ_);
+            if (!collisionReadyAt(next.x, next.y, playerZ_)) break;
+            wallTo = next;
+        }
+        if (!(terrain_.tileLoadedAt(wallTo.x, wallTo.y) || wmoOnly_ || transportRiding())) {
             wallTo.x = playerX_;  // off the loaded tiles: stay
             wallTo.y = playerY_;
         }

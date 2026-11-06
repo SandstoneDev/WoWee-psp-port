@@ -243,7 +243,7 @@ bool WorldScreen::drawPaperDoll(UiRenderer& ui, bool focusable) {
         const Rect pr{PX(7), PY(6), 60 * kSX, 60 * kSY};
         const int race = me ? static_cast<int>(me->race) : 0, sex = me && me->gender == game::Gender::FEMALE ? 1 : 0;
         // Round, as SetPortraitTexture.
-        if (race > 0 && race < 12 && ufArt_.portrait[race][sex].pixels) ui.imageCircle(ufArt_.portrait[race][sex], pr);
+        if (race > 0 && race < 12 && ownPortrait(race,sex).pixels) ui.imageCircle(ownPortrait(race,sex), pr);
         else ui.fillCircle(Rect{pr.x + 2, pr.y + 2, pr.w - 4, pr.h - 4}, 0xFF101010u);
     }
     ui.image(pdArt_.frame, Rect{kOx, kOy, kFrameW, kFrameH});

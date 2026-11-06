@@ -23,13 +23,13 @@ namespace wowee::ui::psp {
 inline bool lifeWalks(int life) { return life != 1; }
 
 // world_flush: whether a teleport from (ox, oy) to (nx, ny) (server coordinates, yards) leaves the
-// stream window - the new window of (2 * radius + 1)^2 tiles shares no tile with the old one (tile = floor(32 - y /
-// 533.33), floor(32 - x / 533.33), as TileStreamer). Then everything streamed for the old place can go at once.
+// stream window: the destination tile was outside the old window, even if the windows share edge tiles.
+// Release the old scene so the new landing tile has room to load.
 inline bool teleportLeavesWindow(float ox, float oy, float nx, float ny, int radius) {
     constexpr float kTile = 533.33333f;
     const int otx = static_cast<int>(std::floor(32.0f - oy / kTile)), oty = static_cast<int>(std::floor(32.0f - ox / kTile));
     const int ntx = static_cast<int>(std::floor(32.0f - ny / kTile)), nty = static_cast<int>(std::floor(32.0f - nx / kTile));
-    return std::abs(ntx - otx) > 2 * radius || std::abs(nty - oty) > 2 * radius;
+    return std::abs(ntx - otx) > radius || std::abs(nty - oty) > radius;
 }
 
 struct TeleportHoldState {
@@ -37,6 +37,7 @@ struct TeleportHoldState {
     bool doodadsLoaded = false;  // the doodads of that tile are in (or it has none)
     bool insideBigWmo = false;   // the position is inside a big WMO's box
     bool wmoReady = false;       // that WMO is open and its collision around the player resident
+    bool objectCollisionReady = true;  // pending static, game-object or transport collision near the landing
     bool floorNear = false;      // a floor within 2 yd below the server's height (or 0.6 above) exists now
 };
 
@@ -44,8 +45,10 @@ enum class TeleportHoldWhy : uint8_t { kHold = 0, kFloor, kTimeout };
 
 inline TeleportHoldWhy teleportHoldDecide(const TeleportHoldState& s, uint32_t elapsedMs, uint32_t holdMs) {
     const bool timeout = elapsedMs >= holdMs;
-    if (s.insideBigWmo && !s.wmoReady) return timeout ? TeleportHoldWhy::kTimeout : TeleportHoldWhy::kHold;
-    if (s.floorNear) return TeleportHoldWhy::kFloor;
+    if (!s.objectCollisionReady || (s.insideBigWmo && !s.wmoReady)) return timeout ? TeleportHoldWhy::kTimeout : TeleportHoldWhy::kHold;
+    // Nearby terrain is not proof that an inn/house floor has loaded. Let
+    // its initial geometry arrive before snapping below the server landing Z.
+    if (s.floorNear && (s.insideBigWmo || s.doodadsLoaded)) return TeleportHoldWhy::kFloor;
     if (s.terrainLoaded && s.doodadsLoaded) return TeleportHoldWhy::kFloor;  // nothing at that height: a real fall
     return timeout ? TeleportHoldWhy::kTimeout : TeleportHoldWhy::kHold;
 }

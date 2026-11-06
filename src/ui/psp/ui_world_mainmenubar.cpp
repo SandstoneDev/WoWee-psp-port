@@ -23,6 +23,7 @@
 //     the original's cost and checks from spells.pak "suse" (ManaCostPercentage, the form, the aura states,
 //     the reagents) - see actionUsable().
 #include "ui/psp/ui_world_screen.hpp"
+#include "ui/psp/ui_psp_layout.hpp"
 
 #include "game/update_field_table.hpp"
 #include "platform/psp/psp_config.hpp"
@@ -135,7 +136,12 @@ bool formAllows(const pp::SpellInfo& si, uint8_t form, const pp::SpellDb& db) {
 
 WorldScreen::MmbArt::~MmbArt() { pp::textureRelease(tex); }
 
+Rect WorldScreen::hudXpRect() const {
+    return pspLayoutActive()?psp_layout::xp():Rect{kBarX,kXpY,kBarW,kXpH};
+}
+
 Rect WorldScreen::mmbButton(int i) const {
+    if(pspLayoutActive())return psp_layout::action(i);
     // ActionButton1: BOTTOMLEFT 8,4 of MainMenuBarArtFrame; ActionButtonN: LEFT of N-1's RIGHT +6 (36 wide).
     return Rect{kBarX + (8.0f + 42.0f * static_cast<float>(i)) * kS, kBottom - 40.0f * kS, 36.0f * kS, 36.0f * kS};
 }
@@ -180,9 +186,9 @@ void WorldScreen::updateXpView() {
     v.maxLevelBar = level >= kMaxPlayerLevel;
     if (v.shown && v.rested > 0) {
         const float tickSet = std::max((static_cast<float>(v.cur) + static_cast<float>(v.rested)) /
-                                           static_cast<float>(v.max) * kBarW,
+                                           static_cast<float>(v.max) * hudXpRect().w,
                                        0.0f);
-        if (!(tickSet > kBarW)) {
+        if (!(tickSet > hudXpRect().w)) {
             v.tick = true;
             v.tickX = tickSet;
         }
@@ -199,39 +205,48 @@ void WorldScreen::drawMainMenuBarArt(UiRenderer& ui) {
     if (!spellsInit_ || settings_.isOpen() || fxHides(kFxHideBar)) return;
     updateXpView();
     const XpView& v = xpView_;
+    const Rect strip=hudXpRect();
+    const float scale=pspLayoutActive()?psp_layout::barScale:1.f;
+    const float barX=strip.x,barW=strip.w,xpY=strip.y,xpH=strip.h;
+    const float capScale=pspLayoutActive()?.75f:1.f;
+    auto y=[&](float classicY){return kBottom-(kBottom-classicY)*scale;};
     const pp::Texture& t = mmbArt_.tex;
     const bool art = t.pixels != nullptr;
     if (v.shown) {
-        ui.fill(Rect{kBarX, kXpY, kBarW, kXpH}, 0x80000000u);  // BACKGROUND: black 0.5
+        ui.fill(Rect{barX, xpY, barW, xpH}, 0x80000000u);  // BACKGROUND: black 0.5
         if (v.tick && v.tickX > 0.0f)                            // ExhaustionLevelFillBar (BORDER), alpha 0.15
-            ui.fill(Rect{kBarX, kXpY, v.tickX, kXpH}, (xpColor_ & 0x00FFFFFFu) | 0x26000000u);
+            ui.fill(Rect{barX, xpY, v.tickX, xpH}, (xpColor_ & 0x00FFFFFFu) | 0x26000000u);
         const float f = std::clamp(static_cast<float>(v.cur) / static_cast<float>(v.max), 0.0f, 1.0f);
         if (f > 0.0f) {  // the StatusBar (UI-StatusBar, BarColor)
-            const Rect fill{kBarX, kXpY, kBarW * f, kXpH};
+            const Rect fill{barX, xpY, barW * f, xpH};
             if (ufArt_.bar.pixels)
                 ui.image(ufArt_.bar, fill, SrcRect{0, 0, ufArt_.bar.uw * f, static_cast<float>(ufArt_.bar.uh)}, xpColor_);
             else
                 ui.fill(fill, xpColor_);
         }
         if (art) {  // OVERLAY: MainMenuXPBarTexture0/1
-            ui.image(t, Rect{kBarX, kXpOverY, 128, 5}, kSrcXp[0]);
-            ui.image(t, Rect{kBarX + 128, kXpOverY, 128, 5}, kSrcXp[1]);
+            ui.image(t, Rect{barX,xpY,128*scale,5*scale}, kSrcXp[0]);
+            ui.image(t, Rect{barX+128*scale,xpY,128*scale,5*scale}, kSrcXp[1]);
         }
     } else if (v.maxLevelBar && art) {
-        ui.image(t, Rect{kBarX, kMaxY, 128, 4}, kSrcMax[0]);
-        ui.image(t, Rect{kBarX + 128, kMaxY, 128, 4}, kSrcMax[1]);
+        ui.image(t, Rect{barX,y(kMaxY),128*scale,4*scale}, kSrcMax[0]);
+        ui.image(t, Rect{barX+128*scale,y(kMaxY),128*scale,4*scale}, kSrcMax[1]);
     }
     if (!art) return;
     // MainMenuBarArtFrame (raised over the XP bar): the slots, then the end caps (OVERLAY).
-    ui.image(t, Rect{kBarX, kArtY, 128, 22}, kSrcBar[0]);
-    ui.image(t, Rect{kBarX + 128, kArtY, 128, 22}, kSrcBar[1]);
-    ui.image(t, Rect{kCapLX, kCapY, 64, 38}, kSrcCapL);
-    ui.image(t, Rect{kCapRX, kCapY, 64, 38}, kSrcCapR);
+    ui.image(t, Rect{barX,y(kArtY),128*scale,22*scale}, kSrcBar[0]);
+    ui.image(t, Rect{barX+128*scale,y(kArtY),128*scale,22*scale}, kSrcBar[1]);
+    ui.image(t, Rect{barX-48*capScale,kBottom-38*capScale,64*capScale,38*capScale}, kSrcCapL);
+    ui.image(t, Rect{barX+barW-16*capScale,kBottom-38*capScale,64*capScale,38*capScale}, kSrcCapR);
 }
 
 // After the action buttons ("spells" pass): ExhaustionTick and MainMenuBarExpText (DIALOG strata, over the
 // buttons), the cursor stops of the bar and the tick.
 void WorldScreen::drawMainMenuBarOverlay(UiRenderer& ui) {
+    const Rect strip=hudXpRect();
+    const float barX=strip.x,barW=strip.w,xpY=strip.y,xpH=strip.h;
+    const float tickY=pspLayoutActive()?strip.y-4:kTickY;
+    const float textY0=pspLayoutActive()?strip.y:kTextY0;
     xpTip_ = 0;
     const XpView& v = xpView_;
     if (!v.shown) {
@@ -239,10 +254,10 @@ void WorldScreen::drawMainMenuBarOverlay(UiRenderer& ui) {
         return;
     }
     const bool clickable = uiMode_ && !settings_.isOpen();
-    const bool barFocus = clickable && winFocus_.addStop(kIdXpBar, Rect{kBarX, kXpY, kBarW, kXpH});
+    const bool barFocus = clickable && winFocus_.addStop(kIdXpBar, Rect{barX, xpY, barW, xpH});
     bool tickFocus = false;
     if (v.tick) {
-        const Rect r{std::floor(kBarX + v.tickX - 8.0f + 0.5f), kTickY, 16, 16};
+        const Rect r{std::floor(barX + v.tickX - 8.0f + 0.5f), tickY, 16, 16};
         if (clickable) tickFocus = winFocus_.addStop(kIdXpTick, r);
         if (mmbArt_.tex.pixels) {
             ui.image(mmbArt_.tex, r, kSrcTick);
@@ -260,8 +275,8 @@ void WorldScreen::drawMainMenuBarOverlay(UiRenderer& ui) {
                       static_cast<unsigned>(v.max));
         const Font& tiny = kit_.font(kFontTiny);
         const float capH = std::round(static_cast<float>(tiny.pixelSize()) * 0.72f);  // as the unit frames' bars
-        const float y = std::floor(kTextY0 + (kTextH - capH) * 0.5f + capH - static_cast<float>(tiny.ascent()) + 0.5f);
-        ui.textShadow(tiny, kBarX + kBarW * 0.5f, y, line, kColWhite, Align::Center);
+        const float y = std::floor(textY0 + (kTextH - capH) * 0.5f + capH - static_cast<float>(tiny.ascent()) + 0.5f);
+        ui.textShadow(tiny, barX + barW * 0.5f, y, line, kColWhite, Align::Center);
     }
     // ExhaustionTick.timer = 1 on the bar's OnEnter -> ExhaustionToolTipText after 1 s; the tick's OnEnter at once.
     const uint32_t now = pp::logUptimeMs();
@@ -284,6 +299,8 @@ void WorldScreen::drawXpTooltip(UiRenderer& ui) {
         return;
     }
     const XpView& v = xpView_;
+    const Rect strip=hudXpRect();
+    const float tickY=pspLayoutActive()?strip.y-4:kTickY;
     const RestState& rs = kRestStates[v.state <= 6 ? v.state : 0];
     const int percentXp = static_cast<int>(std::ceil(static_cast<double>(v.cur) / static_cast<double>(v.max) * 100.0));
     char xpText[48];
@@ -311,12 +328,12 @@ void WorldScreen::drawXpTooltip(UiRenderer& ui) {
     const int lines = append ? 4 : 3;
     Rect r{0, 0, w + 16.0f, lh * static_cast<float>(lines) + 10.0f};
     if (v.tick) {
-        const float tx = std::floor(kBarX + v.tickX - 8.0f + 0.5f);
+        const float tx = std::floor(strip.x + v.tickX - 8.0f + 0.5f);
         r.x = tx + 8.0f >= pp::kScreenW * 0.5f ? tx - r.w : tx + 16.0f;  // ANCHOR_LEFT / ANCHOR_RIGHT
-        r.y = kTickY - r.h;
+        r.y = tickY - r.h;
     } else {
         r.x = pp::kScreenW - 4.0f - r.w;
-        r.y = kXpY - 1.0f - r.h;
+        r.y = strip.y - 1.0f - r.h;
     }
     r.x = std::max(2.0f, std::min(r.x, pp::kScreenW - 2.0f - r.w));
     r.y = std::max(2.0f, r.y);

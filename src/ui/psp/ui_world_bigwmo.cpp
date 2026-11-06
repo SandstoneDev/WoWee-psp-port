@@ -24,6 +24,7 @@
 #include "platform/psp/psp_pak.hpp"
 #include "platform/psp/psp_prof.hpp"
 #include "rendering/psp/psp_bigwmo.hpp"
+#include "rendering/psp/psp_collision_stream_policy.hpp"
 
 #include <pspkernel.h>
 
@@ -182,9 +183,11 @@ void WorldScreen::loadBigWmoIndex(pp::Pak& pak) {
     s.cfg.lod.shellDistance = static_cast<float>(std::clamp(pp::configGetInt("wmoshell", 160), 50, 2000));
     s.cfg.visMode = std::clamp(pp::configGetInt("wmovis", rp::PortalVisibility::kVisWalkExt), 0, 4);
     s.cfg.lod.viewDistance = static_cast<float>(std::clamp(pp::configGetInt("wmoview", 450), 50, 2000));
-    s.cfg.collisionYd = static_cast<float>(std::clamp(pp::configGetInt("wmocolyd", 40), 10, 200));
+    s.cfg.collisionYd = static_cast<float>(std::clamp(pp::configGetInt("wmocolyd", 10), 4, 10));
     s.cfg.doodadYd = static_cast<float>(std::clamp(pp::configGetInt("wmodoodadyd", 160), 0, 600));
     s.cfg.portals = pp::configGetInt("wmoportals", 1) != 0;
+    s.cfg.frontToBack = pp::configGetInt("wmofrontsort", 1) != 0;
+    PSP_LOGI(pp::tag::Gfx,"wmo_draw_order front_to_back=%d depth_band=32",s.cfg.frontToBack?1:0);
     s.cfg.texLodBytes = static_cast<uint32_t>(std::max(0, pp::configGetInt("wmotexlod", 16))) * 1024u;
     s.cfg.prefetchSec = static_cast<float>(std::clamp(pp::configGetInt("wmoprefetch", 15), 0, 100)) * 0.1f;
     s.doodadsOn = pp::configGetInt("wmodoodads", 1) != 0;
@@ -244,27 +247,37 @@ void WorldScreen::updateBigWmos(float dtSec) {
     // Open the nearest within reach (at most kMaxOpen; the nearest first - was the first by index
     // -, one while descriptors are short; a pak missing or bad is never tried again, one that failed for want of a
     // descriptor / memory / a read 5 s later - was: any failure hid the WMO until the game restarted).
-    while (s.open.size() < (s.fdTight ? 1u : kMaxOpen)) {
+    while (s.open.size() < kMaxOpen) {
         int pick = -1;
         float pickYd = reach;
+        float pickPriority = 1e30f;
         for (uint32_t pi = 0; pi < s.placements.size(); ++pi) {
             if (s.dead[pi] || !due(s.openRetryMs[pi], now)) continue;
             bool already = false;
             for (const auto& in : s.open) already = already || in.placement == pi;
-            const float yd = already ? 1e30f : boxYards(s.placements[pi], cam);
+            const float yd = already ? 1e30f : std::min(boxYards(s.placements[pi], cam), boxYards(s.placements[pi], player));
             if (!already && yd > reach) s.farWaitSinceMs[pi] = 0;  // out of reach - its wait starts over
-            if (s.govCut && yd > 0.0f) continue;  // the governor's step 3 - only the one the camera is in
-            if (yd <= pickYd) {
+            const float playerYd=boxYards(s.placements[pi],player);
+            const bool required=playerYd<=rp::kCollisionMandatoryRadius;
+            if (!rp::collisionOwnerOpenAllowed(s.fdTight,static_cast<uint32_t>(s.open.size()),kMaxOpen,required)) continue;
+            const float priority=required ? playerYd : 10000.0f+yd;
+            if (s.govCut && yd > 0.0f && !required) continue;  // the governor's step 3 - only the one the camera is in
+            if (!already && yd<=reach && priority<pickPriority) {
+                pickPriority = priority;
                 pickYd = yd;
                 pick = static_cast<int>(pi);
             }
         }
         if (pick < 0) break;
         const uint32_t pi = static_cast<uint32_t>(pick);
+        if (s.fdTight) {
+            for (auto& existing:s.open)
+                if (!existing.wmo->inFlight()) existing.wmo->releaseFd();
+        }
         // from outside its box - not at world entry, and only with room to spare (asked again in 5 s).
         // wmofarkb of headroom (pieces of <= 512 KB, one 1 MB block) - but after wmofarwait s of
         // waiting the near reserve (wmoreserve) is enough: the lowest priority waits for room, never forever.
-        if (pickYd > 0.0f) {
+        if (pickYd > 0.0f && boxYards(s.placements[pi],player)>rp::kCollisionMandatoryRadius) {
             uint32_t& since = s.farWaitSinceMs[pi];
             const uint32_t waited = since ? now - since : 0u;
             pp::FarWmoRule rule;
@@ -400,7 +413,7 @@ void WorldScreen::updateBigWmos(float dtSec) {
         }
     }
     // Low memory (hardware: ~44 MB heap, ~43 used at world entry): a probe of wmoreserve KB, as the tile
-    // streamer's streamreserve, twice a second. While it fails: no new reads, and the budget drops to what is
+    // streamer's streamreserve, twice a second. While it fails: only essential collision reads, and the budget drops to what is
     // resident minus 256 KB (the plan evicts the furthest); it comes back when the probe passes.
     if (now >= s.nextProbeMs) {
         s.nextProbeMs = now + 500;
@@ -424,7 +437,8 @@ void WorldScreen::updateBigWmos(float dtSec) {
         // (no chunk, no shell) for 5 s keeps only its header + 256 KB - the rest goes by the LRU below; in sight again,
         // its budget is back the next frame (the chunks come with the reads, as at its opening).
         const rp::BigWmoStats& ws = w.stats();
-        const bool blank = ws.outside && ws.chunks == 0 && ws.shellCells == 0 && !tpHold_.active;
+        const bool blank = ws.outside && ws.chunks == 0 && ws.shellCells == 0 && !tpHold_.active &&
+                           boxYards(s.placements[in.placement], player) > 0.0f;
         if (!blank) in.blankSinceMs = 0;
         else if (!in.blankSinceMs) in.blankSinceMs = now | 1u;
         const bool idleBlank = in.blankSinceMs && now - in.blankSinceMs > 5000u;
@@ -435,10 +449,12 @@ void WorldScreen::updateBigWmos(float dtSec) {
             w.cfg.budgetBytes = s.cfg.budgetBytes;
         }
         if (idleBlank) w.cfg.budgetBytes = std::min(w.cfg.budgetBytes, ws.headerBytes + 256u * 1024u);
-        // The landing hold waits for this WMO's floor - its reads go past the low-memory gate.
+        // Walking can wait for collision too. Stopping every read under pressure
+        // deadlocks that wait; admit essential nearby collision, defer cosmetics.
         const bool landing = tpHold_.active;
-        const uint32_t room = s.lowMem && !landing ? 0u : (inFlight < s.maxReads ? s.maxReads - inFlight : 0u);
-        w.update(cam, player, dtSec, s.frame, s.reqs, room);
+        const uint32_t room = inFlight < s.maxReads ? s.maxReads - inFlight : 0u;
+        w.setCollisionProbe(collisionWaitReason_==3 ? &collisionProbe_ : nullptr);
+        w.update(cam, player, dtSec, s.frame, s.reqs, room, s.lowMem && !landing);
         if (!s.reqs.empty() && !w.ensureFd()) {
             // No descriptor now (hardware: 3-4 free): the reads wait for the next plan (cancel - no
             // read failed, no back-off; ensureFd tries the card at most once a second).
@@ -478,7 +494,11 @@ void WorldScreen::updateBigWmos(float dtSec) {
 
     // Doodads: a new set when the resident doodad cells changed (at most once a second), its models read ahead.
     // not while memory is low (the set shown stays; tried again when the probe passes).
-    if (s.doodadsOn && !s.govCut && dpak && s.nextDirty && !s.nextBuilding && now >= s.nextAtMs && !s.lowMem) {
+    if (now >= s.nextAtMs) {
+        for (const auto& in:s.open)
+            if (in.wmo->tables().h->reserved) {s.nextDirty=true;break;}
+    }
+    if (s.doodadsOn && dpak && s.nextDirty && !s.nextBuilding && now >= s.nextAtMs && !s.lowMem) {
         s.nextDirty = false;
         s.nextAtMs = now + 1000;
         s.next.clear();
@@ -492,7 +512,7 @@ void WorldScreen::updateBigWmos(float dtSec) {
                 rp::DoodadPlacement p{};
                 p.uniqueId = rp::bigWmoPartId(w.uniqueId(), 0x20000u + d.index);
                 p.model = d.model;
-                p.reserved = d.group == 0xFFFF ? 0 : static_cast<uint16_t>(std::min<uint32_t>(in.groupBase + d.group + 1u, 0xFFFFu));
+                p.reserved = (d.flags & 1u) || d.group == 0xFFFF ? 0 : static_cast<uint16_t>(std::min<uint32_t>(in.groupBase + d.group + 1u, 0xFFFFu));
                 const glm::vec3 pos = glm::vec3(M * glm::vec4(d.position[0], d.position[1], d.position[2], 1.0f));
                 const glm::mat3 ax = A * glm::mat3(glm::vec3(d.axes[0], d.axes[1], d.axes[2]), glm::vec3(d.axes[3], d.axes[4], d.axes[5]),
                                                    glm::vec3(d.axes[6], d.axes[7], d.axes[8]));
@@ -504,9 +524,15 @@ void WorldScreen::updateBigWmos(float dtSec) {
                 p.sphere[1] = sc3.y;
                 p.sphere[2] = sc3.z;
                 p.sphere[3] = d.sphere[3] * sc;
+                if ((d.flags & 1u) && glm::distance(glm::vec2(pos), glm::vec2(player)) > 160.0f+p.sphere[3]) return;
                 s.next.push_back(p);
-            });
+            }, s.govCut);
         }
+        const bool unchanged=s.next.size()==s.placed.size() && std::equal(s.next.begin(),s.next.end(),s.placed.begin(),
+            [](const rp::DoodadPlacement& a,const rp::DoodadPlacement& b){
+                return a.uniqueId==b.uniqueId && a.model==b.model && a.reserved==b.reserved;
+            });
+        if (!unchanged) {
         // Read ahead the models the doodad renderer does not have (their collision and impostors too).
         // queued and issued below as the loader has room (was: pushed at once - a full ring lost
         // the rest silently), under a generation (an abandoned read-ahead's results are freed) and its own park key.
@@ -548,6 +574,7 @@ void WorldScreen::updateBigWmos(float dtSec) {
         } else {
             s.nextBuilding = true;
         }
+    }
     }
     // the read-ahead goes out after the WMO's own reads (pushed above), at most kDoodadFlightBytes
     // in flight; a full ring keeps the rest queued for the next frame; low memory abandons it (its blobs freed).
@@ -622,25 +649,29 @@ void WorldScreen::updateBigWmos(float dtSec) {
                      U(st.headerBytes / 1024u), U(st.reads), U(st.evictions), U(st.overBudget), U(in.wmo->inFlight()),
                      in.wmo->fd(), U(pp::heapUsedKb()), U(st.guardSkipped), U(st.badBlobs),
                      s.fdTight ? 1 : 0);
-            // the interior groups' batches drawn by their baked light (no day/night tint) - a line of
-            // its own (bigwmo_frame is cut at the log's line length). inlit=1: some were drawn this frame.
+            PSP_LOGI(pp::tag::Gfx,"bigwmo_batch name=%s saved=%u cache_kb=%u",in.wmo->name(),
+                U(in.wmo->batchSaved()),U(in.wmo->batchCacheBytes()/1024u));
+            // Interior-group draw counts (courtyard01 is deliberately zone-tinted) - a line of its own because
+            // bigwmo_frame is cut at the log's line length. inlit=1: interior groups were drawn this frame.
             const int cg = st.camGroup;
             const bool camIn = cg >= 0 && static_cast<uint32_t>(cg) < in.wmo->tables().h->groupCount &&
                                (in.wmo->tables().groups[cg].flags & rp::kWmoGroupInterior) != 0;
             PSP_LOGI(pp::tag::Gfx, "bigwmo_light name=%s inlit=%d cam_in=%d in=%u tint=%u", in.wmo->name(),
                      st.interiorDraws ? 1 : 0, camIn ? 1 : 0, U(st.interiorDraws), U(st.tintedDraws));
+            PSP_LOGI(pp::tag::Gfx,"bigwmo_plan full=%u queue=%u local=%u candidates=%u",
+                     U(st.spatialPlans),U(st.queueRefreshes),U(st.collisionPlans),U(st.planCandidates));
         }
     }
 }
 
 // the memory governor's third step - the big WMOs'
-// doodads (both pseudo-tiles, the read-ahead) dropped and no new set built until it gives the step back (then the
-// next update builds one). The WMOs themselves stay (their budget is wmobudget). PSP only. KB freed (unloadTile).
+// optional doodads are dropped; the next safe update may rebuild only bounded nearby landmarks.
+// The WMOs themselves stay (their budget is wmobudget). PSP only. KB freed (unloadTile).
 uint32_t WorldScreen::bigWmoDoodadsGovernor(bool cut) {
     if (!bigWmo_) return 0;
     BigWmoState& s = *bigWmo_;
     s.govCut = cut;
-    s.nextDirty = true;  // given back: a set at the next update; cut: nothing is built meanwhile
+    s.nextDirty = true;  // next update: full set when restored, landmarks only while cut
     if (!cut) {
         PSP_LOGI(pp::tag::Mem, "bigwmo_doodads_governor on");
         return 0;
@@ -662,7 +693,8 @@ uint32_t WorldScreen::bigWmoDoodadsGovernor(bool cut) {
     for (size_t i = 0; i < s.open.size();) {
         rp::BigWmo& w = *s.open[i].wmo;
         const rp::BigWmoStats& st = w.stats();
-        if (st.outside && st.chunks == 0 && st.shellCells == 0 && w.inFlight() == 0) {
+        const bool playerInside = boxYards(s.placements[s.open[i].placement], glm::vec3(playerX_, playerY_, playerZ_)) <= 0.0f;
+        if (!playerInside && st.outside && st.chunks == 0 && st.shellCells == 0 && w.inFlight() == 0) {
             const uint32_t before = pp::heapUsedBytes();
             headerKb += st.headerBytes / 1024u;
             PSP_LOGI(pp::tag::Gfx, "bigwmo_close name=%s governor=1", w.name());
@@ -824,15 +856,24 @@ void WorldScreen::bigWmoLanding(float x, float y, float z, bool& inside, bool& r
     for (uint32_t pi = 0; pi < s.placements.size(); ++pi) {
         if (s.dead[pi] || boxYards(s.placements[pi], p) > 0.0f) continue;
         inside = true;
+        bool placementReady=false;
         for (const auto& in : s.open) {
             if (in.placement != pi) continue;
             uint32_t w = 0, r = 0;
-            ready = in.wmo->collisionReadyAt(x, y, 12.0f, w, r);
+            placementReady = in.wmo->collisionReadyAt(x, y, z, rp::kCollisionLandingRadius, w, r);
             wanted += w;
             resident += r;
-            if (!ready) return;
+            if (!placementReady) { ready=false; return; }
         }
-        if (!ready) return;  // not open yet (updateBigWmos opens the one the player is in without a probe)
+        if (!placementReady) {
+            ready=false;
+            const uint32_t now=pp::logUptimeMs();
+            if (now>=nextCollisionWaitLogMs_)
+                PSP_LOGW(pp::tag::Gfx,"collision_owner_wait pi=%u open=%u tight=%d",
+                         U(pi),U(s.open.size()),s.fdTight ? 1 : 0);
+            return;
+        } // not open yet
+        ready=true;  // updateBigWmos opens the player's WMO without a probe
     }
 }
 

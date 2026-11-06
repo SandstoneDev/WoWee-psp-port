@@ -16,8 +16,9 @@ namespace prof = wowee::platform::psp::prof;
 
 namespace {
 
-constexpr int skinnedType(int weights) {
-    return GU_WEIGHTS(weights) | GU_WEIGHT_8BIT | GU_TEXTURE_16BIT | GU_COLOR_5650 | GU_VERTEX_16BIT |
+constexpr int skinnedType(int weights, bool floatPosition, bool weights16) {
+    return GU_WEIGHTS(weights) | (weights16 ? GU_WEIGHT_16BIT : GU_WEIGHT_8BIT) | GU_TEXTURE_16BIT | GU_COLOR_5650 |
+           (floatPosition ? GU_VERTEX_32BITF : GU_VERTEX_16BIT) |
            GU_TRANSFORM_3D;
 }
 
@@ -155,15 +156,26 @@ uint32_t SkinDrawer::drawBatch(const SkinView& v, const ModelBatch& b, const Sce
         const SkinSubBatch& sb = v.subBatches[b.indexStart + k];
         if (sb.vertexCount < 3) continue;
         for (int j = 0; j < sb.weights; ++j) {
-            if (slotBone_[j] == sb.palette[j]) continue;
-            sceGuBoneMatrix(static_cast<unsigned>(j), &ge[sb.palette[j]]);
-            slotBone_[j] = sb.palette[j];
+            if (const auto* blend = v.paletteBlend(sb, static_cast<unsigned>(j))) {
+                ScePspFMatrix4 mixed;
+                static_assert(sizeof(mixed) == 16 * sizeof(float));
+                skinBlendPaletteMatrix(*blend, reinterpret_cast<const float*>(ge), 16,
+                                       reinterpret_cast<float*>(&mixed), 16);
+                sceGuBoneMatrix(static_cast<unsigned>(j), &mixed);
+                slotBone_[j] = -2;  // PSP: next ordinary slot must not reuse a virtual matrix
+            } else {
+                if (slotBone_[j] == sb.palette[j]) continue;
+                sceGuBoneMatrix(static_cast<unsigned>(j), &ge[sb.palette[j]]);
+                slotBone_[j] = sb.palette[j];
+            }
             ++boneUploads;
         }
         prof::count(prof::kDraws, 1);
         prof::count(prof::kVertices, sb.vertexCount);
         prof::count(prof::kTriangles, sb.vertexCount - 2u);
-        sceGuDrawArray(GU_TRIANGLE_STRIP, skinnedType(sb.weights), sb.vertexCount, nullptr, v.vertices(sb));
+        sceGuDrawArray(GU_TRIANGLE_STRIP, skinnedType(sb.weights, (v.h->flags & kSkinFloatPosition) != 0,
+                                                   (sb.reserved & kSkinWeights16) != 0),
+                       sb.vertexCount, nullptr, v.vertices(sb));
         tris += sb.vertexCount - 2u;
         ++draws;
     }

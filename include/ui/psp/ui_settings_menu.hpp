@@ -1,4 +1,4 @@
-// Graphics settings menu over the world (SELECT -> Menu -> Graphics).
+// Settings menu over the world (START -> Settings).
 //
 // Upstream: ui/settings_schema.hpp describes every setting once (SettingDesc:
 // key, label, kind, range, step, default, enabledWhen) and SettingsPanel
@@ -22,10 +22,12 @@
 #include "ui/psp/ui_kit.hpp"
 #include "ui/psp/ui_language.hpp"  // LanguageFrame
 #include "ui/settings_schema.hpp"
+#include "ui/psp/ui_settings_layout.hpp"
 
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace wowee::ui::psp {
 
@@ -41,19 +43,35 @@ struct GraphicsSettings {
     int npcmax = 24;         // nearest creatures drawn
     int terrainsharp = 0;    // floor mips: 0 AUTO, 1 by distance (sharp)
     int sharpdist = 120;     // yd of level 0 on the sharp floor
+    int classicfog = 1;     // classic low-distance horizon and authored fog density
     int terraindetail = 1;   // near detail pass
-    int framecap = 60;       // 30 or 60 fps
+    int graphicspreset = 5; // Low / Medium / High / Ultra / Custom / Adaptive
+    int adaptive30 = 1;     // adaptive detail at either FPS target; legacy config key retained
+    int framecap = 30;       // 30 or 60 fps
     int remotepredict = 1;   // other players predicted from the last packet (PSP)
     int perfhud = 0;         // fps and ping on screen, left of the minimap (PSP)
+    int worldhints = 1;      // PSP: action buttons over NPCs, targets, objects and loot
     int afksit = 300;        // s without input -> sit (0 = off)
     int targetall = 0;       // D-pad right cycles 0 = hostile units only (upstream Tab), 1 = every unit
     int autoloot = 0;        // AUTO_LOOT_DEFAULT_TEXT - loot without the window
     int musicvol = 30;       // Zone music volume, % (0 = off; was wowee.cfg only)
+    int spellfx = 1;        // off / you and pet / all casters
+    int spellfxreal = 1;    // basic / fancy
+    int levelupfx = 1;
+    int camfollow = 1;
+    int camsmartfollow = 0; // PSP: keep the owner's established stick/camera behavior by default.
+    int uinavigation = 1;
+    int barassignment = 1;
+    int brightness = 100;   // software scene adjustment, not LCD backlight
+    int water = 1, particles = 1, weather = 1;
+    int ambientvol = 35;
+    int weathervol = 35;
     int sfxvol = 100;        // Sounds - effects volume, % (psp_audio sfxSetVolume)
 };
 
 class SettingsMenu {
 public:
+    ~SettingsMenu();
     // wowee.cfg -> values, each clamped to its row's range.
     void load();
 
@@ -81,6 +99,10 @@ public:
     bool setValue(const char* key, int v);
 
 private:
+    void releaseArt();
+    bool openDropdown(size_t row);
+    bool updateDropdown(const platform::psp::PadState& pad,float dtSec);
+    bool commitValue(size_t row,int value);
     bool step(size_t row, int dir, bool wrap);
     bool rowEnabled(size_t row) const;
     void restoreDefaults();
@@ -95,7 +117,18 @@ private:
     bool updatePrompt(const platform::psp::PadState& pad, float dtSec);
     void drawPrompt(UiRenderer& ui, const UiKit& kit);
 
+    platform::psp::Texture headerArt_,borderArt_,dropBoxArt_,dropButtonArt_,dropButtonDownArt_,
+        dropHighlightArt_,dropBgArt_,checkArt_,checkboxArt_,categoryArt_,sliderBgArt_,sliderBorderArt_,sliderThumbArt_;
+    int dropdownRow_=-1,dropdownSelection_=0;
+    Rect dropdownAnchor_{};
+    bool artTried_=false;
+    std::vector<SettingsLayoutRow> layout_;
+    int layoutPage_=-1;
+    uint32_t layoutFontRevision_=~0u;
+    float scrollY_=0,layoutHeight_=0,layoutRowH_=0;
     GraphicsSettings values_;
+    int page_ = 0;
+    UiDpadRepeat settingRepeat_;
     FocusRing focus_;
     FocusRing inert_;          // The rows under the language list take no focus
     LanguageFrame picker_;     // Cross on "Language" - the same list as the login screen's
@@ -104,6 +137,10 @@ private:
     int langSel_ = 0;          // index in localeInstalled()
     int langOpenSel_ = 0;      // at open(): what the next start uses (wowee.cfg)
     bool prompt_ = false;      // the restart notice is up (open_ stays true under it)
+    std::string helpText_;
+    std::vector<std::string> helpLines_;
+    uint32_t helpFontRevision_=~0u;
+    float helpScale_=0,helpTime_=0;
     std::string promptCode_;   // the language picked
 };
 

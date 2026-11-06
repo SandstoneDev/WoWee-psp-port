@@ -57,7 +57,6 @@ namespace pp = wowee::platform::psp;
 namespace {
 
 constexpr float kS = 0.8f;  // WorldScreen::kDialogScale (static_assert in loadPopupArt)
-constexpr float kPopupTop = 48.0f;               // StaticPopup1 TOP 0,-135 of the 768-unit UIParent
 constexpr uint32_t kDialogBg = 0x99000000u;      // UI-DialogBox-Background: black, alpha 153
 constexpr uint32_t kColDisable = 0xFF808080u;    // GameFontDisable (0.5, 0.5, 0.5)
 float U(float units) { return std::floor(units * kS + 0.5f); }  // units -> whole px
@@ -112,7 +111,7 @@ void WorldScreen::loadPopupArt() {
 void WorldScreen::beginPopups() {
     popupStackY_ = 0.0f;
     // The dialog art (~60 KB) only while a dialog is open. kWinRelease: for the death popup.
-    if (popupArt_.tried && !windowOpen(kWinMenu) && !windowOpen(kWinBindConfirm) && !windowOpen(kWinTalentWipe) &&
+    if (popupArt_.tried && !barAssign_.active() && !session_.logoutPending() && !windowOpen(kWinMenu) && !windowOpen(kWinBindConfirm) && !windowOpen(kWinTalentWipe) &&
         !windowOpen(kWinQuestAbandon) && !windowOpen(kWinRelease) &&
         !windowOpen(kWinUnlearnSkill) &&  // StaticPopup UNLEARN_SKILL
         !windowOpen(kWinPartyInvite) && !windowOpen(kWinLootRollConfirm) &&  // PARTY_INVITE, CONFIRM_LOOT_ROLL
@@ -157,7 +156,8 @@ void WorldScreen::drawGameMenuButton(UiRenderer& ui, uint32_t id, const Rect& r,
                                      bool enabled) {
     loadNpcArt(false);  // UIPanelButton art (pbtn_*)
     if (!npcArt_.btnUp.pixels) {
-        kit_.button(ui, winFocus_, id, r, label, enabled && focusable);
+        kit_.button(ui,winFocus_,id,r,pspMenuDrawing_?"":label,enabled&&focusable);
+        if(pspMenuDrawing_)ui.textMarquee(kit_.font(kFontNormal),Rect{r.x+29,r.y+3,r.w-34,r.h-6},label,enabled?kColWhite:kColDisable);
         return;
     }
     const bool focused = focusable && enabled && winFocus_.addStop(id, r);
@@ -172,7 +172,8 @@ void WorldScreen::drawGameMenuButton(UiRenderer& ui, uint32_t id, const Rect& r,
     ui.image(t, Rect{r.x + r.w - cap, r.y, cap, r.h}, SrcRect{tw - capT, 0, capT, th});
     if (focused && npcArt_.btnHl.pixels) ui.image(npcArt_.btnHl, r, 0xFFFFFFFFu, Blend::Add);
     const Font& fn = kit_.font(kFontNormal);
-    ui.textShadow(fn, r.x + r.w * 0.5f + (pressed ? 1.0f : 0.0f),
+    if(pspMenuDrawing_)ui.textMarquee(fn,Rect{r.x+29,r.y+3,r.w-34,r.h-6},label,enabled?kColWhite:kColDisable);
+    else ui.textShadow(fn, r.x + r.w * 0.5f + (pressed ? 1.0f : 0.0f),
                   r.y + std::floor((r.h - static_cast<float>(fn.lineHeight())) * 0.5f + 0.5f), label,
                   enabled ? kColWhite : kColDisable, Align::Center);
 }
@@ -180,6 +181,7 @@ void WorldScreen::drawGameMenuButton(UiRenderer& ui, uint32_t id, const Rect& r,
 Rect WorldScreen::drawStaticPopup(UiRenderer& ui, const StaticPopup& p) {
     PROF_SCOPE("popup");
     loadPopupArt();
+    FocusRing& popupFocus=p.focus ? *p.focus : winFocus_;
     const Font& fn = kit_.font(kFontNormal);
     const Font& fs = kit_.font(kFontSmall);
     const float lh = static_cast<float>(fn.lineHeight());
@@ -190,7 +192,7 @@ Rect WorldScreen::drawStaticPopup(UiRenderer& ui, const StaticPopup& p) {
     const float w = U(p.alert ? 420 : 320);
     const float h = U(32) + textH + U(8) + U(21) + (p.hasMoneyFrame ? U(16) : 0.0f) +
                     (p.editText ? U(8) + U(32) : 0.0f);  // StaticPopup_Resize, + 8 + the edit box
-    const Rect r{std::floor((static_cast<float>(pp::kScreenW) - w) * 0.5f), popupStackY_ > 0.0f ? popupStackY_ : kPopupTop,
+    const Rect r{std::floor((static_cast<float>(pp::kScreenW) - w) * 0.5f), std::max(0.f,std::floor((pp::kScreenH-h)*.5f)),
                  w, h};
     popupStackY_ = r.y + r.h;
     drawDialogBox(ui, r);
@@ -207,7 +209,7 @@ Rect WorldScreen::drawStaticPopup(UiRenderer& ui, const StaticPopup& p) {
     if (p.editText) {
         // StaticPopupEditBoxTemplate (130 wide) under the text; Cross on it = the caller's keyboard.
         const Rect eb{std::floor(cx - U(65)), ty + U(8) + (p.hasMoneyFrame ? U(16) : 0.0f), U(130), U(20)};
-        const bool f = p.focusable && p.editId && winFocus_.addStop(p.editId, eb);
+        const bool f = p.focusable && p.editId && popupFocus.addStop(p.editId, eb);
         ui.fill(eb, 0xC0000000u);
         const uint32_t edge = f ? 0xFF00D0FFu : 0xFF808080u;
         ui.fill(Rect{eb.x, eb.y, eb.w, 1.0f}, edge);
@@ -224,8 +226,8 @@ Rect WorldScreen::drawStaticPopup(UiRenderer& ui, const StaticPopup& p) {
         return tw > U(past) ? tw + U(20) : U(120);
     };
     auto button = [&](uint32_t id, const Rect& b, const char* label, bool enabled) {
-        const bool f = p.focusable && enabled && winFocus_.addStop(id, b);
-        const bool pressed = f && winFocus_.isPressed(id);
+        const bool f = p.focusable && enabled && popupFocus.addStop(id, b);
+        const bool pressed = f && popupFocus.isPressed(id);
         const pp::Texture& t = !enabled && popupArt_.btnDis.pixels ? popupArt_.btnDis
                                : pressed && popupArt_.btnDown.pixels ? popupArt_.btnDown
                                                                      : popupArt_.btnUp;

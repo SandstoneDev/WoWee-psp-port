@@ -155,12 +155,73 @@ void WorldScreen::updateNpc(const pp::PadState& pad, float dtSec) {
     if ((pad.held & PSP_CTRL_LTRIGGER) && !(pad.held & PSP_CTRL_RTRIGGER) && (pad.pressed & PSP_CTRL_UP))
         interactTarget();
     syncNpcWindows();
+    if(npcVoiceGuid_) {
+        bool service=false;
+        for(uint8_t w:{kWinGossip,kWinVendor,kWinQuestDetails,kWinQuestProgress,kWinQuestReward,kWinBank,kWinTrainer})service=service||windowOpen(w);
+        if(service)npcVoiceSeenWindow_=true;
+        else if(npcVoiceSeenWindow_) {
+            if(auto e=session_.entities().getEntity(npcVoiceGuid_)) {
+                const glm::vec3 pos=core::coords::canonicalToServer(glm::vec3(e->getX(),e->getY(),e->getZ()));
+                sounds_.playNpcVoice(e->getField(game::fieldIndex(game::UF::UNIT_FIELD_DISPLAYID)),1,pos);
+            }
+            npcVoiceGuid_=0;npcVoiceSeenWindow_=false;
+        } else if(pp::logUptimeMs()-npcVoiceAtMs_>10000)npcVoiceGuid_=0;
+    }
+    const uint8_t cachedWindows[]={kWinGossip,kWinQuestDetails,kWinQuestProgress,kWinQuestReward};
+    for(size_t i=0;i<npcLayouts_.size();++i)
+        if(npcLayouts_[i].valid && !windowOpen(cachedWindows[i]))npcLayouts_[i]=NpcFrameLayout{};
     updateMerchant();  // MerchantFrame (backpack with it, error line)
     updateBankMail(dtSec);  // BankFrame / MailFrame (session events, windows, keyboard)
     updateAuction();  // AuctionFrame (session events, windows, keyboard)
     if (npcArt_.frame.pixels && !windowOpen(kWinGossip) && !windowOpen(kWinQuestDetails) &&
         !windowOpen(kWinQuestProgress) && !windowOpen(kWinQuestReward))
         npcArt_.release(false);  // the frame art only while a conversation is open
+}
+
+// PSP: preview the living NPC handled by Interact, including its higher-priority
+// loot/object/mail actions. This never selects a unit or sends a request.
+uint64_t WorldScreen::interactionNpcHint() const {
+    if (session_.life() != Life::Alive) return 0;
+    const glm::vec3 self(playerX_, playerY_, playerZ_);
+    auto distance = [&](uint64_t guid) {
+        glm::vec3 pos;
+        float height = 0.0f;
+        if (!unitPosition(guid, pos, height)) return 1e30f;
+        const glm::vec3 delta = pos - self;
+        return std::sqrt(glm::dot(delta, delta));
+    };
+    for (uint64_t corpse : session_.lootableCorpses())
+        if (distance(corpse) < 8.0f) return 0;
+    const uint16_t npcFlags = game::fieldIndex(game::UF::UNIT_NPC_FLAGS);
+    uint64_t guid = session_.target();
+    auto entity = guid ? session_.entities().getEntity(guid) : nullptr;
+    float dist = distance(guid);
+    uint64_t mailbox = 0;
+    float mailDist = 0.0f;
+    const bool hasMailbox = session_.nearestMailbox(self, 10.0f, mailbox, mailDist);
+    if (guid && (gameObjectBeforeNpc(dist) || (hasMailbox && mailDist < dist))) return 0;
+    // classBarInteract(guid, 0) boards a selected party player's vehicle first.
+    if (guid && (guid >> 48) == 0 && guid != session_.playerGuid() &&
+        session_.unitVehicleId(guid) != 0 && session_.partyMember(guid)) return 0;
+    if (!entity || entity->getType() != game::ObjectType::UNIT) {
+        guid = 0;
+        dist = npc_.range > 0.0f ? npc_.range : 8.0f;
+        for (const auto& [candidate, ent] : session_.entities().getEntities()) {
+            if (ent->getType() != game::ObjectType::UNIT || !ent->getField(npcFlags)) continue;
+            UnitView unit;
+            if (!unitView(candidate, unit) || unit.dead) continue;
+            const float d = distance(candidate);
+            if (d < dist) { dist = d; guid = candidate; }
+        }
+        entity = guid ? session_.entities().getEntity(guid) : nullptr;
+    }
+    UnitView unit;
+    if (!entity || !entity->getField(npcFlags) || !unitView(guid, unit) || unit.dead ||
+        session_.isHostileUnit(guid) ||
+        (entity->getField(game::fieldIndex(game::UF::UNIT_FIELD_FLAGS)) & game::UNIT_FLAG_NOT_SELECTABLE) ||
+        (npc_.range > 0.0f && dist > npc_.range) || gameObjectBeforeNpc(dist)) return 0;
+    if (hasMailbox && mailDist < dist) return 0;
+    return guid;
 }
 
 // upstream GameScreen right-click on a unit + GameHandler::interactWithNpc.
@@ -291,6 +352,12 @@ void WorldScreen::interactTarget() {
             session_.interactWithNpc(guid);  // trainers, innkeepers...: the server's gossip
             how = "gossip";
         }
+    }
+    if(flags && !session_.isHostileUnit(guid) && how && std::strcmp(how,"far")!=0 && std::strcmp(how,"none")!=0 &&
+       (npcVoiceGuid_!=guid || nowMs-npcVoiceAtMs_>2000)) {
+        const glm::vec3 pos=core::coords::canonicalToServer(glm::vec3(e->getX(),e->getY(),e->getZ()));
+        sounds_.playNpcVoice(e->getField(game::fieldIndex(game::UF::UNIT_FIELD_DISPLAYID)),0,pos);
+        npcVoiceGuid_=guid;npcVoiceAtMs_=nowMs;npcVoiceSeenWindow_=false;
     }
     if (++npc_.logs <= 60)
         PSP_LOGI(pp::tag::Net, "npc_interact guid=%08X flags=%X how=%s dist=%.1f",
@@ -625,7 +692,6 @@ bool WorldScreen::drawNpcWindow(UiRenderer& ui, uint8_t w) {
         title(r, npcName(v.vendorGuid));
         const std::string cash = std::string(CLIENT_STR(MONEY_COLON)) + " " + money(session_.selfField(game::fieldIndex(game::UF::PLAYER_FIELD_COINAGE)));
         ui.textShadow(fs, r.x + r.w - 14, r.y + 28, cash.c_str(), kColWhite, Align::Right);
-        ui.textShadow(fs, r.x + 14, r.y + 28, OWN_STR(NPC_VENDOR_BUY_HINT), kColGrey);
         float y = r.y + 44;
         const int total = static_cast<int>(v.items.size());
         for (int i = 0; i < kRowsVendor; ++i) {
@@ -782,8 +848,20 @@ void WorldScreen::drawQuestMarkers(UiRenderer& ui) {
             if (glm::dot(d, d) > maxDist * maxDist) continue;
             UnitView u;
             if (unitView(guid, u) && u.dead) continue;
-            if (!projectHud(pos + glm::vec3(0, 0, h + 0.4f), sx, sy)) continue;
-            ui.textShadow(kit_.font(kFontTitle), sx, sy - 34, m.symbol, m.dim ? kColGrey : kColGold, Align::Center);
+            const glm::vec3 anchor=pos+glm::vec3(0,0,h+.4f);
+            if (!projectHud(anchor,sx,sy)) continue;
+            if(!npcHudVisibility_.visible(guid,camPosForHud_,anchor,pp::logUptimeMs(),
+                [&](const glm::vec3& origin,const glm::vec3& dir,float distance){
+                    float hit=models_.raycastBuildings(origin,dir,distance);
+                    hit=bigWmoRay(origin,dir,hit);
+                    hit=transportCameraRay(origin,dir,hit);
+                    return hit<distance;
+                }))continue;
+            loadNpcArt(false);
+            const int icon=*m.symbol=='!'?11:(m.dim?13:12);
+            const auto& marker=npcArt_.icons[icon];
+            if(marker.pixels)ui.image(marker,Rect{sx-9,sy-28,18,24},m.dim?kColGrey:kColWhite);
+            else ui.textShadow(kit_.font(kFontNormal),sx,sy-28,m.symbol,m.dim?kColGrey:kColGold,Align::Center);
             ++drawn;
         }
     }

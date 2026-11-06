@@ -126,6 +126,7 @@ void WorldScreen::drawWeaponFx(const rendering::psp::TerrainCamera& cam) {
     u.requests.clear();
     rp::WeaponGlow g[4];
     auto add = [&](uint64_t owner, const rp::CharacterModel& m, const glm::vec3& at, bool own) {
+        if (!own && performanceCosmetic_<.5f) return;
         const size_t n = m.weaponGlows(g, 4);
         for (size_t i = 0; i < n && u.requests.size() < kMaxGlowRequests; ++i) {
             rp::WeaponGlows::Request r;

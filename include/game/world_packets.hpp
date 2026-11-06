@@ -2307,6 +2307,9 @@ struct SpellGoData {
     uint8_t missCount = 0;
     std::vector<SpellGoMissEntry> missTargets;
     uint64_t targetGuid = 0;  ///< Primary target GUID from SpellCastTargets (0 = none/AoE)
+    bool hasDestination = false;
+    uint64_t destinationTransport = 0;
+    float destination[3] = {}; // server coordinates, transport-local when destinationTransport != 0
 
     [[nodiscard]] bool isValid() const { return spellId != 0; }
 };

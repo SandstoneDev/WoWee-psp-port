@@ -14,8 +14,11 @@
 // demand (not preloaded), pitch = playback rate of the mixer, others'
 // footsteps (upstream: the own character only), no mounts / swimming yet.
 #include "ui/psp/ui_world_sounds.hpp"
+#include "rendering/psp/psp_water_format.hpp"
 
+#include "game/update_field_table.hpp"
 #include "platform/psp/psp_audio.hpp"
+#include "platform/psp/psp_pak.hpp"
 #include "platform/psp/psp_config.hpp"
 #include "platform/psp/psp_fs.hpp"
 #include "platform/psp/psp_log.hpp"
@@ -37,6 +40,7 @@ namespace paths = sound_paths;
 
 namespace {
 WorldSounds* g_sounds = nullptr;
+constexpr uint32_t kOwnStepTag = 0x53544550u;
 } // namespace
 
 // --- API for the other world code ------------------------------------------
@@ -60,6 +64,8 @@ void WorldSounds::shutdown() {
     entryById_.clear();
     entryByName_.clear();
     others_.clear();
+    npcVoices_.clear();
+    ambienceAreas_.clear(); ambienceEntry_=~uint32_t{0}; ambienceClip_=-1;
 }
 
 std::vector<int> WorldSounds::resolve(const std::vector<std::string>& list) const {
@@ -80,14 +86,11 @@ int WorldSounds::first(const std::vector<std::string>& list) const {
 bool WorldSounds::init(uint32_t mapId, uint32_t race, bool male) {
     shutdown();
     footsteps_ = std::clamp(pp::configGetInt("footsteps", 2), 0, 2);
-    if (!pp::configGetInt("sfx", 1)) {
-        PSP_LOGI(pp::tag::Sys, "sfx_off (wowee.cfg sfx=0)");
-        return false;
-    }
+    const bool audio = pp::configGetInt("sfx", 1) != 0; // water still needs the surface grids
     const int budget = std::clamp(pp::configGetInt("sfxbudget", 512)  /* the hardware heap */, 128, 8192);
     char path[256];
     pp::fsPath(path, sizeof(path), "data/sounds.pak");
-    if (!bank_.open(path, static_cast<uint32_t>(budget), mapId)) {
+    if (!bank_.open(path, static_cast<uint32_t>(budget), mapId, audio)) {
         PSP_LOGW(pp::tag::Sys, "sounds_missing path=%s", path);
         return false;
     }
@@ -109,6 +112,25 @@ bool WorldSounds::init(uint32_t mapId, uint32_t race, bool male) {
         }
     }
 
+    pp::Pak ambiencePak;
+    if (ambiencePak.open(path)) {
+        const auto* e=ambiencePak.find("ambience");
+        void* data=e && e->size<=1024*1024 && e->size%sizeof(fmt::AreaAmbience)==0 ? ambiencePak.load(e) : nullptr;
+        if (data) {
+            const auto* rows=static_cast<const fmt::AreaAmbience*>(data);
+            for (uint32_t i=0;i<e->size/sizeof(*rows);++i) ambienceAreas_[rows[i].area]={rows[i].parent,rows[i].day,rows[i].night};
+            pp::pakFree(data);
+        }
+        const auto* voiceEntry=ambiencePak.find("npcvoices");
+        void* voiceData=voiceEntry && voiceEntry->size<=1024*1024 && voiceEntry->size%sizeof(fmt::NpcVoiceRecord)==0 ? ambiencePak.load(voiceEntry):nullptr;
+        if(voiceData) {
+            const auto* rows=static_cast<const fmt::NpcVoiceRecord*>(voiceData);
+            npcVoices_.assign(rows,rows+voiceEntry->size/sizeof(*rows));
+            std::sort(npcVoices_.begin(),npcVoices_.end(),[](const auto& a,const auto& b){return a.display<b.display;});
+            pp::pakFree(voiceData);
+        }
+        ambiencePak.close();
+    }
     // UiSoundManager::initialize (+ its fallbacks, whisper before mail).
     for (int s = 0; s < static_cast<int>(UiSound::Count); ++s) {
         uiClip_[s] = -1;
@@ -156,12 +178,33 @@ bool WorldSounds::init(uint32_t mapId, uint32_t race, bool male) {
     for (int s = 0; s < 7; ++s) landing_[s] = resolve(audio::classicFootstepPaths(mats[s]));
     meleeSwing_ = resolve(paths::meleeSwing());
     const paths::RaceVoice rv = paths::raceVoice(race);
-    jump_ = resolve(paths::jump(rv.folder, rv.base, male));
     swimStroke_ = resolve(paths::swimStroke());
-    hardLand_ = resolve(paths::hardLand(rv.folder, rv.base, male));
     attackGrunt_ = resolve(paths::vocals(0, rv.folder, rv.base, male));
     wound_ = resolve(paths::vocals(1, rv.folder, rv.base, male));
     woundCrit_ = resolve(paths::vocals(2, rv.folder, rv.base, male));
+    deathVoice_ = resolve(paths::vocals(3, rv.folder, rv.base, male));
+    pp::Pak voicePak;
+    if (voicePak.open(path)) {
+        const auto* entry=voicePak.find("voices");
+        void* data=entry && entry->size<=4096 && entry->size%sizeof(fmt::CharacterVoice)==0 ? voicePak.load(entry) : nullptr;
+        if (data) {
+            const auto* rows=static_cast<const fmt::CharacterVoice*>(data);
+            for (uint32_t i=0;i<entry->size/sizeof(*rows);++i) {
+                if (rows[i].race!=race || rows[i].sex!=(male ? 0u : 1u)) continue;
+                auto use=[&](std::vector<int>& bank,uint32_t id) {
+                    auto authored=resolveEntry(id);
+                    if (!authored.empty()) bank=std::move(authored);
+                };
+                use(attackGrunt_,rows[i].attack); use(wound_,rows[i].wound);
+                use(woundCrit_,rows[i].critical); use(deathVoice_,rows[i].death);
+                break;
+            }
+            pp::pakFree(data);
+        }
+    }
+    PSP_LOGI(pp::tag::Sys,"voice_profile race=%u sex=%s jump=%u wound=%u",
+             static_cast<unsigned>(race),male ? "male" : "female",
+             0u,static_cast<unsigned>(wound_.size()));
     // MovementSoundManager::initialize (its "small" set loads the medium files).
     const char* water[3] = {"Small", "Medium", "Giant"};
     for (int i = 0; i < 3; ++i) enterWater_[i] = first(paths::enterWater(water[i]));
@@ -175,11 +218,45 @@ bool WorldSounds::init(uint32_t mapId, uint32_t race, bool male) {
     PSP_LOGI(pp::tag::Sys,
              "sfx_init ui=%u steps=%u swing=%u hits=%u jump=%u grunt=%u wound=%u rows=%u budget_kb=%d feet=%d",
              ui, steps, static_cast<unsigned>(swing_[1].size()), static_cast<unsigned>(hitFlesh_.size()),
-             static_cast<unsigned>(jump_.size()), static_cast<unsigned>(attackGrunt_.size()),
+             0u, static_cast<unsigned>(attackGrunt_.size()),
              static_cast<unsigned>(wound_.size()), static_cast<unsigned>(entryById_.size()), budget, footsteps_);
     g_sounds = this;
     nextLogMs_ = pp::logUptimeMs() + 10000u;
     return true;
+}
+
+void WorldSounds::environment(uint32_t area,bool night,bool indoors,int weather,float intensity,int zoneVolume,int weatherVolume) {
+    uint32_t entry=0;
+    for (int depth=0;area && depth<16;++depth) {
+        const auto it=ambienceAreas_.find(area);
+        if (it==ambienceAreas_.end()) break;
+        entry=night ? it->second.night : it->second.day;
+        if (entry || it->second.parent==area) break;
+        area=it->second.parent;
+    }
+    if (entry!=ambienceEntry_) {
+        ambienceEntry_=entry;
+        const auto clips=resolveEntry(entry);
+        ambienceClip_=clips.empty() ? -1 : clips[static_cast<size_t>(frame_)%clips.size()];
+        ambienceGain_=1.0f;
+        const auto row=entryById_.find(entry);
+        if (entries_ && row!=entryById_.end()) {
+            const auto* header=static_cast<const fmt::SoundEntriesHeader*>(entries_);
+            const auto* rows=reinterpret_cast<const fmt::SoundEntryRow*>(static_cast<const uint8_t*>(entries_)+header->rowOffset);
+            ambienceGain_=std::clamp(rows[row->second].volume,0.0f,1.0f);
+        }
+        PSP_LOGI(pp::tag::Sys,"zone_ambience entry=%u clip=%d gain=%.2f night=%d",
+                 static_cast<unsigned>(entry),ambienceClip_,ambienceGain_,night ? 1 : 0);
+    }
+    bank_.ambience(0,ambienceClip_,ambienceGain_*zoneVolume*.01f*(indoors ? .25f : 1.f));
+    int clip=-1;
+    if (!indoors && weather && intensity>.05f && weatherVolume>0) {
+        const char* type=weather==1 ? "rain" : weather==2 ? "snow" : "sandstorm";
+        const char* grade=intensity>.65f ? "heavy" : intensity>.3f ? "medium" : "light";
+        char path[128]; std::snprintf(path,sizeof(path),"sound/ambience/weather/%s%s%s.wav",type,grade,weather==1 ? "loop" : "");
+        clip=bank_.find(fmt::soundPathHash(path));
+    }
+    bank_.ambience(1,clip,weatherVolume*.01f*std::clamp(intensity,0.f,1.f));
 }
 
 void WorldSounds::beginFrame(float dtSec, int volumePercent, const glm::vec3& listener, float listenerYaw) {
@@ -195,6 +272,10 @@ void WorldSounds::beginFrame(float dtSec, int volumePercent, const glm::vec3& li
     const uint32_t now = pp::logUptimeMs();
     if (static_cast<int32_t>(now - nextLogMs_) >= 0) {
         nextLogMs_ = now + 10000u;
+        const auto& audio=pp::audioStats();
+        PSP_LOGI(pp::tag::Sys,"sfx_mixer voices=%u late=%u max_us=%u output_errors=%u",
+                 static_cast<unsigned>(audio.sfxVoices),static_cast<unsigned>(audio.sfxLateBlocks),
+                 static_cast<unsigned>(audio.sfxMixMaxUs),static_cast<unsigned>(audio.outputErrors));
         const pp::SoundBankStats& s = bank_.stats();
         PSP_LOGI(pp::tag::Sys, "sfx_cache kb=%u n=%u loads=%u fails=%u evict=%u plays=%u late=%u drops=%u",
                  static_cast<unsigned>(s.residentKb), static_cast<unsigned>(s.resident), static_cast<unsigned>(s.loads),
@@ -231,21 +312,21 @@ bool WorldSounds::elapsed(uint32_t& lastMs, float minSec, uint32_t now) const {
     return lastMs == 0 || static_cast<float>(now - lastMs) >= minSec * 1000.0f;
 }
 
-bool WorldSounds::play2D(int clip, float volume, float pitch) {
+bool WorldSounds::play2D(int clip, float volume, float pitch, uint32_t tag) {
     if (clip < 0) return false;
     const float v = std::clamp(volume, 0.0f, 1.0f);
     if (++playLogs_ <= 60)
         PSP_LOGI(pp::tag::Sys, "sfx_play id=%08x vol=%.2f pan=0.00", static_cast<unsigned>(bank_.clipHash(clip)), v);
-    return bank_.play(clip, v, 0.0f, pitch);
+    return bank_.play(clip, v, 0.0f, pitch, tag);
 }
 
-bool WorldSounds::spatial(const glm::vec3& p, float maxDistance, float& gain, float& pan) const {
+bool WorldSounds::spatial(const glm::vec3& p, float maxDistance, float& gain, float& pan, float minDistance) const {
     const glm::vec3 d = p - listener_;
     const float dist = std::sqrt(d.x * d.x + d.y * d.y + d.z * d.z);
     // PSP: past maxDistance nothing is started (miniaudio keeps the 1/max
     // floor there: 1 % - inaudible, but a voice of the 12).
     if (!(dist <= maxDistance)) return false;
-    gain = 1.0f / std::max(dist, 1.0f);  // ma_attenuation_model_inverse, min 1, rolloff 1
+    gain = minDistance / std::max(dist, minDistance); // authored full-volume radius, inverse rolloff
     const float h = std::sqrt(d.x * d.x + d.y * d.y);
     pan = 0.0f;
     if (h > 0.01f) {
@@ -269,9 +350,8 @@ bool WorldSounds::surfaceAt(float x, float y, float z, StepSurface& out) const {
     const uint8_t nib = static_cast<uint8_t>((cells[n / 2] >> ((n & 1u) * 4u)) & 0xFu);
     if (nib & fmt::kSurfCellWater) {
         float wh = 0.0f;
-        std::memcpy(&wh, cells + 256 * 32 + chunk * 4, 4);
-        // upstream: water under the feet when z < water height + 0.25.
-        if (z < wh + 0.25f) {
+        // Use the rendered surface, including v2 slopes, for footsteps too.
+        if (waterAt(x, y, wh) && z < wh + 0.25f) {
             out = StepSurface::Water;
             return true;
         }
@@ -291,6 +371,23 @@ bool WorldSounds::waterAt(float x, float y, float& level) const {
     const uint32_t n = static_cast<uint32_t>(sc.chunk * 64 + sc.cell);
     const uint8_t* cells = g + sizeof(fmt::SurfaceGridHeader);
     const uint8_t nib = static_cast<uint8_t>((cells[n / 2] >> ((n & 1u) * 4u)) & 0xFu);
+    unsigned patchCount = 0;
+    const auto* patches = fmt::waterPatches(g, patchCount);
+    if (reinterpret_cast<const fmt::SurfaceGridHeader*>(g)->version == 2) {
+        constexpr float tile = 533.33333f, chunk = tile / 16.0f, unit = chunk / 8.0f;
+        const float fr = std::clamp(((32 - sc.fileY) * tile - (sc.chunk / 16) * chunk - x) / unit, 0.0f, 8.0f);
+        const float fc = std::clamp(((32 - sc.fileX) * tile - (sc.chunk % 16) * chunk - y) / unit, 0.0f, 8.0f);
+        const int r = std::min(static_cast<int>(fr), 7), c = std::min(static_cast<int>(fc), 7);
+        bool found = false;
+        for (unsigned i = 0; i < patchCount; ++i) {
+            const auto& p = patches[i];
+            if (p.chunk != sc.chunk || !fmt::waterCell(p, r, c)) continue;
+            const float h = fmt::waterHeight(p, r, c, fr - r, fc - c);
+            if (!found || h > level) level = h;
+            found = true;
+        }
+        return found;
+    }
     if (!(nib & fmt::kSurfCellWater)) return false;
     uint32_t bits = 0;
     std::memcpy(&bits, cells + 256 * 32 + sc.chunk * 4, 4);
@@ -303,6 +400,12 @@ bool WorldSounds::waterAt(float x, float y, float& level) const {
 void WorldSounds::playUi(UiSound s) {
     if (s >= UiSound::Count) return;
     play2D(uiClip_[static_cast<int>(s)], 0.7f);  // upstream 0.7 * volumeScale
+}
+
+bool WorldSounds::playNpcVoice(uint32_t display,uint8_t kind,const glm::vec3& pos) {
+    if(kind>=4)return false;
+    const auto it=std::lower_bound(npcVoices_.begin(),npcVoices_.end(),display,[](const auto& row,uint32_t id){return row.display<id;});
+    return it!=npcVoices_.end() && it->display==display && it->sound[kind] && playEntry(it->sound[kind],&pos);
 }
 
 bool WorldSounds::playByName(const char* name) {
@@ -321,7 +424,22 @@ bool WorldSounds::playByName(const char* name) {
     return false;
 }
 
-bool WorldSounds::playEntry(uint32_t id, const glm::vec3* pos) {
+std::vector<int> WorldSounds::resolveEntry(uint32_t id) const {
+    std::vector<int> clips;
+    const auto it=entryById_.find(id);
+    if (!entries_ || it==entryById_.end()) return clips;
+    const auto* h=static_cast<const fmt::SoundEntriesHeader*>(entries_);
+    const auto* base=static_cast<const uint8_t*>(entries_);
+    const auto& row=reinterpret_cast<const fmt::SoundEntryRow*>(base+h->rowOffset)[it->second];
+    const auto* files=reinterpret_cast<const uint32_t*>(base+h->fileOffset);
+    for (uint32_t i=0;i<row.fileCount;++i) {
+        const int clip=bank_.find(files[row.firstFile+i]);
+        if (clip>=0 && std::find(clips.begin(),clips.end(),clip)==clips.end()) clips.push_back(clip);
+    }
+    return clips;
+}
+
+bool WorldSounds::playEntry(uint32_t id, const glm::vec3* pos, uint32_t tag, bool sustain) {
     if (!entries_) return false;
     auto it = entryById_.find(id);
     if (it == entryById_.end()) return false;
@@ -334,13 +452,15 @@ bool WorldSounds::playEntry(uint32_t id, const glm::vec3* pos) {
     const int c = bank_.find(files[row.firstFile + xorshift(rng_) % row.fileCount]);
     if (c < 0) return false;
     const float vol = row.volume > 0.0f ? std::min(row.volume, 1.0f) : 1.0f;
-    if (!pos) return play2D(c, vol);
+    if (!pos) return bank_.play(c,vol,0,1.0f,tag,sustain);
     float gain = 0.0f, pan = 0.0f;
-    if (!spatial(*pos, 100.0f, gain, pan)) return false;
+    const float near=std::isfinite(row.minDistance) && row.minDistance>0.f ? row.minDistance : 1.f;
+    const float far=std::isfinite(row.distanceCutoff) && row.distanceCutoff>near ? row.distanceCutoff : std::max(100.f,near);
+    if (!spatial(*pos, far, gain, pan, near)) return false;
     if (++playLogs_ <= 60)
         PSP_LOGI(pp::tag::Sys, "sfx_play id=%08x vol=%.2f pan=%.2f", static_cast<unsigned>(bank_.clipHash(c)),
                  vol * gain, pan);
-    return bank_.play(c, vol * gain, pan, 1.0f);
+    return bank_.play(c, vol * gain, pan, 1.0f,tag,sustain);
 }
 
 // --- CombatSoundManager + the attacker-state sound block ---------------------
@@ -389,12 +509,6 @@ void WorldSounds::onMeleeHit(bool playerAttacker, bool playerTarget, uint32_t hi
 }
 
 // --- ActivitySoundManager ---------------------------------------------------
-void WorldSounds::playJump() {
-    const uint32_t now = pp::logUptimeMs();
-    if (jump_.empty() || !elapsed(lastJumpMs_, 0.35f, now)) return;
-    if (play2D(pick(jump_), rnd(0.65f, 0.75f), rnd(0.98f, 1.04f))) lastJumpMs_ = now;
-}
-
 void WorldSounds::playLanding(StepSurface surface, bool hardLanding) {
     const uint32_t now = pp::logUptimeMs();
     if (!elapsed(lastLandMs_, 0.10f, now)) return;
@@ -404,7 +518,7 @@ void WorldSounds::playLanding(StepSurface surface, bool hardLanding) {
         play2D(pick(clips), rnd(base * 0.95f, base * 1.05f), rnd(0.95f, 1.03f));
         lastLandMs_ = now;
     }
-    if (hardLanding && !hardLand_.empty()) play2D(pick(hardLand_), rnd(0.80f, 0.88f), rnd(0.97f, 1.03f));
+    // Voice pain is driven by a server-confirmed damage event, never by landing alone.
 }
 
 void WorldSounds::playMeleeSwing() {
@@ -420,6 +534,10 @@ void WorldSounds::playAttackGrunt() {
     if (play2D(pick(attackGrunt_), rnd(0.55f, 0.70f), rnd(0.96f, 1.04f))) lastGruntMs_ = now;
 }
 
+void WorldSounds::playDeath() {
+    if(active() && !deathVoice_.empty())play2D(pick(deathVoice_),1.f,1.f);
+}
+
 void WorldSounds::playWound(bool crit) {
     const auto& clips = (crit && !woundCrit_.empty()) ? woundCrit_ : wound_;
     const uint32_t now = pp::logUptimeMs();
@@ -431,11 +549,9 @@ void WorldSounds::playWound(bool crit) {
 void WorldSounds::updateActivity(float dtSec, bool grounded, float verticalVelocity, bool swimming, bool moving,
                                  StepSurface surface) {
     if (!active()) return;
-    const bool jumping = !grounded && verticalVelocity > 0.0f;               // CameraController::isJumping
     const bool falling = !grounded && !swimming && verticalVelocity <= 0.0f;  // isFalling
     if (!actInit_) {
         prevGrounded_ = grounded;
-        prevJumping_ = jumping;
         prevFalling_ = falling;
         prevSwimming_ = swimming;
         actInit_ = true;
@@ -444,7 +560,6 @@ void WorldSounds::updateActivity(float dtSec, bool grounded, float verticalVeloc
     if (!swimming && prevSwimming_) sinceWaterExit_ = 0.0f;
     else if (sinceWaterExit_ < kWaterExitSfxSuppress) sinceWaterExit_ += dtSec;
     const bool justLeftWater = sinceWaterExit_ < kWaterExitSfxSuppress;
-    if (jumping && !prevJumping_ && !swimming && !justLeftWater) playJump();
     if (grounded && !prevGrounded_ && !justLeftWater) playLanding(surface, prevFalling_);
     const uint32_t now = pp::logUptimeMs();
     if ((swimming && !prevSwimming_) || (!swimming && prevSwimming_)) {  // playWaterEnter / playWaterExit
@@ -459,7 +574,6 @@ void WorldSounds::updateActivity(float dtSec, bool grounded, float verticalVeloc
         lastStrokeMs_ = 0;
     }
     prevGrounded_ = grounded;
-    prevJumping_ = jumping;
     prevFalling_ = falling;
     prevSwimming_ = swimming;
 }
@@ -508,7 +622,7 @@ void WorldSounds::playRandomStep(StepSurface surface, float minInterval, float v
     if (list->empty()) return;
     const float pitch = rnd(0.97f, 1.05f);
     const float volume = std::clamp(rnd(0.92f, 1.00f) * volumeMul, 0.1f, 1.0f);
-    if (play2D(pick(*list), volume, pitch)) {
+    if (play2D(pick(*list), volume, pitch, kOwnStepTag)) {
         lastStepMs_ = now;
         ++stepsOwn_;
     }
@@ -517,13 +631,14 @@ void WorldSounds::playRandomStep(StepSurface surface, float minInterval, float v
 void WorldSounds::playWaterFootstep(int size) {
     static const float kMul[3] = {0.6f, 0.8f, 1.0f};
     const int i = std::clamp(size, 0, 2);
-    play2D(pick(waterStep_[i]), 0.7f * kMul[i]);
+    play2D(pick(waterStep_[i]), 0.7f * kMul[i], 1.f, kOwnStepTag);
 }
 
 void WorldSounds::ownFootsteps(bool canPlay, bool footstepState, uint32_t animId, float timeMs, float durationMs,
                                const uint32_t* events, uint32_t eventCount, bool sprinting, StepSurface surface) {
-    if (!active() || footsteps_ == 0) return;
-    if (!(canPlay && footstepState)) {
+    if (!active()) return;
+    if (footsteps_==0 || !(canPlay && footstepState)) {
+        bank_.cancelTag(kOwnStepTag);
         own_.initialized = false;
         return;
     }
@@ -581,6 +696,8 @@ void WorldScreen::initSounds() {
         race = static_cast<uint32_t>(c.race);
         male = !(c.gender == game::Gender::FEMALE || (c.gender == game::Gender::NONBINARY && c.useFemaleModel));
     }
+    const uint32_t bytes=session_.selfField(game::fieldIndex(game::UF::UNIT_FIELD_BYTES_0));
+    if ((bytes & 0xFFu)!=0) { race=bytes & 0xFFu; male=((bytes>>16)&0xFFu)==0; }
     sounds_.init(session_.worldEntry().mapId, race, male);
 }
 
@@ -610,6 +727,14 @@ StepSurface WorldScreen::soundSurface(float dtSec) {
 }
 
 void WorldScreen::updateSounds(float dtSec) {
+    pp::WorldSession::ServerSound eventSound;
+    while(session_.takeServerSound(eventSound)){
+        glm::vec3 at;float height=0;
+        const bool positional=eventSound.source && unitPosition(eventSound.source,at,height);
+        const bool played=sounds_.playEntry(eventSound.id,positional?&at:nullptr);
+        PSP_LOGI(pp::tag::Sys,"server_sound entry=%u source=%u played=%d",static_cast<unsigned>(eventSound.id),
+            static_cast<unsigned>(eventSound.source),played?1:0);
+    }
     // UI sounds the session queued (loot, inventory, quests).
     using SS = pp::WorldSession::SessionSound;
     SS ss;
@@ -628,9 +753,10 @@ void WorldScreen::updateSounds(float dtSec) {
     if (!sounds_.active()) return;
     PROF_SCOPE("sfx");
     sounds_.beginFrame(dtSec, settings_.values().sfxvol, camPosForHud_, camYaw_);
+    updateEnvironmentAudio();
     const StepSurface surface = soundSurface(dtSec);
     // PSP: no swimming in the port yet (upstream: CameraController water).
-    sounds_.updateActivity(dtSec, !airborne_, vz_, false, wantMove_, surface);
+    sounds_.updateActivity(dtSec, !airborne_, vz_, ownSwimming(), wantMove_, surface);
     uint32_t animId = 0, n = 0;
     float t = 0.0f, dur = 0.0f;
     const uint32_t* ev = nullptr;
@@ -638,7 +764,11 @@ void WorldScreen::updateSounds(float dtSec) {
     const auto loco = animator_.getLocomotion().getState();
     const bool stepState =
         loco == rendering::LocomotionFSM::State::WALK || loco == rendering::LocomotionFSM::State::RUN;
-    sounds_.ownFootsteps(clock && !airborne_, stepState, animId, t, dur, ev, n,
+    const glm::vec3 stepPos(playerX_,playerY_,playerZ_);
+    const glm::vec3 stepDelta=stepPos-sfxStepPos_;
+    sfxStepPos_=stepPos;
+    const bool actuallyMoving=wantMove_ && stepDelta.x*stepDelta.x+stepDelta.y*stepDelta.y>0.000001f;
+    sounds_.ownFootsteps(clock && !airborne_ && !ownSwimOrFly() && !mountActive_ && actuallyMoving, stepState, animId, t, dur, ev, n,
                          loco == rendering::LocomotionFSM::State::RUN, surface);
     if (sounds_.footstepMode() < 2) return;
     // PSP: other players and NPCs (not upstream, see playOtherStep).

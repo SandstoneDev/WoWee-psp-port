@@ -15,8 +15,10 @@
 // bottom right opens the windows; debug switches that used to live on
 // button combos are in the "Debug" window.
 #include "ui/psp/ui_world_screen.hpp"
+#include "ui/psp/ui_psp_layout.hpp"
 
 #include "platform/psp/psp_config.hpp"
+#include "platform/psp/psp_fs.hpp"
 #include "platform/psp/psp_display.hpp"
 #include "platform/psp/psp_log.hpp"
 #include "platform/psp/psp_public_safe.hpp"  // PSP: automation / debug only on a dev server
@@ -45,6 +47,7 @@ enum : uint32_t {
     kIdMenuGraphics = 0x5711,
     kIdMenuExit,
     kIdMenuClose,
+    kIdMenuLogout,
     kIdDbgOverlay = 0x5720,
     kIdDbgCapture,
     kIdDbgModels,
@@ -134,6 +137,7 @@ bool WorldScreen::isPopupWindow(uint8_t w) const {
 // right of the rightmost open panel, else left of the leftmost - wholly on the screen, else the
 // default place (overlapping, as before). The full-screen world map is no panel.
 void WorldScreen::placeBeside(uint8_t w, const Rect& base) {
+    if(w==kWinBags)return; // ContainerFrame anchors belong at the bottom right.
     float minX = 1e9f, maxX = -1e9f;
     bool any = false;
     for (uint8_t o : windows_) {
@@ -182,118 +186,215 @@ void WorldScreen::openWindow(uint8_t w) {
     uiArtNoteWindowOpen();  // art that failed to load is tried again (UiArtRetry)
     windows_.erase(std::remove(windows_.begin(), windows_.end(), w), windows_.end());
     windows_.push_back(w);  // on top
+    winFocus_.focusGroup(w);
     // PSP: the game menu opens with its first button focused (was: the focus stayed on the HUD,
     // the D-pad first had to find the menu).
-    if (w == kWinMenu) winFocus_.setFocus(kIdMenuGraphics);
+    if (!winFocus_.rememberedFocus(w)) {
+        if(w==kWinMenu)winFocus_.setFocus(kIdMenuGraphics);
+        else if(w==kWinBags)winFocus_.setFocus(kIdBagSlot0+static_cast<uint32_t>(invBag_*36));
+        else if(w==kWinCharacter)winFocus_.setFocus(0x6010);
+        else if(w==kWinSpellbook)winFocus_.setFocus(0x5C80);
+        else if(w==kWinQuestLog)winFocus_.setFocus(0x6B00);
+    }
+    winFocus_.cancelPresses();
     PSP_LOGI(pp::tag::Ctrl, "window_open id=%u", static_cast<unsigned>(w));
 }
 
 void WorldScreen::closeWindow(uint8_t w) {
+    if (!windowOpen(w)) return; // Closing an absent panel must not steal cursor focus.
+    const bool active=activeWindow()==w;
+    if(w==kWinBags)std::fill(bagOpen_,bagOpen_+5,false);
     if (windowOpen(w)) windowSound(w, false);
     windows_.erase(std::remove(windows_.begin(), windows_.end(), w), windows_.end());
     autoPos_.erase(w);  // the next open starts from its own place again
     placeNext_.erase(std::remove(placeNext_.begin(), placeNext_.end(), w), placeNext_.end());
+    if(dragWin_==w)dragWin_=0;
+    if(active)winFocus_.focusGroup(activeWindow());
+    uint8_t modal=0;
+    for(auto it=windows_.rbegin();it!=windows_.rend();++it)if(isPopupWindow(*it)){modal=*it;break;}
+    winFocus_.setModalGroup(modal);
+    winFocus_.cancelPresses();
+    if(!activeWindow())setUiMode(false);
 }
 
 void WorldScreen::setUiMode(bool on) {
     if (on == uiMode_) return;
+    if (!on && barAssign_.active()) cancelSpellAssignment();
+    if (!on) { invHeld_=InvHeld{}; bookPick_=0; bookPickItem_=false; }
     uiMode_ = on;
     // chat button - SELECT, Cross opens the chat.
-    if (on) winFocus_.setFocus(windows_.empty() ? WorldChat::kBarButtonId : 0u);
+    if(on) {
+        if(activeWindow())winFocus_.focusGroup(activeWindow());
+        else {winFocus_.focusGroup(0);winFocus_.setFocus(pspLayoutActive()?0x5C10u:WorldChat::kBarButtonId);}
+    }
     PSP_LOGI(pp::tag::Ctrl, "ui_mode on=%d windows=%u", on ? 1 : 0, static_cast<unsigned>(windows_.size()));
 }
 
+void WorldScreen::toggleGameMenu() {
+    if(session_.logoutPending()) session_.cancelLogout();
+    const bool fromSettings=settings_.isOpen();
+    if(fromSettings)settings_.close();
+    if(barAssign_.active()) cancelSpellAssignment();
+    invHeld_=InvHeld{};bookPick_=0;bookPickItem_=false;
+    if(dragWin_) {
+        winPos_[dragWin_]=dragOrigin_;
+        winFocus_.focusGroup(dragWin_);
+        if(dragReturnFocus_)winFocus_.setFocus(dragReturnFocus_);
+    }
+    dragWin_=0;
+    if(windowOpen(kWinMenu) && !fromSettings) {
+        closeWindow(kWinMenu);
+        if(menuReturnWindow_ && windowOpen(menuReturnWindow_))raiseWindow(menuReturnWindow_);
+        if(menuReturnSettings_) {settings_.open(liveSettings());setUiMode(true);}
+        menuReturnSettings_=false;menuReturnWindow_=0;
+    } else {
+        menuReturnSettings_=fromSettings;
+        menuReturnWindow_=activeWindow()==kWinMenu?0:activeWindow();
+        setUiMode(true);openWindow(kWinMenu);
+    }
+    uint8_t modal=0;
+    for(auto it=windows_.rbegin();it!=windows_.rend();++it)
+        if(isPopupWindow(*it)) {modal=*it;break;}
+    winFocus_.setModalGroup(modal);
+}
+
+uint8_t WorldScreen::activeWindow() const {
+    for(auto it=windows_.rbegin();it!=windows_.rend();++it)if(*it!=kWinPullouts)return *it;
+    return 0;
+}
+
+void WorldScreen::raiseWindow(uint8_t w) {
+    if(!windowOpen(w))return;
+    windows_.erase(std::remove(windows_.begin(),windows_.end(),w),windows_.end());
+    windows_.push_back(w);winFocus_.focusGroup(w);winFocus_.cancelPresses();
+}
+
+uint32_t WorldScreen::windowSwitchCount() const {
+    uint32_t count=0;
+    for(uint8_t w:windows_) {
+        if(isPopupWindow(w))return 0; // confirmations always keep ownership
+        if(w && w!=kWinPullouts && w!=kWinReadyCheck)++count;
+    }
+    return count;
+}
+
+void WorldScreen::cycleWindow(int direction) {
+    if(!direction || windowSwitchCount()<2 || dragWin_ || settings_.isOpen() || barAssign_.active())return;
+    // A stable ring independent of z-order: raising a panel must not change
+    // which panel comes next, particularly when cycling backward through 3+.
+    uint8_t order[256];size_t count=0;
+    for(uint8_t w:windows_)if(w && w!=kWinPullouts && w!=kWinReadyCheck)order[count++]=w;
+    std::sort(order,order+count);
+    const uint8_t active=activeWindow();
+    size_t current=0;
+    for(size_t i=0;i<count;++i)if(order[i]==active){current=i;break;}
+    const size_t next=direction>0?(current+1)%count:(current+count-1)%count;
+    raiseWindow(order[next]); // preserves each panel's remembered control and held items
+}
+
+bool WorldScreen::windowSwitchPad(const pp::PadState& pad) {
+    if(!uiMode_ || dragWin_ || settings_.isOpen() || barAssign_.active())return false;
+    const uint32_t shoulders=PSP_CTRL_LTRIGGER|PSP_CTRL_RTRIGGER;
+    const bool quick=(pad.held&shoulders)==shoulders && (pad.pressed&shoulders);
+    const bool previous=(pad.held&PSP_CTRL_LTRIGGER) && (pad.pressed&PSP_CTRL_LEFT);
+    const bool next=(pad.held&PSP_CTRL_LTRIGGER) && (pad.pressed&PSP_CTRL_RIGHT);
+    if(!quick && !previous && !next)return false;
+    cycleWindow(previous?-1:1);
+    return true; // never pass a switch press into an item action or panel tab
+}
+
+bool WorldScreen::windowBack(const pp::PadState& pad) {
+    if(!((pad.pressed|pad.released)&PSP_CTRL_CIRCLE))return false;
+    if(invHeld_.active && !windowOpen(kWinDeleteItem)){invHeld_=InvHeld{};winFocus_.cancelPresses();return true;}
+    if(bookPick_){bookPick_=0;bookPickItem_=false;winFocus_.cancelPresses();return true;}
+    const uint8_t w=activeWindow();
+    if(w==kWinDeleteItem){invHeld_=InvHeld{};closeWindow(w);return true;}
+    if(!w){setUiMode(false);winFocus_.cancelPresses();return true;}
+    if(deathPopupKeepsOnEscape(w))return true;
+    if(w==kWinBags && !(pad.held&PSP_CTRL_LTRIGGER))return closeFocusedBag();
+    // Container/equipment slots retain Circle's contextual item action.
+    uint8_t bag=0,slot=0;
+    if(!isPopupWindow(w) && (inventoryIdToWire(winFocus_.focused(),bag,slot) || (w==kWinBank && bankIdToWire(winFocus_.focused(),bag,slot))))return false;
+    if(w==kWinMenu)toggleGameMenu();else closeWindow(w);
+    return true;
+}
+
+bool WorldScreen::windowManagementAction(uint32_t act) {
+    const uint32_t kind=act&0xFFFF0000u;
+    if(kind!=0x00FE0000u && kind!=0x00FD0000u && kind!=0x00FB0000u && kind!=0x00FA0000u)return false;
+    const uint8_t w=static_cast<uint8_t>(act);
+    if(w!=activeWindow())return true;
+    if(kind==0x00FB0000u || kind==0x00FA0000u){cycleWindow(kind==0x00FA0000u?1:-1);return true;}
+    if(kind==0x00FE0000u){if(w==kWinMenu)toggleGameMenu();else if(!deathPopupKeepsOnEscape(w))closeWindow(w);return true;}
+    if(w==kWinBags || isPopupWindow(w)||(w==kWinWorldMap&&!mapMini()) || (pspLayoutActive() && (w==kWinBags || w==kWinBank)))return true;
+    const auto it=winRect_.find(w);if(it==winRect_.end())return true;
+    dragOrigin_=WinPos{it->second.x,it->second.y};winPos_[w]=dragOrigin_;dragWin_=w;
+    dragShoulder_=false;
+    dragReturnFocus_=winFocus_.rememberedFocus(w);
+    winFocus_.cancelPresses();return true;
+}
+
 void WorldScreen::updateWindows(const pp::PadState& pad, float dtSec) {
+    // Route switching before L+stick window movement and any per-panel input.
+    if(windowSwitchPad(pad)){winFocus_.update(pp::PadState{},dtSec);return;}
+    const bool wasDragging=dragWin_!=0;
+    pp::PadState movePad=pad;
+    if(!barAssign_.active() || wasDragging)dragWindows(movePad,pad);
+    if(wasDragging || dragWin_){winFocus_.update(pp::PadState{},dtSec);return;}
     // Cross = the left mouse button, Circle = the right one (FocusRing activated /
-    // activatedAlt), START = Esc: it closes the top window, with none open it opens the game menu
-    // (was: Circle closed windows and left the interface). SELECT still leaves the interface.
+    // activatedAlt). START is handled globally before any window; SELECT leaves the interface.
+    if (barAssign_.active()) {
+        bool popup=false;
+        for (uint8_t w : windows_) popup = popup || isPopupWindow(w);
+        if (!popup) { updateSpellAssignment(pad,dtSec); return; }
+        cancelSpellAssignment();
+    }
+    winFocus_.setPanelNavigation(true);
+    uint8_t modal = 0;
+    for (auto it = windows_.rbegin(); it != windows_.rend(); ++it)
+        if (isPopupWindow(*it)) { modal = *it; break; }
+    winFocus_.setModalGroup(modal);
+    const uint8_t active = activeWindow();
+    // PSP: HUD contextual clicks complete before an unhandled Circle falls back to Back.
+    const bool immediateBack = invHeld_.active || bookPick_ ||
+                               active == kWinDeleteItem || active == kWinBags || deathPopupKeepsOnEscape(active);
+    if ((pad.pressed & PSP_CTRL_CIRCLE) && immediateBack && windowBack(pad)) {
+        winFocus_.update(pp::PadState{}, dtSec);
+        return;
+    }
     pp::PadState p = pad;
     p.held &= ~PSP_CTRL_START;
     p.pressed &= ~PSP_CTRL_START;
     p.released &= ~PSP_CTRL_START;
-    if ((pad.pressed & PSP_CTRL_START)) {
-        if (mapCloseDropDown()) {  // Esc closes the map's dropdown list first
-            winFocus_.update(p, dtSec);
-            return;
-        }
-        if (tradeSkillCloseDropDown()) {  // Esc closes the trade skill dropdown list first
-            winFocus_.update(p, dtSec);
-            return;
-        }
-        if (wotlkCloseDropDown()) {  // Esc closes the LFD / achievement / calendar lists first
-            winFocus_.update(p, dtSec);
-            return;
-        }
-        if (socialCloseDropDown()) {  // Esc closes the status / who / rank lists first
-            winFocus_.update(p, dtSec);
-            return;
-        }
-        if (ggbCloseDropDown()) {  // Esc closes ChannelListDropDown / the roster menu first
-            winFocus_.update(p, dtSec);
-            return;
-        }
-        if (petClearCursor()) {  // Esc drops a pet action / a stable pet off the cursor (ClearCursor)
-            winFocus_.update(p, dtSec);
-            return;
-        }
-        // A popup without hideOnEscape (DEATH, RECOVER_CORPSE) is passed by.
-        // Two windows at once: START closes only the menu and popups (StaticPopup
-        // EscapePressed); with panels open it opens the game menu over them - they stay (the panels close with
-        // their close button or Circle on the title).
-        uint8_t escTop = 0;
-        for (auto it = windows_.rbegin(); it != windows_.rend() && !escTop; ++it)
-            if (!deathPopupKeepsOnEscape(*it) && isPopupWindow(*it)) escTop = *it;
-        if (itemUseEscape()) {
-            // Esc while an item spell waits for its item - SpellStopTargeting
-        } else if (ggbEscape()) {
-            // Esc with a glyph waiting for its socket / a vault item on the cursor
-        } else if (bookPick_ != 0) {
-            bookPick_ = 0;  // Esc with a spell on the cursor drops it (ClearCursor)
-            bookPickItem_ = false;
-        } else if (escTop != 0) {
-            // layers - the Debug window is drawn on top, so it closes first.
-            if (windowOpen(kWinDebug)) closeWindow(kWinDebug);
-            else closeWindow(escTop);  // through closeWindow (its sound)
-        } else {
-            openWindow(kWinMenu);
-        }
-    }
+
     tipCompareHeld_ = (pad.held & PSP_CTRL_LTRIGGER) != 0;  // L = Shift (IsModifiedClick("COMPAREITEMS"))
-    dragWindows(p, pad);  // R + stick moves a window
     dressUpPad(p);  // L + Triangle = Ctrl+click (DressUpItemLink) - before the loot window's Triangle
-    lootWindowPad(p);  // loot - Up / Triangle take all, before the focus sees Up
+    if(activeWindow()==kWinLoot)lootWindowPad(p); // only the active loot panel may consume Up/Triangle
     partyWindowPad(p);  // a click outside the unit menu closes it (before the focus moves)
     raidBgWindowPad(p);  // Square = the drag (raid members, pullouts), clicks outside a dropdown
     socialWindowPad(p);  // a click outside the social dropdown list closes it
     petWindowPad(p);  // Square = the drag (pet buttons, stable slots)
     mapZonePad(p);  // the D-pad walks the world map's zones on the continent view
     winFocus_.update(p, dtSec);
-    if (dragWin_) {
-        // The window follows the cursor the stick just moved.
-        // The saved top-left follows the cursor; windowPos() keeps the
-        // whole window on the screen (was: 40 x 20 px of it).
-        WinPos& wp = winPos_[dragWin_];
-        wp.dx += winFocus_.cursorX() - dragX_;
-        wp.dy += winFocus_.cursorY() - dragY_;
-        dragX_ = winFocus_.cursorX();
-        dragY_ = winFocus_.cursorY();
-        auto it = winRect_.find(dragWin_);
-        if (it != winRect_.end()) {
-            const Rect& r = it->second;
-            wp.dx = std::clamp(wp.dx, 0.0f, std::max(0.0f, pp::kScreenW - r.w));
-            wp.dy = std::clamp(wp.dy, 0.0f, std::max(0.0f, pp::kScreenH - r.h));
-        }
-        return;  // no clicks while dragging
-    }
     if (deleteItemPad(p)) return;  // the held item put down on the world -> DELETE_ITEM
     ggbWindowPad(p);        // Square on the vault's slots (before the bags' own)
     bankMailWindowPad(p);   // Square on the bank / letter slots (before the bags' own)
     auctionWindowPad(p);    // Square on the sell slot (its drag)
-    inventoryWindowPad(p);  // inventory (Square = pick up / put down)
+    inventoryWindowPad(p);  // Triangle = switch bags, L+Square = split; Cross moves via its click action
     spellWindowPad(p);      // Square on a book spell / an action button = pick up
     fxWindowPad(p);  // framexml - Square on a FrameXML frame = its right click
     // Circle with nothing under it (a window's title band) closes that window.
-    if ((p.released & PSP_CTRL_CIRCLE) && !winFocus_.activatedAlt() && closeTitleUnderCursor()) return;
+    if (winFocus_.emptyAltClick()) {
+        if (invHeld_.active) invHeld_=InvHeld{};
+        else if (bookPick_) { bookPick_=0; bookPickItem_=false; }
+        else if (!closeTitleUnderCursor()) {
+            uint8_t top=0;
+            for (auto it=windows_.rbegin();it!=windows_.rend();++it)
+                if (!deathPopupKeepsOnEscape(*it)) { top=*it;break; }
+            if (top) closeWindow(top); else if (windows_.empty()) setUiMode(false);
+        }
+        return;
+    }
     // Circle = the right click on what the focus is on.
     if (const uint32_t alt = winFocus_.activatedAlt()) {
         if (partyAltAction(alt)) return;  // a unit frame - its menu (UnitPopup)
@@ -313,11 +414,25 @@ void WorldScreen::updateWindows(const pp::PadState& pad, float dtSec) {
         if (lootWindowAction(alt)) return;      // a loot slot: take it
         if (trainerAltAction(alt)) return;      // a trainer service - select and learn it
         if (mapWindowAltAction(alt)) return;    // the map - zoom out (WorldMapButton RightButton)
-        if (alt >= 0x5C80 && alt < 0x5C8C) spellWindowAction(alt);  // a book spell - CastSpell
+        if (alt >= 0x5C80 && alt < 0x5C8C) {
+            castBookSpell(alt);  // a book spell - CastSpell
+            return;
+        }
+        windowBack(p);  // no contextual action handled this release
         return;
     }
     const uint32_t act = winFocus_.activated();
     if (!act) return;
+    // Menu buttons close the menu before opening their destination. Preserve
+    // interface navigation across that transition, including the new grid menu.
+    struct UiActionGuard {
+        WorldScreen& screen; uint8_t before; bool wasUi;
+        ~UiActionGuard(){
+            if(wasUi && !screen.uiMode_ && screen.activeWindow() && screen.activeWindow()!=before)
+                screen.setUiMode(true);
+        }
+    } actionGuard{*this,activeWindow(),uiMode_};
+    if(windowManagementAction(act))return;
     if (partyWindowAction(act)) return;  // unit frames, the unit menu, PARTY_INVITE
     if (petWindowAction(act)) return;  // PetFrame, PetActionBar, PetStableFrame, the pet popups / tabs
     if (classBarWindowAction(act)) return;  // the class bars, VehicleMenuBar, the flyout
@@ -368,11 +483,16 @@ void WorldScreen::updateWindows(const pp::PadState& pad, float dtSec) {
             else openWindow(kWinDebug);
             break;
         case kIdMenuGraphics: settings_.open(liveSettings()); break;
-        case kIdMenuExit:
-            PSP_LOGI(pp::tag::Exit, "reason=menu_exit");
-            pp::systemRequestExit();
+        case kIdMenuLogout:
+            if (session_.logoutPending()) session_.cancelLogout();
+            else session_.requestLogout(false);
+            closeWindow(kWinMenu);
             break;
-        case kIdMenuClose: closeWindow(kWinMenu); break;
+        case kIdMenuExit:
+            session_.requestLogout(true);
+            closeWindow(kWinMenu);
+            break;
+        case kIdMenuClose: toggleGameMenu(); break;
         case kIdDbgOverlay:
             prof::toggleOverlay();
             logSet("overlay", prof::overlayOn() ? 1 : 0);
@@ -450,14 +570,21 @@ void WorldScreen::updateWindows(const pp::PadState& pad, float dtSec) {
     }
 }
 
-// Windows move. R held + stick: the window under the cursor
-// (topmost first) follows the cursor; release R to drop it - the place is
+// Windows move through the Move action or by holding L and moving the stick. Confirming saves the place
 // saved in wowee.cfg as winxy_<id>=x,y (the top-left on the screen;
 // the build-84 offsets winpos_<id> are ignored). The world map (full screen) stays.
 // Returns the offset for this frame's draw: the saved place (if any) against the
 // window's default bounds of the last frame, clamped so the WHOLE window stays on
 // the screen - every frame, not only while dragging.
 WorldScreen::WinPos WorldScreen::windowPos(uint8_t w) {
+    if(w==kWinBags || (pspLayoutActive() && w==kWinBank))return WinPos{};
+    if(isPopupWindow(w)) {
+        const auto it=winBase_.find(w);
+        if(it==winBase_.end())return WinPos{};
+        const Rect& b=it->second;
+        return WinPos{std::max(0.f,(pp::kScreenW-b.w)*.5f)-b.x,
+                      std::max(0.f,(pp::kScreenH-b.h)*.5f)-b.y};
+    }
     if (!winPosLoaded_) {
         winPosLoaded_ = true;
         for (int id = 1; id < 256; ++id) {
@@ -495,43 +622,34 @@ WorldScreen::WinPos WorldScreen::windowPos(uint8_t w) {
 }
 
 void WorldScreen::dragWindows(pp::PadState& p, const pp::PadState& pad) {
-    const bool rHeld = (pad.held & PSP_CTRL_RTRIGGER) != 0;
-    if (rHeld && !dragWin_ && (pad.pressed & PSP_CTRL_RTRIGGER)) {
-        const float cx = winFocus_.cursorX(), cy = winFocus_.cursorY();
-        for (auto it = winDrawn_.rbegin(); it != winDrawn_.rend(); ++it) {
-            auto r = winRect_.find(*it);
-            if ((*it != kWinWorldMap || mapMini()) && r != winRect_.end() && r->second.contains(cx, cy)) {
-                dragWin_ = *it;
-                break;
-            }
-        }
-        if (dragWin_) {
-            const Rect& r = winRect_[dragWin_];
-            winPos_[dragWin_] = WinPos{r.x, r.y};  // from where it is drawn now
-            dragX_ = cx;
-            dragY_ = cy;
-            PSP_LOGI(pp::tag::Ctrl, "window_drag id=%u", static_cast<unsigned>(dragWin_));
-        }
+    if(!dragWin_) {
+        if(!uiMode_ || !(pad.held&PSP_CTRL_LTRIGGER) ||
+           (std::abs(pad.ax)<.2f && std::abs(pad.ay)<.2f))return;
+        const uint8_t w=activeWindow();
+        if(!w || isPopupWindow(w) || (w==kWinWorldMap&&!mapMini()))return;
+        windowManagementAction(0x00FD0000u|w);
+        if(!dragWin_)return;
+        dragShoulder_=true;
     }
-    if (dragWin_ && !rHeld) {
-        const WinPos wp = winPos_[dragWin_];
-        char key[16], val[32];
-        std::snprintf(key, sizeof(key), "winxy_%02x", static_cast<unsigned>(dragWin_));
-        std::snprintf(val, sizeof(val), "%.0f,%.0f", wp.dx, wp.dy);
-        pp::configSet(key, val);
-        pp::configSave();
-        PSP_LOGI(pp::tag::Ctrl, "window_drop id=%u pos=%s", static_cast<unsigned>(dragWin_), val);
-        dragWin_ = 0;
+    const uint8_t w=dragWin_;
+    if(pad.pressed&PSP_CTRL_CIRCLE){winPos_[w]=dragOrigin_;dragWin_=0;winFocus_.focusGroup(w);if(dragReturnFocus_)winFocus_.setFocus(dragReturnFocus_);winFocus_.cancelPresses();p=pp::PadState{};return;}
+    if((pad.pressed&PSP_CTRL_CROSS) || (dragShoulder_ && !(pad.held&PSP_CTRL_LTRIGGER))){
+        const WinPos wp=winPos_[w];char key[16],val[32];
+        std::snprintf(key,sizeof(key),"winxy_%02x",static_cast<unsigned>(w));
+        std::snprintf(val,sizeof(val),"%.0f,%.0f",wp.dx,wp.dy);
+        pp::configSet(key,val);pp::configSave();dragWin_=0;winFocus_.focusGroup(w);if(dragReturnFocus_)winFocus_.setFocus(dragReturnFocus_);winFocus_.cancelPresses();p=pp::PadState{};return;
     }
-    if (dragWin_) {
-        // The stick moves the cursor; the D-pad would jump it between widgets.
-        const uint32_t dpad = PSP_CTRL_UP | PSP_CTRL_DOWN | PSP_CTRL_LEFT | PSP_CTRL_RIGHT;
-        p.held &= ~dpad;
-        p.pressed &= ~dpad;
-    }
+    const auto it=winRect_.find(w);if(it==winRect_.end()){dragWin_=0;return;}
+    WinPos& wp=winPos_[w];const float step=120.f*std::clamp(lastDt_,.001f,.1f);
+    wp.dx+=(pad.ax+((pad.held&PSP_CTRL_RIGHT)?1.f:0.f)-((pad.held&PSP_CTRL_LEFT)?1.f:0.f))*step;
+    wp.dy+=(pad.ay+((pad.held&PSP_CTRL_DOWN)?1.f:0.f)-((pad.held&PSP_CTRL_UP)?1.f:0.f))*step;
+    wp.dx=std::clamp(wp.dx,0.f,std::max(0.f,pp::kScreenW-it->second.w));
+    wp.dy=std::clamp(wp.dy,0.f,std::max(0.f,pp::kScreenH-it->second.h));
+    p=pp::PadState{};
 }
 
 void WorldScreen::drawWindows(UiRenderer& ui) {
+    if(!pspLayoutActive() || !windowOpen(kWinMenu))pspMenuIcons_.release();
     PROF_SCOPE("ui.windows");
     dressUpTick();  // a closed DressUpFrame / character window gives back its model and art
     beginPopups();  // StaticPopup stack, the dialog art
@@ -554,10 +672,12 @@ void WorldScreen::drawWindows(UiRenderer& ui) {
     // they never cover each other; the chat box and its buttons stay clear.
     uint8_t order[32];
     size_t shown = 0;
-    for (uint8_t w : windows_)
-        if (w != kWinDebug && shown < 31) order[shown++] = w;
-    if (windowOpen(kWinDebug)) order[shown++] = kWinDebug;
+    const size_t first=windows_.size()>32?windows_.size()-32:0;
+    for(size_t i=first;i<windows_.size();++i)order[shown++]=windows_[i];
     winDrawn_.assign(order, order + shown);
+    size_t opaqueFrom=0;
+    if(pspLayoutActive() && uiMode_)for(size_t i=0;i<shown;++i)
+        if(order[i]==kWinBags || order[i]==kWinBank)opaqueFrom=i;
     invTipId_ = 0;  // the windows set them, the tooltip is drawn after them all
     tipProtoItem_ = 0;
     tipSpellId_ = 0;  // the book's
@@ -575,8 +695,8 @@ void WorldScreen::drawWindows(UiRenderer& ui) {
     };
     occludeAbove(0);
     drawWotlkAlerts(ui);  // AchievementAlertFrame / DungeonCompletionAlertFrame (under the windows)
-    if (!fullMapOpen()) drawWindowColumn(ui);  // under the windows (hidden with the HUD)
-    // Each window at its own offset; its drawn bounds are what R grabs.
+    if (!fullMapOpen() && !pspLayoutActive()) drawWindowColumn(ui);  // under the windows (hidden with the HUD)
+// Each window at its own offset; the explicit Move action uses these bounds.
     struct WinScope {
         UiRenderer& ui;
         FocusRing& focus;
@@ -584,11 +704,13 @@ void WorldScreen::drawWindows(UiRenderer& ui) {
         std::unordered_map<uint8_t, Rect>& bases;
         uint8_t w;
         WinPos off;
+        bool dim;
         WinScope(UiRenderer& u, FocusRing& f, std::unordered_map<uint8_t, Rect>& r,
-                 std::unordered_map<uint8_t, Rect>& b, uint8_t id, WinPos p)
-            : ui(u), focus(f), rects(r), bases(b), w(id), off(p) {
+                 std::unordered_map<uint8_t, Rect>& b, uint8_t id, WinPos p, bool inactive)
+            : ui(u), focus(f), rects(r), bases(b), w(id), off(p),dim(inactive) {
             ui.setOffset(p.dx, p.dy);
             focus.setOffset(p.dx, p.dy);
+            focus.setGroup(id);
             ui.boundsBegin();
         }
         ~WinScope() {
@@ -597,16 +719,25 @@ void WorldScreen::drawWindows(UiRenderer& ui) {
             // The default place (no offset), what windowPos() clamps.
             if (r.w > 0.0f && r.h > 0.0f) bases[w] = Rect{r.x - off.dx, r.y - off.dy, r.w, r.h};
             ui.setOffset(0.0f, 0.0f);
+            if(dim && r.w>0.f && r.h>0.f)ui.fill(r,0x28000000u);
             focus.setOffset(0.0f, 0.0f);
+            focus.setGroup(0);
         }
     };
     for (size_t wi = 0; wi < shown; ++wi) {
+        if(wi<opaqueFrom)continue; // entirely covered by an opaque inventory grid
         const uint8_t w = order[wi];
+        if(pspLayoutActive() && (w==kWinBags || w==kWinBank)) {
+            if(!uiMode_)continue; // SELECT restores the world; return to UI to resume this grid
+            bool hidden=false;
+            for(size_t next=wi+1;next<shown;++next)hidden=hidden || order[next]==kWinBags || order[next]==kWinBank || (order[next]==kWinWorldMap&&!mapMini());
+            if(hidden)continue; // another full-screen inventory completely covers this grid
+        }
         occludeAbove(wi + 1);
         // The window hides what was declared before it (HUD, chat, the windows under it) from the
         // cursor - its bounds of the last frame, in screen coordinates (no offset yet).
         if (auto br = winRect_.find(w); br != winRect_.end()) winFocus_.addBlocker(br->second);
-        WinScope scope(ui, winFocus_, winRect_, winBase_, w, windowPos(w));
+        WinScope scope(ui, winFocus_, winRect_, winBase_, w, windowPos(w),uiMode_ && w!=activeWindow());
         if (drawCombatWindow(ui, w)) continue;  // combat
         if (drawSpellWindow(ui, w)) continue;   // spells: the spell book
         if (drawLootWindow(ui, w)) continue;  // loot
@@ -731,7 +862,60 @@ void WorldScreen::drawWindows(UiRenderer& ui) {
     drawSocialOverlay(ui);  // FriendsFrame's GameTooltip (a friend, the tabs, the guild buttons)
     drawGgbOverlay(ui);  // the glyph tooltip, the cursor's glyph / vault item
     if (!uiMode_ || settings_.isOpen()) return;
-    kit_.cursor(ui, winFocus_);
+    if (barAssign_.active()) drawSpellAssignment(ui);
+}
+
+void WorldScreen::drawWindowAffordances(UiRenderer& ui) {
+    if(!uiMode_ || settings_.isOpen() || session_.logoutPending() || barAssign_.active())return;
+    const uint8_t w=activeWindow();
+    if(pspLayoutActive() && (w==kWinBags || w==kWinBank))return; // full-screen grids own their close/hint controls
+    const auto it=winRect_.find(w);if(!w || it==winRect_.end())return;
+    const Rect r=it->second;
+    if(r.w<=0.f || r.h<=0.f)return;
+    winFocus_.setGroup(w);
+    if(dragWin_){
+        kit_.controlHint(ui,kit_.font(kFontSmall),r.x+4,r.y+3,dragShoulder_?OWN_STR(WIN_MOVE_HOLD_HINT):OWN_STR(WIN_MOVE_HINT),kColGold);
+        winFocus_.setGroup(0);return;
+    }
+    if(!deathPopupKeepsOnEscape(w)) {
+        const Rect close{std::max(0.f,r.x+r.w-18),std::max(0.f,r.y+2),16,16};
+        kit_.button(ui,winFocus_,0x00FE0000u|w,close,"");
+        kit_.glyph(ui,kPadCircle,Rect{close.x+2,close.y+2,12,12});
+    }
+    if(!isPopupWindow(w) && (w!=kWinWorldMap || mapMini()) && r.w>=110.f) {
+        const Rect move{r.x+r.w-36,r.y+2,16,16};
+        kit_.button(ui,winFocus_,0x00FD0000u|w,move,"");
+        kit_.glyph(ui,kPadStick,Rect{move.x+2,move.y+2,12,12});
+        if(winFocus_.focused()==(0x00FD0000u|w))
+            ui.textShadow(kit_.font(kFontSmall),move.x,move.y+17,OWN_STR(WIN_MOVE),kColGold);
+    }
+    if(windowSwitchCount()>1 && !isPopupWindow(w) && r.w>=110.f) {
+        const Rect previous{r.x+r.w-72,r.y+2,16,16};
+        const Rect next{r.x+r.w-54,r.y+2,16,16};
+        kit_.button(ui,winFocus_,0x00FB0000u|w,previous,"");
+        kit_.glyph(ui,kPadLeft,Rect{previous.x+2,previous.y+2,12,12});
+        kit_.button(ui,winFocus_,0x00FA0000u|w,next,"");
+        kit_.glyph(ui,kPadRight,Rect{next.x+2,next.y+2,12,12});
+        const uint32_t kind=winFocus_.focused()&0xFFFF0000u;
+        if(kind==0x00FB0000u || kind==0x00FA0000u) {
+            const float x=std::clamp(previous.x-90.f,4.f,pp::kScreenW-220.f);
+            const float y=std::min(r.y+20.f,pp::kScreenH-12.f);
+            kit_.controlHint(ui,kit_.font(kFontSmall),x,y,OWN_STR(WIN_SWITCH_HINT),kColGold);
+        }
+    }
+    winFocus_.setGroup(0);
+    Rect focus;
+    if(winFocus_.focusedRect(focus) && focus.w>0.f && focus.h>0.f) {
+        // The glyph is attached to its actual control, above all panels and
+        // tooltips, rather than to a separate global instruction panel.
+        const float x=std::clamp(focus.x+focus.w-5.f,0.f,pp::kScreenW-11.f);
+        const float y=std::clamp(focus.y+focus.h-5.f,0.f,pp::kScreenH-11.f);
+        kit_.glyph(ui,kPadCross,Rect{x,y,10,10});
+        const uint32_t id=winFocus_.focused();
+        if(id>=0x5C80 && id<0x5C8C) {
+            kit_.glyph(ui,kPadSquare,Rect{std::max(0.f,x-11),y,10,10});
+        }
+    }
 }
 
 // The game menu of the original - GameMenuFrame.xml ("every window 1:1 on the original
@@ -740,34 +924,59 @@ void WorldScreen::drawWindows(UiRenderer& ui) {
 // (VIDEOOPTIONS_MENU, EXIT_GAME, RETURN_TO_GAME); the PSP has no micro buttons / key bindings, so the
 // panels they open are buttons here, named as the original names them (CHARACTER, TALENTS, QUEST_LOG,
 // WORLD_MAP), plus the bags and the tutorials (PSP). Absent on the PSP: SOUNDOPTIONS_MENU / UIOPTIONS_MENU (one
-// settings dialog: VIDEOOPTIONS_MENU), KEY_BINDINGS, MACROS, LOGOUT (no logout).
+// settings dialog: VIDEOOPTIONS_MENU), KEY_BINDINGS, MACROS.
 // Nine buttons of 21 units, 1 apart, RETURN_TO_GAME 16 under them: 262 units = 210 px at 0.8 - one column fits.
 // + SOCIAL_BUTTON (FriendsFrame's Raid tab) before EXIT_GAME - 284 units = 227 px.
+void WorldScreen::loadPspMenuIcons() {
+    if(pspMenuIcons_.tried)return;
+    pspMenuIcons_.tried=true;
+    char path[256];pp::fsPath(path,sizeof(path),"data/menuicons.pak");
+    pp::Pak pak;if(!pak.open(path))return;
+    const char* names[]={"settings","character","book","talents","quests","bags","map","tutorials","social","achievements","dungeons","logout","exit","back"};
+    unsigned loaded=0;
+    for(size_t i=0;i<14;++i) {
+        const auto* e=pak.find(names[i]);if(!e)continue;
+        void* blob=pak.load(e);if(!blob)continue;
+        if(pp::textureFromBlob(blob,e->size,pspMenuIcons_.tex[i],true))++loaded;else pp::pakFree(blob);
+    }
+    pak.close();PSP_LOGI(pp::tag::Gfx,"menu_icons loaded=%u",loaded);
+}
+
 void WorldScreen::drawGameMenu(UiRenderer& ui) {
-    constexpr float S = kDialogScale;
+    pspMenuDrawing_=pspLayoutActive();
+    if(pspMenuDrawing_)loadPspMenuIcons();
+    constexpr float S = 0.68f; // thirteen rows plus Return fit the 272px screen
     auto U = [](float units) { return std::floor(units * S + 0.5f); };
     // above RETURN_TO_GAME: SOCIAL_BUTTON, achievements, the dungeon finder
-    constexpr int kRows = 11;
+    constexpr int kRows = 13;
     const float w = U(195), h = U(26.5f + kRows * 22.0f - 1.0f + 16.0f + 21.0f + 23.5f);
-    const Rect r{std::floor((pp::kScreenW - w) * 0.5f), std::floor((pp::kScreenH - h) * 0.5f), w, h};
+    const Rect r=pspLayoutActive()?psp_layout::menu():Rect{std::floor((pp::kScreenW-w)*.5f),std::floor((pp::kScreenH-h)*.5f),w,h};
     drawDialogBox(ui, r);
     drawDialogHeader(ui, r, CLIENT_STR(MAIN_MENU));
     const bool focusable = uiMode_ && !settings_.isOpen() && !windowOpen(kWinBindConfirm);
     // GameMenuButtonOptions: CENTER at TOP 0,-37 (top 26.5); the next ones TOP to BOTTOM 0,-1.
     const float bw = U(144), bh = U(21), bx = r.x + std::floor((w - bw) * 0.5f);
-    auto row = [&](int k) { return Rect{bx, r.y + U(26.5f + static_cast<float>(k) * 22.0f), bw, bh}; };
-    drawGameMenuButton(ui, kIdMenuGraphics, row(0), CLIENT_STR(VIDEOOPTIONS_MENU), focusable);  // PSP: all settings
-    drawInventoryMenuRow(ui, row(1), row(4), focusable);                         // CHARACTER / the bags (PSP)
-    drawGameMenuButton(ui, kIdMenuTalents, row(2), CLIENT_STR(TALENTS), focusable);
-    drawGameMenuButton(ui, kIdNpcQuestLog, row(3), CLIENT_STR(QUEST_LOG), focusable);
-    drawGameMenuButton(ui, kIdMenuMap, row(5), CLIENT_STR(WORLD_MAP), focusable);
-    drawTutorialMenuButton(ui, row(6), focusable);                               // the tutorials
-    drawRaidMenuButton(ui, row(7), focusable);  // SOCIAL_BUTTON (ToggleFriendsFrame())
-    drawWotlkMenuButtons(ui, row(8), row(9), focusable);  // ACHIEVEMENT_BUTTON, DUNGEONS_BUTTON
+    auto row = [&](int k) { return pspLayoutActive()?psp_layout::menuButton(k):Rect{bx, r.y + U(26.5f + static_cast<float>(k) * 22.0f), bw, bh}; };
+    drawGameMenuButton(ui, kIdMenuGraphics, row(0), OWN_STR(SET_TITLE), focusable);  // PSP: all settings
+    drawInventoryMenuRow(ui, row(1), row(5), focusable);                         // CHARACTER / the bags (PSP)
+    drawGameMenuButton(ui, kIdMenuTalents, row(3), CLIENT_STR(TALENTS), focusable);
+    drawGameMenuButton(ui, kIdNpcQuestLog, row(4), CLIENT_STR(QUEST_LOG), focusable);
+    drawGameMenuButton(ui, kIdMenuMap, row(6), CLIENT_STR(WORLD_MAP), focusable);
+    drawTutorialMenuButton(ui, row(7), focusable);                               // the tutorials
+    drawRaidMenuButton(ui, row(8), focusable);  // SOCIAL_BUTTON (ToggleFriendsFrame())
+    drawWotlkMenuButtons(ui, row(9), row(10), focusable);  // ACHIEVEMENT_BUTTON, DUNGEONS_BUTTON
+    drawGameMenuButton(ui, kIdMenuLogout, row(kRows - 2), session_.logoutPending() ? OWN_STR(LOGOUT_CANCEL) : OWN_STR(LOGOUT_SELECT), focusable);
     drawGameMenuButton(ui, kIdMenuExit, row(kRows - 1), CLIENT_STR(EXIT_GAME), focusable);
     // GameMenuButtonContinue: TOP to GameMenuButtonQuit's BOTTOM 0,-16.
-    const Rect back{bx, r.y + U(26.5f + (kRows - 1) * 22.0f + 21.0f + 16.0f), bw, bh};
+    const Rect back=pspLayoutActive()?psp_layout::menuBack():Rect{bx, r.y + U(26.5f + (kRows - 1) * 22.0f + 21.0f + 16.0f), bw, bh};
+    drawGameMenuButton(ui,0x5C01u,row(2),CLIENT_STR(SPELLBOOK),focusable);
     drawGameMenuButton(ui, kIdMenuClose, back, CLIENT_STR(RETURN_TO_GAME), focusable);
+    if(pspMenuDrawing_)for(int i=0;i<14;++i) {
+        const Rect b=i==13?back:row(i);
+        const pp::Texture& icon=(i==1 && ownPortraitOk_ && ownPortraitTex_.pixels)?ownPortraitTex_:pspMenuIcons_.tex[i];
+        if(icon.pixels)ui.image(icon,Rect{b.x+5,b.y+(b.h-20)*.5f,20,20});
+    }
+    pspMenuDrawing_=false;
 }
 
 // The window buttons: a column at the right edge, under the minimap and above
@@ -777,7 +986,9 @@ void WorldScreen::drawGameMenu(UiRenderer& ui) {
 // Only "Book", right of the action bar (under the WatchFrame); "Chat" -> a click on
 // the chat box, "Menu" -> START, "Debug" only with wowee.cfg debugbutton=1 (above "Book").
 void WorldScreen::drawWindowColumn(UiRenderer& ui) {
-    if (!uiMode_ || settings_.isOpen()) return;
+    if(settings_.isOpen())return;
+    if(pspLayoutActive())return; // no quick-access dock in the PSP HUD
+    if (!uiMode_) return;
     const float bw = 64, bh = 20, bx = pp::kScreenW - bw - 4, gap = 2;
     const float by = pp::kScreenH - bh - 4;
     auto covered = [&](const Rect& b) {
@@ -792,9 +1003,28 @@ void WorldScreen::drawWindowColumn(UiRenderer& ui) {
     auto button = [&](uint32_t id, const Rect& r, const char* label) {
         kit_.button(ui, winFocus_, id, r, label, !covered(r));
     };
-    button(0x5C01 /* spells: kIdBarBook */, Rect{bx, by, bw, bh}, OWN_STR(WIN_BOOK));
     static const bool debugButton = pp::configGetInt("debugbutton", 0) != 0;
     if (debugButton) button(kIdBarDebug, Rect{bx, by - bh - gap, bw, bh}, OWN_STR(DBG_TITLE));
+}
+
+void WorldScreen::drawLogoutCountdown(UiRenderer& ui) {
+    if (!session_.logoutCountdownVisible()) return;
+    const bool exiting=session_.logoutExitsGame();
+    const uint32_t seconds=session_.logoutSecondsRemaining();
+    char line[160];
+    if (seconds) std::snprintf(line,sizeof(line),exiting ? OWN_STR(EXIT_COUNTDOWN) : OWN_STR(LOGOUT_COUNTDOWN),static_cast<unsigned>(seconds));
+    else std::snprintf(line,sizeof(line),"%s",OWN_STR(LOGOUT_SERVER_WAIT));
+    StaticPopup p;
+    p.text=line; p.focus=&logoutFocus_; p.focusable=true;
+    if (exiting) {
+        p.button1=OWN_STR(EXIT_NOW); p.button1Id=0x57AB;
+        p.button2=CLIENT_STR(CANCEL); p.button2Id=0x57AA;
+    } else {
+        p.button1=CLIENT_STR(CANCEL); p.button1Id=0x57AA;
+    }
+    popupStackY_=0.0f; // same StaticPopup1 anchor as party/guild invitations
+    drawStaticPopup(ui,p);
+    kit_.cursor(ui,logoutFocus_);
 }
 
 } // namespace wowee::ui::psp

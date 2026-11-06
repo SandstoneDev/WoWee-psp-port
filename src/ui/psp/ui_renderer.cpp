@@ -280,11 +280,11 @@ void UiRenderer::textShadow(const Font& f, float x, float y, const char* utf8, u
     text(f, x, y, utf8, abgr, align);
 }
 
-void UiRenderer::textMarquee(const Font& f, const Rect& box, const char* utf8, uint32_t abgr) {
-    const float w = static_cast<float>(f.measure(utf8)) / scale_;
+void UiRenderer::textMarquee(const Font& f, const Rect& box, const char* utf8, uint32_t abgr,float measuredWidth) {
+    const float w = (measuredWidth>=0 ? measuredWidth : static_cast<float>(f.measure(utf8))) / scale_;
     const float y = box.y + (box.h - f.lineHeight() / scale_) * 0.5f;
     if (w <= box.w) {
-        textShadow(f, box.x + box.w * 0.5f, y, utf8, abgr, Align::Center);
+        textShadow(f, box.x + (box.w-w)*0.5f, y, utf8, abgr, Align::Left);
         return;
     }
     constexpr float kPause = 1.5f, kSpeed = 25.0f;

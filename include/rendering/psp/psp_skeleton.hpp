@@ -18,6 +18,7 @@
 #include <cstdint>
 #include <cstring>
 #include <initializer_list>
+#include <limits>
 
 namespace wowee::rendering::psp {
 
@@ -26,6 +27,23 @@ namespace wowee::rendering::psp {
 struct BoneMatrix {
     float m[12];
 };
+
+// PSP: works on pose matrices (12 floats) or already folded GE matrices (16).
+// Call after pose/crossfade evaluation; no per-vertex CPU skinning or allocation.
+inline void skinBlendPaletteMatrix(const SkinPaletteBlend& blend, const float* matrices,
+                                  uint32_t stride, float* out, uint32_t components) {
+    for (uint32_t i = 0; i < components; ++i) out[i] = 0.0f;
+    unsigned total = 0;
+    for (unsigned i = 0; i < 4; ++i) total += blend.weights[i];
+    if (!total) return;  // used zero-sum slots are rejected by SkinView
+    const float inverse = 1.0f / static_cast<float>(total);
+    for (unsigned k = 0; k < 4; ++k) {
+        if (!blend.weights[k]) continue;
+        const float factor = static_cast<float>(blend.weights[k]) * inverse;
+        const float* matrix = matrices + static_cast<uint32_t>(blend.bones[k]) * stride;
+        for (uint32_t i = 0; i < components; ++i) out[i] += matrix[i] * factor;
+    }
+}
 
 // Checked view of a WSKN blob. init() validates every offset and key index,
 // so a damaged pak entry is rejected instead of read out of bounds.
@@ -39,6 +57,17 @@ struct SkinView {
     const SkinSubBatch* subBatches = nullptr;
     const BoneTrack* tracks = nullptr;
     const int16_t* keys = nullptr;  // 4 per key
+    const SkinPaletteBlend* virtualPalettes = nullptr;
+    const SkinTimingSequence* timings = nullptr;
+
+    const uint32_t* sequenceTimes(uint32_t sequence) const {
+        return timings ? reinterpret_cast<const uint32_t*>(blob + timings[sequence].offset) : nullptr;
+    }
+
+    const SkinPaletteBlend* paletteBlend(const SkinSubBatch& sb, unsigned slot) const {
+        if (!(sb.reserved & kSkinVirtualPalette)) return nullptr;
+        return virtualPalettes + static_cast<size_t>(&sb - subBatches) * kSkinMaxPalette + slot;
+    }
 
     // animOnly: a "WSKA" blob (extra sequences, no vertices) whose skeleton
     // must match `bonesOf` (the model's WSKN).
@@ -47,12 +76,18 @@ struct SkinView {
         if (!data || size < sizeof(SkinHeader)) return false;
         const auto* p = static_cast<const uint8_t*>(data);
         const auto* hh = reinterpret_cast<const SkinHeader*>(p);
-        if (std::memcmp(hh->magic, animOnly ? "WSKA" : "WSKN", 4) != 0 || hh->version != kSkinFormatVersion)
+        if (std::memcmp(hh->magic, animOnly ? "WSKA" : "WSKN", 4) != 0 ||
+            (hh->version != kSkinFormatVersion && hh->version != kSkinFloatScaleVersion &&
+             hh->version != kSkinPrecisionVersion && hh->version != kSkinTimedVersion))
             return false;
         if (hh->boneCount == 0 || hh->boneCount > 255 || (!animOnly && hh->batchCount == 0)) return false;
+        if ((hh->flags & kSkinFloatPosition) && hh->version < kSkinFloatScaleVersion) return false;
+        if ((hh->flags & kSkinHasVirtualPalette) && (hh->version < kSkinPrecisionVersion || animOnly)) return false;
+        if ((hh->flags & (kSkinSlerpRotation | kSkinFloatRotation)) && hh->version != kSkinTimedVersion) return false;
         if (animOnly && (hh->boneCount != bonesOf || hh->batchCount != 0 || hh->subBatchCount != 0)) return false;
         auto fits = [&](uint32_t off, uint64_t bytes) {
-            return (off & 3u) == 0 && off <= size && bytes <= static_cast<uint64_t>(size - off);
+            return (off & 3u) == 0 && off <= size && bytes <= static_cast<uint64_t>(size - off) &&
+                !(hh->version == kSkinTimedVersion && bytes && off < sizeof(SkinHeader) + sizeof(SkinTimingExtension));
         };
         const uint32_t nb = hh->boneCount, ns = hh->sequenceCount;
         if (!fits(hh->boneOffset, uint64_t{nb} * sizeof(SkinBone)) ||
@@ -68,25 +103,110 @@ struct SkinView {
             if (bn[i].parent >= static_cast<int>(i) || bn[i].parent < -1) return false;
         const auto* sq = reinterpret_cast<const AnimSequence*>(p + hh->sequenceOffset);
         const auto* tr = reinterpret_cast<const BoneTrack*>(p + hh->trackOffset);
+        const SkinTimingSequence* tm = nullptr;
+        if (hh->version == kSkinTimedVersion) {
+            if (size < sizeof(SkinHeader) + sizeof(SkinTimingExtension)) return false;
+            const auto* ex = reinterpret_cast<const SkinTimingExtension*>(p + sizeof(SkinHeader));
+            const uint32_t at = ex->timingOffset;
+            if (ex->reserved || !fits(at, sizeof(SkinTimingHeader) + uint64_t{ns} * sizeof(SkinTimingSequence)))
+                return false;
+            const auto* th = reinterpret_cast<const SkinTimingHeader*>(p + at);
+            if (std::memcmp(th->magic, "WTIM", 4) || th->version != 1 || th->sequenceCount != ns) return false;
+            tm = reinterpret_cast<const SkinTimingSequence*>(p + at + sizeof(SkinTimingHeader));
+        }
         for (uint32_t s = 0; s < ns; ++s) {
             if (sq[s].frameCount < 2) return false;
+            if (tm) {
+                if (tm[s].count != sq[s].frameCount || !fits(tm[s].offset, uint64_t{tm[s].count} * 4u)) return false;
+                const auto* times = reinterpret_cast<const uint32_t*>(p + tm[s].offset);
+                if (times[0] != 0 || times[tm[s].count - 1u] != sq[s].durationMs) return false;
+                if (!sq[s].durationMs) {
+                    if (tm[s].count != 2) return false;
+                } else {
+                    for (uint32_t k = 1; k < tm[s].count; ++k) if (times[k] <= times[k - 1u]) return false;
+                }
+            }
             for (uint32_t i = 0; i < nb; ++i) {
                 const BoneTrack& t = tr[s * nb + i];
-                for (uint32_t ref : {t.rotation, t.translation, t.scale}) {
+                const uint32_t refs[] = {t.rotation, t.translation, t.scale};
+                for (int component = 0; component < 3; ++component) {
+                    const uint32_t ref = refs[component];
                     if (ref == kTrackNone) continue;
-                    const uint32_t first = ref & ~kTrackAnimated;
-                    const uint32_t n = (ref & kTrackAnimated) ? sq[s].frameCount : 1u;
+                    const bool compactT = hh->version == kSkinTimedVersion && component == 1 &&
+                        (ref & kTrackCompactTranslation) != 0;
+                    const uint32_t first = ref & ~(kTrackAnimated | (compactT ? kTrackCompactTranslation : 0u));
+                    uint32_t n = (ref & kTrackAnimated) ? sq[s].frameCount : 1u;
+                    // PSP: scale has float xyz rather than three clipped int16s in v2.
+                    const bool floatScale = (hh->version >= kSkinFloatScaleVersion && component == 2) ||
+                        (hh->version == kSkinTimedVersion && component == 1 && !compactT);
+                    const bool floatRotation = component == 0 && (hh->flags & kSkinFloatRotation);
+                    if (floatScale || floatRotation) n *= 2u;
                     if (first > hh->keyCount || n > hh->keyCount - first) return false;
+                    if (compactT) {
+                        if (!(hh->translationScale > 0.0f) || !std::isfinite(hh->translationScale)) return false;
+                        for (uint32_t k = 0; k < n; ++k) {
+                            int16_t words[4];
+                            std::memcpy(words, p + hh->keyOffset + (first + k) * 8u, sizeof(words));
+                            const uint16_t code = static_cast<uint16_t>(words[3]);
+                            if (code & 0x8000u) return false;
+                            for (unsigned axis = 0; axis < 3; ++axis) {
+                                const unsigned exponent = (code >> (axis * 5u)) & 31u;
+                                const float step = hh->translationScale / static_cast<float>(uint32_t{1} << exponent);
+                                if (!std::isfinite(words[axis] * step)) return false;
+                            }
+                        }
+                    }
+                    if (floatScale)
+                        for (uint32_t k = 0; k < n; k += 2) {
+                            float xyz[3];
+                            std::memcpy(xyz, p + hh->keyOffset + (first + k) * 8u, sizeof(xyz));
+                            for (float x : xyz) if (!std::isfinite(x)) return false;
+                        }
+                    if (floatRotation)
+                        for (uint32_t k = 0; k < n; k += 2) {
+                            float q[4];
+                            std::memcpy(q, p + hh->keyOffset + (first + k) * 8u, sizeof(q));
+                            float length2 = 0;
+                            for (float c : q) {
+                                if (!std::isfinite(c)) return false;
+                                length2 += c * c;
+                            }
+                            if (!(length2 > 1e-12f) || !std::isfinite(length2)) return false;
+                        }
                 }
             }
         }
         const auto* sb = reinterpret_cast<const SkinSubBatch*>(p + hh->subBatchOffset);
+        const SkinPaletteBlend* vp = nullptr;
+        if (hh->flags & kSkinHasVirtualPalette) {
+            const uint32_t at = hh->reserved[2];
+            const uint64_t bytes = sizeof(SkinPaletteHeader) +
+                uint64_t{hh->subBatchCount} * kSkinMaxPalette * sizeof(SkinPaletteBlend);
+            if (!fits(at, bytes)) return false;
+            const auto* ph = reinterpret_cast<const SkinPaletteHeader*>(p + at);
+            if (std::memcmp(ph->magic, "WVPL", 4) || ph->version != 1 || ph->slots != kSkinMaxPalette ||
+                ph->subBatchCount != hh->subBatchCount) return false;
+            vp = reinterpret_cast<const SkinPaletteBlend*>(p + at + sizeof(SkinPaletteHeader));
+        }
         for (uint32_t i = 0; i < hh->subBatchCount; ++i) {
+            if ((sb[i].reserved & ~(kSkinWeights16 | kSkinVirtualPalette)) ||
+                (sb[i].reserved && hh->version < kSkinPrecisionVersion) ||
+                ((sb[i].reserved & kSkinVirtualPalette) && !vp)) return false;
             if (sb[i].weights < 1 || sb[i].weights > kSkinMaxPalette || (sb[i].vertexOffset & 15u) ||
-                !fits(sb[i].vertexOffset, sb[i].vertexCount * static_cast<uint32_t>(skinVertexStride(sb[i].weights))))
+                !fits(sb[i].vertexOffset, sb[i].vertexCount * static_cast<uint32_t>(
+                    skinVertexStride(sb[i].weights, (hh->flags & kSkinFloatPosition) != 0, sb[i].reserved))))
                 return false;
-            for (int j = 0; j < sb[i].weights; ++j)
-                if (sb[i].palette[j] >= nb) return false;
+            for (int j = 0; j < sb[i].weights; ++j) {
+                if (sb[i].reserved & kSkinVirtualPalette) {
+                    const auto& blend = vp[i * kSkinMaxPalette + j];
+                    unsigned sum = 0;
+                    for (int k = 0; k < 4; ++k) {
+                        if (blend.weights[k] && blend.bones[k] >= nb) return false;
+                        sum += blend.weights[k];
+                    }
+                    if (!sum) return false;
+                } else if (sb[i].palette[j] >= nb) return false;
+            }
         }
         const auto* bt = reinterpret_cast<const ModelBatch*>(p + hh->batchOffset);
         for (uint32_t i = 0; i < hh->batchCount; ++i)
@@ -101,6 +221,8 @@ struct SkinView {
         subBatches = sb;
         tracks = tr;
         keys = reinterpret_cast<const int16_t*>(p + hh->keyOffset);
+        virtualPalettes = vp;
+        timings = tm;
         return true;
     }
 
@@ -136,6 +258,75 @@ inline void key4(const int16_t* keys, uint32_t ref, uint32_t k0, float f, float*
 
 namespace skel_detail {
 
+inline void keyFloat3(const int16_t* keys, uint32_t ref, uint32_t frame, float factor, float out[3]) {
+    const int16_t* a = keys + static_cast<size_t>(ref & ~kTrackAnimated) * 4u;
+    const bool animated = (ref & kTrackAnimated) != 0;
+    if (animated) a += frame * 8u;
+    float first[3], next[3];
+    std::memcpy(first, a, sizeof(first));
+    std::memcpy(next, animated ? a + 8 : a, sizeof(next));
+    for (int c = 0; c < 3; ++c) out[c] = first[c] + (next[c] - first[c]) * factor;
+}
+
+// PSP: exact interpolation is paid only by clips that explicitly request it.
+// Float keys also remove the int16 angular precision floor on long lever arms.
+inline void keyRotation(const int16_t* keys, uint32_t ref, uint32_t frame, float factor,
+                        bool floats, bool slerp, float out[4]) {
+    const bool animated = (ref & kTrackAnimated) != 0;
+    const unsigned stride = floats ? 8u : 4u;  // int16 words
+    const int16_t* a = keys + static_cast<size_t>(ref & ~kTrackAnimated) * 4u;
+    if (animated) a += frame * stride;
+    const int16_t* b = animated ? a + stride : a;
+    float qa[4], qb[4];
+    if (floats) {
+        std::memcpy(qa, a, sizeof(qa));std::memcpy(qb, b, sizeof(qb));
+    } else {
+        for (unsigned c = 0; c < 4; ++c) {qa[c] = a[c];qb[c] = b[c];}
+    }
+    if (!slerp) {
+        for (unsigned c = 0; c < 4; ++c) out[c] = qa[c] + (qb[c] - qa[c]) * factor;
+        return;
+    }
+    const auto unit = [](float q[4]) {
+        const float length2 = q[0]*q[0] + q[1]*q[1] + q[2]*q[2] + q[3]*q[3];
+        if (!(length2 > 1e-12f)) {q[0]=q[1]=q[2]=0;q[3]=1;return;}
+        const float inverse = 1.0f / std::sqrt(length2);
+        for (unsigned c = 0; c < 4; ++c) q[c] *= inverse;
+    };
+    unit(qa);unit(qb);
+    float cosine = 0;
+    for (unsigned c = 0; c < 4; ++c) cosine += qa[c] * qb[c];
+    if (cosine < 0) {cosine = -cosine;for (float& c : qb) c = -c;}
+    if (cosine > 1) cosine = 1;
+    if (!animated || factor <= 0) {std::memcpy(out, qa, sizeof(qa));return;}
+    if (factor >= 1) {std::memcpy(out, qb, sizeof(qb));return;}
+    // Match the source sampler's epsilon, including very small rotations.
+    if (cosine > 1.0f - std::numeric_limits<float>::epsilon()) {
+        for (unsigned c = 0; c < 4; ++c) out[c] = qa[c] + (qb[c] - qa[c]) * factor;
+    } else {
+        const float angle = std::acos(cosine), denominator = std::sin(angle);
+        const float first = std::sin((1.0f - factor) * angle) / denominator;
+        const float next = std::sin(factor * angle) / denominator;
+        for (unsigned c = 0; c < 4; ++c) out[c] = qa[c] * first + qb[c] * next;
+    }
+}
+
+inline void keyCompactTranslation(const int16_t* keys, uint32_t ref, uint32_t frame,
+                                  float factor, float baseScale, float out[3]) {
+    const int16_t* a = keys + static_cast<size_t>(ref & ~(kTrackAnimated | kTrackCompactTranslation)) * 4u;
+    const bool animated = (ref & kTrackAnimated) != 0;
+    if (animated) a += frame * 4u;
+    const int16_t* b = animated ? a + 4 : a;
+    for (unsigned axis = 0; axis < 3; ++axis) {
+        const auto decode = [&](const int16_t* key) {
+            const unsigned exponent = (static_cast<uint16_t>(key[3]) >> (axis * 5u)) & 31u;
+            return key[axis] * (baseScale / static_cast<float>(uint32_t{1} << exponent));
+        };
+        const float first = decode(a), next = decode(b);
+        out[axis] = first + (next - first) * factor;
+    }
+}
+
 // Local rotation / translation / scale of every bone of one sequence at one
 // time (keys of the frame pair around it, linear between them).
 struct Sampler {
@@ -149,12 +340,27 @@ struct Sampler {
         if (!view.h || seq < 0 || seq >= view.h->sequenceCount) return false;
         const AnimSequence& s = view.sequences[seq];
         const uint32_t last = s.frameCount - 1u;
-        float x = s.durationMs > 0 ? timeMs * static_cast<float>(last) / static_cast<float>(s.durationMs) : 0.0f;
-        if (!(x > 0.0f)) x = 0.0f;  // also NaN
-        if (x > static_cast<float>(last)) x = static_cast<float>(last);
-        k0 = static_cast<uint32_t>(x);
-        if (k0 >= last) k0 = last - 1u;
-        f = x - static_cast<float>(k0);
+        if (const uint32_t* times = view.sequenceTimes(static_cast<uint32_t>(seq))) {
+            float time = timeMs;
+            if (!(time > 0.0f)) time = 0.0f;  // also NaN
+            if (time > s.durationMs) time = static_cast<float>(s.durationMs);
+            uint32_t lo = 0, hi = last;
+            while (lo + 1u < hi) {
+                const uint32_t mid = lo + (hi - lo) / 2u;
+                if (times[mid] <= time) lo = mid;
+                else hi = mid;
+            }
+            k0 = lo;
+            const uint32_t span = times[lo + 1u] - times[lo];
+            f = span ? (time - static_cast<float>(times[lo])) / static_cast<float>(span) : 0.0f;
+        } else {
+            float x = s.durationMs > 0 ? timeMs * static_cast<float>(last) / static_cast<float>(s.durationMs) : 0.0f;
+            if (!(x > 0.0f)) x = 0.0f;
+            if (x > static_cast<float>(last)) x = static_cast<float>(last);
+            k0 = static_cast<uint32_t>(x);
+            if (k0 >= last) k0 = last - 1u;
+            f = x - static_cast<float>(k0);
+        }
         tr = view.tracks + static_cast<size_t>(seq) * view.h->boneCount;
         v = &view;
         return true;
@@ -168,20 +374,33 @@ struct Sampler {
         sv[0] = sv[1] = sv[2] = 1.0f;
         float k[4];
         if (t.rotation != kTrackNone) {
-            key4(v->keys, t.rotation, k0, f, k);
+            const bool exact = (v->h->flags & (kSkinSlerpRotation | kSkinFloatRotation)) != 0;
+            if (exact) keyRotation(v->keys, t.rotation, k0, f,
+                                  (v->h->flags & kSkinFloatRotation) != 0,
+                                  (v->h->flags & kSkinSlerpRotation) != 0, k);
+            else key4(v->keys, t.rotation, k0, f, k);
             const float len2 = k[0] * k[0] + k[1] * k[1] + k[2] * k[2] + k[3] * k[3];
             if (len2 > 1e-12f) {
-                const float inv = platform::psp::vmath::rsqrt(len2);
+                const float inv = exact ? 1.0f / std::sqrt(len2) : platform::psp::vmath::rsqrt(len2);
                 for (int c = 0; c < 4; ++c) q[c] = k[c] * inv;
             }
         }
         if (t.translation != kTrackNone) {
-            key4(v->keys, t.translation, k0, f, k);
-            for (int c = 0; c < 3; ++c) tv[c] = k[c] * v->h->translationScale;
+            if (v->h->version == kSkinTimedVersion && (t.translation & kTrackCompactTranslation))
+                keyCompactTranslation(v->keys, t.translation, k0, f, v->h->translationScale, tv);
+            else if (v->h->version == kSkinTimedVersion) keyFloat3(v->keys, t.translation, k0, f, tv);
+            else {
+                key4(v->keys, t.translation, k0, f, k);
+                for (int c = 0; c < 3; ++c) tv[c] = k[c] * v->h->translationScale;
+            }
         }
         if (t.scale != kTrackNone) {
-            key4(v->keys, t.scale, k0, f, k);
-            for (int c = 0; c < 3; ++c) sv[c] = k[c] * (1.0f / kSkinScaleOne);
+            if (v->h->version >= kSkinFloatScaleVersion) {
+                keyFloat3(v->keys, t.scale, k0, f, sv);
+            } else {
+                key4(v->keys, t.scale, k0, f, k);
+                for (int c = 0; c < 3; ++c) sv[c] = k[c] * (1.0f / kSkinScaleOne);
+            }
         }
     }
 };
@@ -240,6 +459,8 @@ inline void evaluatePose(const SkinView& v, int seq, float timeMs, BoneMatrix* o
     }
     skel_detail::Sampler prev;
     const bool blend = from && w < 1.0f && from->h && from->h->boneCount == nb && prev.init(*from, fromSeq, fromTimeMs);
+    const bool exactBlend = blend && ((v.h->flags | from->h->flags) &
+                                     (kSkinSlerpRotation | kSkinFloatRotation));
     if (!(w > 0.0f)) w = 0.0f;
     for (uint32_t i = 0; i < nb; ++i) {
         float q[4], tv[3], sv[3];
@@ -255,7 +476,7 @@ inline void evaluatePose(const SkinView& v, int seq, float timeMs, BoneMatrix* o
                 len2 += q[c] * q[c];
             }
             if (len2 > 1e-12f) {
-                const float inv = platform::psp::vmath::rsqrt(len2);
+                const float inv = exactBlend ? 1.0f / std::sqrt(len2) : platform::psp::vmath::rsqrt(len2);
                 for (float& c : q) c *= inv;
             } else {
                 q[0] = q[1] = q[2] = 0.0f;

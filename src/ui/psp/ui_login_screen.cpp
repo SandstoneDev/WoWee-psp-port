@@ -5,8 +5,10 @@
 #include "platform/psp/psp_bigheap.hpp"
 #include "platform/psp/psp_config.hpp"
 #include "platform/psp/psp_display.hpp"
+#include "platform/psp/psp_fs.hpp"
 #include "platform/psp/psp_locale.hpp"  // the client's languages
 #include "platform/psp/psp_log.hpp"
+#include "platform/psp/psp_music_path.hpp"
 #include "platform/psp/psp_login_store.hpp"  // PSP: the saved login outside the game folder
 #include "platform/psp/psp_osk.hpp"
 #include "platform/psp/psp_net.hpp"
@@ -23,6 +25,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <malloc.h>  // mallinfo (the transfer's memory line)
 
 namespace wowee::ui::psp {
@@ -93,9 +96,69 @@ void realmType(const auth::Realm& r, const char*& text, uint32_t& col) {
 LoginScreen::LoginScreen(const UiKit& kit, LoginSettings settings) : kit_(kit), settings_(std::move(settings)) {}
 
 LoginScreen::~LoginScreen() {
+    if (menuMusicOwned_) pp::musicStop(0);
+    pp::textureRelease(loginBackground_);
+    pp::textureRelease(loginLogo_);
     loadingSetHook(nullptr, nullptr);
     pp::pakSetReadTick(nullptr, nullptr);
     if (auth_) auth_->disconnect();
+}
+
+void LoginScreen::loadLoginMedia() {
+    if (loginMediaTried_) return;
+    loginMediaTried_=true;
+    // Music must not depend on installing the optional backdrop pack.
+    std::snprintf(menuMusicRel_,sizeof(menuMusicRel_),"sound/music/gluescreenmusic/wotlk_main_title.mp3");
+    char path[256]; pp::fsPath(path,sizeof(path),"data/login.pak");
+    pp::Pak pak;
+    if (!pak.open(path)) {
+        PSP_LOGW(pp::tag::Sys,"login_media missing=%s using_default_title_music=1",path);
+        return;
+    }
+    if (const auto* entry=pak.find("background")) {
+        void* blob=entry->size<=512u*1024u ? pak.load(entry) : nullptr;
+        if (blob && !pp::textureFromBlob(blob,entry->size,loginBackground_,true)) pp::pakFree(blob);
+    }
+    if (const auto* entry=pak.find("logo")) {
+        void* blob=entry->size<=128u*1024u ? pak.load(entry) : nullptr;
+        if (blob && !pp::textureFromBlob(blob,entry->size,loginLogo_,true)) pp::pakFree(blob);
+    }
+    if (const auto* entry=pak.find("music")) {
+        auto* blob=entry->size>1 && entry->size<sizeof(menuMusicRel_) ? static_cast<char*>(pak.load(entry)) : nullptr;
+        if (blob) {
+            if (blob[entry->size-1]==0 && !std::strstr(blob,"..") && !std::strchr(blob,':'))
+                std::snprintf(menuMusicRel_,sizeof(menuMusicRel_),"%s",blob);
+            pp::pakFree(blob);
+        }
+    }
+    pak.close();
+}
+
+void LoginScreen::updateMenuMusic() {
+    // GlueParent.lua uses CurrentGlueMusic (GS_LichKing) across login,
+    // realms and character screens. In-world menus keep the zone soundtrack.
+    const bool entering=world_ && (world_->state()==pp::WorldSession::State::WaitWorld ||
+                                  world_->state()==pp::WorldSession::State::InWorld);
+    if (worldView_ || loading_.active() || entering || transferUnloaded_) {
+        if (menuMusicOwned_) pp::musicStop(800);
+        menuMusicOwned_=false;
+        return;
+    }
+    loadLoginMedia();
+    if (!menuMusicRel_[0]) return;
+    pp::musicSetVolume(std::clamp(pp::configGetInt("musicvol",30),0,100)*.01f);
+    const uint32_t now=pp::logUptimeMs();
+    if ((menuMusicOwned_ && pp::musicActive()) || now<menuMusicRetryMs_) return;
+    char path[256];
+    if (!pp::musicFilePath(path,sizeof(path),menuMusicRel_)) {
+        menuMusicRetryMs_=now+5000u;
+        PSP_LOGW(pp::tag::Sys,"glue_music_missing track=%s layout=data/music/<category>/",menuMusicRel_);
+        return;
+    }
+    pp::musicPlay(path,true,0,800);
+    menuMusicOwned_=true;
+    menuMusicRetryMs_=now+2000u;
+    PSP_LOGI(pp::tag::Sys,"glue_music kit=GS_LichKing loop=1");
 }
 
 void LoginScreen::enterStage(Stage s) {
@@ -343,6 +406,11 @@ void LoginScreen::loadingHook(void* self, float frac) {
 
 // The world is ready on the server: build the world screen under the loading screen.
 void LoginScreen::enterWorldScreen() {
+    if (menuMusicOwned_) pp::musicStop(800);
+    menuMusicOwned_=false;
+    pp::textureRelease(loginBackground_);
+    pp::textureRelease(loginLogo_);
+    loginMediaTried_=false;
     // World entry and its first 20 s write every log line through (the
     // buffered log lost the tail of a hardware crash).
     pp::logSetSync(true);
@@ -493,6 +561,8 @@ void LoginScreen::update(const pp::PadState& pad, float dtSec) {
         introChecked_ = true;
         if (!settings_.autoLogin && MovieFrame::introWanted()) {
             if (MovieFrame::glueAvailable(kClientExpansionLevel)) {
+                pp::musicStop(0);
+                menuMusicOwned_=false; menuMusicRetryMs_=0;
                 movies_.playGlue(*ui_, kClientExpansionLevel);
                 MovieFrame::introPlayed();
             } else {
@@ -501,6 +571,23 @@ void LoginScreen::update(const pp::PadState& pad, float dtSec) {
             }
             return;
         }
+    }
+    updateMenuMusic();
+    if (stage_ == Stage::World && world_ && world_->takeLogoutComplete()) {
+        if (world_->logoutExitsGame()) {
+            pp::systemRequestExit();
+            return;
+        }
+        // Reuse the authenticated account key, but start a fresh world session so no
+        // inventory/aura/quest/character state from the old player can leak into the next.
+        pp::musicStop(0);
+        pp::sfxStopAll();
+        worldView_.reset(); chars_.reset(); world_.reset(); loading_.end();
+        transferUnloaded_=false; transferPendingShown_=false; logSyncUntilMs_=0;
+        pp::logSetSync(false);
+        if (pickedRealm_ < realms_.size() && auth_ && !auth_->getSessionKey().empty()) enterStage(Stage::WorldPending);
+        else backToLogin();
+        return;
     }
     if (stage_ == Stage::World && world_ && world_->state() == pp::WorldSession::State::Failed) {
         // CHAR_LOGIN_FAILED when the server refused the character, DISCONNECTED otherwise
@@ -522,6 +609,7 @@ void LoginScreen::update(const pp::PadState& pad, float dtSec) {
         }
         updateTransferPending();  // SMSG_TRANSFER_PENDING - the next map's loading screen at once
         if (loading_.active() && !transferPendingShown_) {
+            worldView_->setLoadingScreen(true);
             // The world warms up under the loading screen (no input), at least 1 s, at most 8 s.
             // (On hardware it held 6.3 s - vsync makes frames 33 or 50 ms, "20 in a row under 45 ms"
             // kept breaking at ~28 fps): until the last 16 frames average under 40 ms (25 fps).
@@ -546,6 +634,7 @@ void LoginScreen::update(const pp::PadState& pad, float dtSec) {
             return;
         }
         // no input under a pending transfer's loading screen (the world goes on).
+        worldView_->setLoadingScreen(loading_.active());
         worldView_->update(transferPendingShown_ ? pp::PadState{} : pad, dtSec);
         updateGameMovies();  // PLAY_MOVIE / CINEMATIC_START the session took this frame
         if (world_->transferStage() == pp::WorldSession::TransferStage::Ready) beginTransfer();
@@ -747,7 +836,11 @@ void LoginScreen::update(const pp::PadState& pad, float dtSec) {
         if (const int version = cinematics_.pressed(act)) {
             cinematics_.hide();
             PSP_LOGI(pp::tag::Loop, "ui_activate id=0x%X (cinematics) version=%d", static_cast<unsigned>(act), version);
-            if (ui_) movies_.playGlue(*ui_, version);
+            if (ui_) {
+                pp::musicStop(0);
+                menuMusicOwned_=false; menuMusicRetryMs_=0;
+                movies_.playGlue(*ui_, version);
+            }
             focus_.setFocus(kIdCinematicsButton);
         } else if (pad.pressed & (PSP_CTRL_CIRCLE | PSP_CTRL_START)) {
             cinematics_.hide();
@@ -1068,7 +1161,7 @@ void LoginScreen::drawLogin(UiRenderer& ui, const FrameStats& stats, FocusRing& 
     // (BOTTOM 0,275) boxes with their labels, LOGIN (BOTTOM 0,170), QUIT (BOTTOMRIGHT -5,29), the version
     // (BOTTOMLEFT). PSP: the boxes take the system keyboard; the password shows as stars (8 for a
     // saved login).
-    // PSP: no glueLogo - the background art (bg_login) carries the logo already.
+    // The supplied Wrath logo fits above the account label without moving the controls.
     const bool busy = stage_ == Stage::NetDialog || stage_ == Stage::Wifi || stage_ == Stage::ConnectPending ||
                       stage_ == Stage::Connecting || stage_ == Stage::Auth;
     const float cx = pp::kScreenW * 0.5f;
@@ -1088,6 +1181,7 @@ void LoginScreen::drawLogin(UiRenderer& ui, const FrameStats& stats, FocusRing& 
     // AccountLogin panel is hidden - nothing of it shows through the dialog.
     const bool languageUp = language_.shown() || localePrompt_;
     if (!languageUp) {
+        if (loginLogo_.pixels) ui.image(loginLogo_,Rect{cx-80.0f,9.0f,160.0f,80.0f});
         const size_t stars = !settings_.password.empty() ? std::min<size_t>(settings_.password.size(), 16)
                              : settings_.authHash.size() == 20 ? 8 : 0;
         box(96, GLUE_STR(ACCOUNT_NAME), settings_.account, kIdAccountBox);
@@ -1132,7 +1226,9 @@ void LoginScreen::draw(UiRenderer& ui, const FrameStats& stats) {
         return;
     }
     ui.beginFrame();
-    kit_.background(ui, false);
+    loadLoginMedia();
+    if (loginBackground_.pixels) ui.image(loginBackground_,Rect{0,0,static_cast<float>(pp::kScreenW),static_cast<float>(pp::kScreenH)});
+    else kit_.background(ui, false);
     art_.load();
     if (pp::oskActive() || stage_ == Stage::NetDialog) {
         // PSP: the system keyboard / connection dialog draws over this frame - a plain dimmed backdrop under

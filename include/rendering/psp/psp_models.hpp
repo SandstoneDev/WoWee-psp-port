@@ -13,14 +13,21 @@
 // with depth writes off - and a triangle cap as a safety net.
 #pragma once
 
+#include "rendering/psp/psp_model_instance.hpp"
+#include "rendering/psp/psp_world_decoration.hpp"
+
 #include "platform/psp/psp_pak.hpp"
 #include "platform/psp/psp_texture.hpp"
 #include "rendering/psp/psp_model_format.hpp"
+#include "rendering/psp/psp_collision_bounds_index.hpp"
+#include "rendering/psp/psp_collision_candidates.hpp"
+#include "rendering/psp/psp_wall_collision_cache.hpp"
 #include "rendering/psp/psp_terrain.hpp"  // TerrainCamera
 
 #include <pspgu.h>
 
 #include <cstdint>
+#include <memory>
 #include <unordered_set>
 #include <vector>
 
@@ -81,19 +88,23 @@ public:
 
     // The terrain has set projection/view for this camera already.
     void draw(const TerrainCamera& cam, uint32_t fogColorABGR);
+    void visualOffset(uint32_t id,float z) {visualOffsetId_=id;visualOffsetZ_=z;}
     // game object use: the placement `uniqueId` drawn again additively (the client's mouseover
     // highlight of an interactive object); after draw(). False: not drawn.
     bool drawHighlight(uint32_t uniqueId, const TerrainCamera& cam, uint32_t fogColorABGR, uint32_t addABGR);
     const ModelStats& stats() const { return stats_; }
+    void logWallCacheStats() const;
 
     // Collision (M8+, upstream WMORenderer/M2Renderer rules).
     // Highest walkable floor (normal z >= cos 50 deg) under (x, y) at or below
     // probeZ, from WMO groups and M2 collision meshes.
-    bool floorHeight(float x, float y, float probeZ, float& outZ) const;
+    bool floorHeight(float x, float y, float probeZ, float& outZ, uint32_t* placementId = nullptr) const;
     // Pushes `to` out of blocking walls: a cylinder of radius 0.5, height 2
     // standing on feetZ; geometry lower than feetZ + 1 is stepped over.
     void collideWalls(glm::vec3& to, float feetZ) const;
-    uint32_t collisionKb() const { return collisionBytes_ / 1024u; }
+    uint32_t collisionKb() const { return static_cast<uint32_t>((collisionBytes_ + collisionBounds_.bytes()) / 1024u); }
+    bool collisionReadyAt(float x, float y, float z) const;
+    void retryCollisions(platform::psp::Pak& pak);
     // Camera ray against buildings only (upstream raycasts WMOs, not M2s):
     // distance to the first hit along the unit `dir`, or maxDist.
     float raycastBuildings(const glm::vec3& origin, const glm::vec3& dir, float maxDist) const;
@@ -102,6 +113,7 @@ public:
     void loadForestConfig();        // wowee.cfg -> forest (psp_impostors.cpp)
     void logForestStats() const;    // "m2_forest ..." (world_frame cadence)
 
+    float performanceScale = 1.f; // rendering only; collision retains full geometry
     float viewDistance = 160.0f;    // base, scaled per model size
     // big WMOs: a placement with reserved != 0 is a big WMO's doodad (ui_world_bigwmo.cpp), drawn only
     // while bit (reserved - 1) of groupFilter is set - its WMO group is visible through the portals (the client
@@ -130,11 +142,15 @@ private:
         const ModelBatch* batches = nullptr;
         void* colBlob = nullptr;                 // "k_<n>" WCOL, or null
         const CollisionHeader* col = nullptr;
+        bool collisionPending = false;
+        uint32_t collisionRetryMs = 0;
+        uint32_t readyMs = 0; // newly streamed geometry reveals over 400ms
         void* impBlob = nullptr;                 // "i_<n>" WIMP, or null
         const ImpostorHeader* imp = nullptr;
         uint32_t instances = 0;                  // placements using it (VRAM priority)
         bool tried = false;
         uint8_t blendMask = 0;  // frame CPU: bit n = LOD n has blended batches (fills padding)
+        bool excluded = false;  // removed ground-decoration feature, including legacy packs
         bool bad = false;       // failed its checks (broken data, not a short heap)
     };
     struct Tex {
@@ -149,12 +165,8 @@ private:
     static constexpr uint8_t kTexRetries = 5;
     // Static per-doodad data, grouped by grid cell (hardware: the
     // flat loop over ~4.7k doodads cost 5 ms of CPU even at 40 yd).
-    struct Inst {
-        float x, y, z, r;         // world bounding sphere
-        float reach;              // view-distance factor (size, foliage, clutter)
-        const DoodadPlacement* p;
-        const Model* m;
-    };
+    using Inst=ModelInstance<Model>;
+    using CollisionTransform=ModelCollisionTransform;
     struct Cell {
         float x, y, z, r;         // sphere around all its doodads' spheres
         float maxReach;
@@ -164,14 +176,21 @@ private:
         const DoodadPlacement* p;
         const Model* m;
         float dist;
+        float fogStart;
         uint8_t lod;
         ScePspFMatrix4 mtx;  // camera-relative model matrix, built once per frame
     };
 
-    const Model* model(platform::psp::Pak& pak, uint16_t id);
+    const Model* model(platform::psp::Pak& pak, uint16_t id, bool parkedTexturesOnly = false);
+    void loadCollision(platform::psp::Pak& pak, uint16_t id, Model& m);
+    CollisionBoundsIndex collisionBounds_;
+    CollisionCandidates collisionCandidates_;
+    mutable std::unique_ptr<WallCollisionCache> wallCache_;
+    uint32_t pendingCollisionCount_ = 0;
+    std::vector<uint32_t> collisionOrder_; // stable instance order for wall pushes
     const platform::psp::Texture* texture(uint16_t id) const;
     // allowLod: m2texlod may halve it; impostor atlases never (their cell grid).
-    bool loadTexture(platform::psp::Pak& pak, uint16_t id, bool allowLod = true);
+    bool loadTexture(platform::psp::Pak& pak, uint16_t id, bool allowLod = true, bool parkedOnly = false);
     void drawModel(const Visible& v, bool blendPass);
     // PSP (an emulator run: black squares in a village): false = the batch's texture is not loaded (its
     // read failed for want of memory) - the batch is skipped, not drawn untextured (black); the texture is queued for
@@ -180,6 +199,8 @@ private:
     void drawBatch(const Model& m, const ModelBatch& b);
     void moveToVram();
     void buildGrid();
+    float instanceFogStart(const Inst& in,const TerrainCamera& cam,float distance) const;
+    uint32_t drawNowMs_=0;
     // Forest LOD (psp_impostors.cpp)
     uint8_t pickLod(const Inst& in, float dist) const;
     bool pickImpostor(const Inst& in, float dist);
@@ -192,6 +213,7 @@ private:
     std::vector<const DoodadPlacement*> instances_;
     std::unordered_set<uint32_t> seen_;
     std::vector<Inst> insts_;
+    std::vector<CollisionTransform> collisionTransforms_;
     std::vector<Cell> cells_;
     bool gridDirty_ = false;
     std::vector<Visible> visible_;
@@ -237,6 +259,7 @@ public:
     // Rebuilds the cull/collision grid now if a load or unload changed the
     // instances (draw() would do it lazily, but collision queries read it).
     void flushGrid();
+    void excludeGroundDecoration(uint16_t id);
     // Copies the vertices of the most used models not in eDRAM yet, up to
     // maxBytes (at least one model); returns the bytes copied, 0 when nothing
     // is left or nothing fits.
@@ -328,6 +351,7 @@ private:
     struct VisFast {
         const Model* m;
         float dist;
+        float fogStart;
         uint32_t mi;  // its matrix in mtxFast_
         uint8_t lod;
     };
@@ -349,12 +373,16 @@ private:
     float gridMinX_ = 0.0f, gridMinY_ = 0.0f;
     int gridNx_ = 0, gridNy_ = 0, gridSpill_ = 0;
     std::vector<uint16_t> lattice_;  // gridNx_ * gridNy_: index into cells_ + 1 (0 empty); empty = no lattice
+
+    uint32_t visualOffsetId_=0;
+    float visualOffsetZ_=0.f;
     uint32_t gridGen_ = 1;           // bumped by every grid rebuild / clear (memo key)
     struct FloorMemo {
         uint32_t key[3];
         uint32_t gen = 0;
         float z;
         bool found;
+        uint32_t placementId = 0;
     };
     struct RayMemo {
         uint32_t key[9];

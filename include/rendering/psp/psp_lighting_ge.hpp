@@ -1,4 +1,4 @@
-// Lighting on the GE - fog, light tint, sky gradient, glow.
+// Lighting on the GE - fog, light tint, sky gradient.
 //
 // The world keeps its baked vertex light (terrain, doodads, WMO:
 // 0.5 + 0.5 N.sun of a fixed sun, WMO MOCV); what changes with the hour and
@@ -9,7 +9,6 @@
 //     (GU_LIGHTING with no lights, sceGuColorMaterial(GU_AMBIENT)) - or, as a
 //     fallback, one full-screen multiply after the 3D (geometry only);
 //   - sky: a screen-space grid coloured by upstream's skybox.frag gradient;
-//   - glow: quarter-resolution copy of the frame added back "screen" style.
 // The renderers call lightBegin/lightEnd where they set their fog (one line
 // each); the world screen fills frameLight() per frame
 // (src/ui/psp/ui_world_lighting.cpp).
@@ -18,6 +17,7 @@
 #include "rendering/lighting_manager.hpp"  // upstream LightingParams
 #include "rendering/psp/psp_sky_grid.hpp"  // SkyColors, skyColorAt, abgrFrom (host-testable)
 #include "rendering/psp/psp_terrain.hpp"   // TerrainCamera
+#include "rendering/psp/psp_fog_policy.hpp"
 
 #include <cstdint>
 
@@ -30,6 +30,7 @@ enum LightTintMode : int {
 };
 
 struct FrameLight {
+    bool adaptiveFog = false;
     bool fogBands = false;             // fog from the bands; false = the caller's colour at 0.55..0.98 far
     uint32_t fogABGR = 0xFFE0B080u;
     float fogStart = 250.0f, fogEnd = 440.0f;  // yards, already fitted to the far plane
@@ -43,6 +44,9 @@ FrameLight& frameLight();
 
 // In place of `sceGuFog(far * 0.55, far * 0.98, fogColor); sceGuEnable(GU_FOG)`.
 void lightBegin(const TerrainCamera& cam, uint32_t fogColorABGR);
+FogRange lightFogRange(const TerrainCamera& cam);
+// Object-local fog blend; leaves material alpha, cutouts and depth rules intact.
+void lightObjectFog(float start);
 // In place of `sceGuDisable(GU_FOG)`: fog, and the tint's GE state, off.
 void lightEnd();
 // cfg dither3d - the GE's 4 x 4 ordered dither (the sky's matrix) on every lit 3D
@@ -84,11 +88,8 @@ struct SkyCacheStats {
 };
 SkyCacheStats skyCacheStatsTake();  // since the last call
 
-// After the 3D, before the HUD: the screen tint (kTintScreen) and the glow.
-// glowPercent 0 = off; needs glowReserve() at world entry (before the models).
-bool glowReserve();
-bool glowAvailable();
-void drawPost(int glowPercent);
+// After the 3D, before the HUD: optional screen tint (kTintScreen).
+void drawPost();
 
 // abgrFrom (0xAABBGGRR from 0..1 RGB): psp_sky_grid.hpp.
 

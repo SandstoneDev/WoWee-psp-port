@@ -18,7 +18,7 @@
 //   doodadradius=200  yd to a tile's square for its doodads (0 = every tile of the window);
 //                     dropped past it + 96 yd. World entry (WorldScreen::loadDoodads) uses the same radius.
 //   the memory budget:
-//   streamjobkb=3072  KB of models (m_ + k_) one job reads at most, nearest the player first; the rest of the tile
+//   streamjobkb=768   KB of models (m_ + k_) one job reads at most, nearest the player first; the rest of the tile
 //                     is deferred and read by top-up jobs (0 = the whole tile, as before)
 //   tilereserve=1536  KB the heap must still give while a job's models are placed (else deferred, freed)
 //   terrainidle=5000  ms without a read before the terrain pak's descriptor goes back (0 = held, as before)
@@ -39,6 +39,7 @@
 // Profiler zones: stream, stream.read, stream.install.
 #include "ui/psp/ui_world_screen.hpp"
 #include "ui/psp/ui_world_streaming.hpp"
+#include "rendering/psp/psp_collision_stream_policy.hpp"
 
 #include "platform/psp/psp_bigheap.hpp"
 #include "platform/psp/psp_config.hpp"
@@ -273,6 +274,18 @@ bool TileStreamer::needsDoodads(const TileRec& t, float px, float py) const {
     return doodadPak_.find(name) != nullptr;
 }
 
+bool TileStreamer::doodadPlacementMemoryOk(int x, int y, bool nearTile) {
+    char name[24];
+    std::snprintf(name, sizeof(name), "d_%d_%d", x, y);
+    const pp::PakEntry* entry = doodadPak_.find(name);
+    if (!entry) return true;
+    const uint32_t need = rp::tilePlacementHeadroom(tileReserveKb_, entry->size, false);
+    const auto probe = nearTile ? rp::ModelRenderer::budgetNearProbe : rp::ModelRenderer::budgetProbe;
+    if (probe(need)) return true;
+    if (x == curX_ && y == curY_) terrainStarved_ = true;
+    return false;
+}
+
 // A tile in whose terrain could not be loaded for want of memory (or a failed read) - its retry is due.
 bool TileStreamer::needsTerrain(const TileRec& t) const {
     if (t.terrain || !t.terrainRetry || !terrainPak_.isOpen()) return false;
@@ -289,7 +302,8 @@ void TileStreamer::computeQueue(float px, float py) {
             if (x < 0 || x > 63 || y < 0 || y > 63) continue;
             const uint32_t k = tileKey(x, y);
             const TileRec* have = findTile(x, y);
-            if ((have && !needsDoodads(*have, px, py) && !needsTerrain(*have)) ||
+            if ((have && !needsTerrain(*have) &&
+                 (!needsDoodads(*have, px, py) || !have->doodadRetryDue(pp::logUptimeMs()))) ||
                 std::find(absent_.begin(), absent_.end(), k) != absent_.end())
                 continue;
             if (job_.active && job_.x == x && job_.y == y) continue;
@@ -300,7 +314,11 @@ void TileStreamer::computeQueue(float px, float py) {
         const float cx = (31.5f - keyY(k)) * kTile - px, cy = (31.5f - keyX(k)) * kTile - py;
         return cx * cx + cy * cy;
     };
-    std::sort(queue_.begin(), queue_.end(), [&](uint32_t a, uint32_t b) { return dist2(a) < dist2(b); });
+    const uint32_t current = tileKey(curX_, curY_);
+    std::sort(queue_.begin(), queue_.end(), [&](uint32_t a, uint32_t b) {
+        if (a == current || b == current) return a == current && b != current;
+        return dist2(a) < dist2(b);
+    });
     if (!queue_.empty())
         PSP_LOGI(pp::tag::Gfx, "stream_queue n=%u tile=%d_%d next=%d_%d", static_cast<unsigned>(queue_.size()), curX_,
                  curY_, keyX(queue_.front()), keyY(queue_.front()));
@@ -392,7 +410,7 @@ void TileStreamer::onDoodads(Env& env, const void* blobPtr, uint32_t size) {
         bool asked = false;
         for (const Job::ModelRef& m : job_.models) asked = asked || m.id == id;
         if (asked) continue;
-        if (jobKb_ && !job_.models.empty() && job_.modelBytes >= jobKb_ * 1024u) break;
+        if (job_.models.size() >= 16 || job_.modelBytes >= jobKb_ * 1024u) break;
         requestModel(env, id, key);
     }
 }
@@ -402,13 +420,17 @@ void TileStreamer::requestModel(Env& env, uint16_t id, uint32_t key) {
     (void)env;
     char name[16];
     std::snprintf(name, sizeof(name), "m_%u", static_cast<unsigned>(id));
-    const size_t before = job_.models.size();
+    const pp::PakEntry* model = doodadPak_.find(name);
+    if (!model) return;
+    char collisionName[16];
+    std::snprintf(collisionName, sizeof(collisionName), "k_%u", static_cast<unsigned>(id));
+    const pp::PakEntry* collision = doodadPak_.find(collisionName);
+    const uint32_t bytes = model->size + (collision ? collision->size : 0u);
+    // A single large model can still load by itself.
+    if (!job_.models.empty() && job_.modelBytes + bytes > jobKb_ * 1024u) return;
     request(doodadPak_, doodadFd_, name, kModel, id, key);
-    if (job_.models.size() == before) return;  // not in the pak: model() fails the same way
-    job_.modelBytes += job_.models.back().size;
-    std::snprintf(name, sizeof(name), "k_%u", static_cast<unsigned>(id));
-    if (const pp::PakEntry* e = doodadPak_.find(name)) job_.modelBytes += e->size;
-    request(doodadPak_, doodadFd_, name, kCollision, id, key);
+    job_.modelBytes += bytes;
+    request(doodadPak_, doodadFd_, collisionName, kCollision, id, key);
 }
 
 // the install's budget - the player's place, tilereserve, only what the loader parked.
@@ -471,7 +493,9 @@ bool TileStreamer::stepTopUp(Env& env) {
             bestInView = inView;
         }
     }
-    if (!best) return stepTexRetry(env, now);  // nothing deferred - missing textures, if any
+    // Give visible missing textures a turn between model batches.
+    if (!best) return stepTexRetry(env, now);
+    if ((topUps_ + texRetryJobs_) % 2u != 0 && stepTexRetry(env, now)) return true;
     topUpNextMs_ = now + 1000u;
     if (!memoryOk(false, bestInView)) return false;
     job_ = Job{};
@@ -484,9 +508,12 @@ bool TileStreamer::stepTopUp(Env& env) {
     job_.wantDoodads = true;
     job_.deferredBefore = env.models.deferredCount(best->x, best->y);
     std::vector<uint16_t> ids;
-    env.models.deferredModels(doodadPak_, best->x, best->y, env.x, env.y, jobKb_ ? jobKb_ * 1024u : 0xFFFFFFFFu, ids);
+    env.models.deferredModels(doodadPak_, best->x, best->y, env.x, env.y, jobKb_ * 1024u, ids);
     const uint32_t key = tileKey(best->x, best->y);
-    for (uint16_t id : ids) requestModel(env, id, key);
+    for (uint16_t id : ids) {
+        if (job_.models.size() >= 16) break;
+        requestModel(env, id, key);
+    }
     ++topUps_;
     return true;
 }
@@ -544,6 +571,12 @@ void TileStreamer::onModel(Env& env, uint16_t id, const void* blobPtr, uint32_t 
     if (!blob || size < sizeof(rp::ModelHeader) || std::memcmp(h->magic, "WMDL", 4) != 0 ||
         h->version != rp::kModelFormatVersion)
         return;
+    if(rp::excludedGroundDecoration(h->flags)) {
+        env.models.excludeGroundDecoration(id);
+        char name[16];std::snprintf(name,sizeof(name),"m_%u",static_cast<unsigned>(id));
+        if(const auto* e=doodadPak_.find(name))if(void* parked=pp::pakPrefetchTake(doodadPak_.fileId(),e->offset))pp::pakFree(parked);
+        return; // No atlas, impostor or retry work for removed decoration.
+    }
     const uint32_t batches = static_cast<uint32_t>(h->batchCount[0]) + h->batchCount[1] +
                              ((h->flags & rp::kModelLod2) ? h->lod2BatchCount : 0u);  // far LOD
     if (h->batchOffset + batches * sizeof(rp::ModelBatch) > size) return;
@@ -554,8 +587,11 @@ void TileStreamer::onModel(Env& env, uint16_t id, const void* blobPtr, uint32_t 
         const uint16_t t = b[i].texture;
         if (t == rp::kNoTexture || env.models.textureKnown(t)) continue;
         if (std::find(job_.textures.begin(), job_.textures.end(), t) != job_.textures.end()) continue;
-        job_.textures.push_back(t);
         std::snprintf(name, sizeof(name), "x_%u", static_cast<unsigned>(t));
+        const pp::PakEntry* texture = doodadPak_.find(name);
+        if (!texture || job_.textureBytes + texture->size > 768u * 1024u) continue;
+        job_.textures.push_back(t);
+        job_.textureBytes += texture->size;
         request(doodadPak_, doodadFd_, name, kTexture, t, key);
     }
     // a tree's impostor "i_<n>" (ModelRenderer::loadImpostor
@@ -818,14 +854,17 @@ void TileStreamer::startJob(Env& env, int x, int y, bool doodadsOk) {
         }
     }
     std::snprintf(name, sizeof(name), "d_%d_%d", x, y);
+    const TileRec* existing = findTile(x, y);
     // A terrain job started on the ground's margin reads no doodads now (they would take the room
     // the ground was given) - the tile's doodads are asked again (needsDoodads) when streamreserve is there.
     if (doodadsOk && doodadPak_.isOpen() && doodadPak_.find(name) && !env.models.hasTile(x, y) &&
-        wantDoodads(x, y, env.x, env.y)) {
+        wantDoodads(x, y, env.x, env.y) &&
+        (!existing || existing->doodadRetryDue(job_.startMs)) &&
+        ((existing && !job_.wantTerrain) || doodadPlacementMemoryOk(x, y, job_.nearRule))) {
         job_.wantDoodads = true;
         request(doodadPak_, doodadFd_, name, kDoodads, 0, key);
     }
-    if (findTile(x, y)) {  // a tile already in - only its doodads (needsDoodads)
+    if (existing) {  // a tile already in - only its doodads (needsDoodads)
         if (!job_.wantTerrain && !job_.wantDoodads) job_.active = false;
         return;
     }
@@ -892,6 +931,19 @@ bool TileStreamer::stepInstall(Env& env) {
             env.models.resumeTile(doodadPak_, job_.x, job_.y, b);
         } else {
             ok = env.models.loadTile(doodadPak_, job_.x, job_.y, b);
+            const uint32_t fileId = doodadPak_.fileId();
+            // The placement blob stays parked if its install ran out of headroom.
+            // Drop optional textures and retry the placements before rereading the tile.
+            if (!ok && !job_.textures.empty() && pp::pakPrefetchPeek(fileId, job_.doodadOffset)) {
+                char name[16];
+                for (uint16_t id : job_.textures) {
+                    std::snprintf(name, sizeof(name), "x_%u", static_cast<unsigned>(id));
+                    if (const pp::PakEntry* entry = doodadPak_.find(name))
+                        if (void* parked = pp::pakPrefetchTake(fileId, entry->offset)) pp::pakFree(parked);
+                }
+                ok = env.models.loadTile(doodadPak_, job_.x, job_.y, b);
+                PSP_LOGI(pp::tag::Gfx, "tile_placement_retry x=%d y=%d ok=%d", job_.x, job_.y, ok ? 1 : 0);
+            }
         }
         env.models.flushGrid();  // collision queries read the grid before the next draw
         pp::pakPrefetchDrop(doodadPak_.fileId());  // models of doodads a neighbour already placed
@@ -899,7 +951,12 @@ bool TileStreamer::stepInstall(Env& env) {
         job_.installUs += nowUs() - t0;
         job_.doodadsDone = true;
         if (rec) {
-            if (!job_.topUp) rec->doodads = ok;
+            if (!job_.topUp) {
+                rec->doodads = ok;
+                rec->doodadRetry = !ok;
+                rec->doodadRetryMs = pp::logUptimeMs() + 5000u;
+                if (!ok && job_.x == curX_ && job_.y == curY_) terrainStarved_ = true;
+            }
             rec->deferred = rec->doodads && env.models.deferredCount(job_.x, job_.y) > 0;
         }
         return true;
@@ -995,7 +1052,7 @@ void TileStreamer::start(Env& env, const char* mapDir) {
     terrainReserveKb_ = static_cast<uint32_t>(std::clamp(pp::configGetInt("terrainreserve", 1024), 0, 16384));  // B121
     doodadYd_ = static_cast<float>(std::clamp(pp::configGetInt("doodadradius", 200), 0, 2000));
     // doodads by budget, the terrain pak's descriptor back when idle.
-    jobKb_ = static_cast<uint32_t>(std::clamp(pp::configGetInt("streamjobkb", 3072), 0, 65536));
+    jobKb_ = static_cast<uint32_t>(std::clamp(pp::configGetInt("streamjobkb", 768), 128, 768));
     tileReserveKb_ = static_cast<uint32_t>(std::clamp(pp::configGetInt("tilereserve", 1536), 0, 32768));
     terrainIdleMs_ = static_cast<uint32_t>(std::clamp(pp::configGetInt("terrainidle", 5000), 0, 600000));
     texMaxRuns_ = static_cast<uint32_t>(std::clamp(pp::configGetInt("terraintexreads", 6), 1, 64));
@@ -1084,6 +1141,7 @@ void TileStreamer::start(Env& env, const char* mapDir) {
 void TileStreamer::update(Env& env, float /*dtSec*/) {
     if (!active_) return;
     PROF_SCOPE("stream");
+    if (doodadPak_.isOpen()) env.models.retryCollisions(doodadPak_);
     const uint32_t t0 = nowUs();
     // Live units replace the DB spawns (WorldScreen::syncCreatures): drop ours.
     if (!env.staticNpcs || !npcStatic_) {
@@ -1114,9 +1172,10 @@ void TileStreamer::update(Env& env, float /*dtSec*/) {
         checkY_ = env.y;
         computeQueue(env.x, env.y);
     } else if (queue_.empty() && !job_.active && static_cast<int32_t>(pp::logUptimeMs() - retryScanMs_) >= 0) {
-        retryScanMs_ = pp::logUptimeMs() + 1000u;  // a tile's ground whose retry is due
+        retryScanMs_ = pp::logUptimeMs() + 1000u;  // failed ground OR initial doodads, even while stationary
         for (const TileRec& t : tiles_)
-            if (inWindow(t.x, t.y) && needsTerrain(t)) {
+            if (inWindow(t.x, t.y) && (needsTerrain(t) ||
+                                      (needsDoodads(t, env.x, env.y) && t.doodadRetryDue(pp::logUptimeMs())))) {
                 computeQueue(env.x, env.y);
                 break;
             }
@@ -1139,8 +1198,10 @@ void TileStreamer::update(Env& env, float /*dtSec*/) {
         if (!did && !job_.active) {
             while (!queue_.empty()) {
                 const uint32_t k = queue_.front();
-                const TileRec* have = findTile(keyX(k), keyY(k));  // in, but its doodads wanted now
-                if ((have && !needsDoodads(*have, env.x, env.y) && !needsTerrain(*have)) || !inWindow(keyX(k), keyY(k))) {
+                TileRec* have = findTile(keyX(k), keyY(k));  // in, but its doodads wanted now
+                if ((have && !needsTerrain(*have) &&
+                     (!needsDoodads(*have, env.x, env.y) || !have->doodadRetryDue(pp::logUptimeMs()))) ||
+                    !inWindow(keyX(k), keyY(k))) {
                     queue_.erase(queue_.begin());
                     continue;
                 }
@@ -1151,6 +1212,13 @@ void TileStreamer::update(Env& env, float /*dtSec*/) {
                 const bool needTerrain = !env.terrain.hasTile(keyX(k), keyY(k)) && terrainPak_.find(tname);
                 // A tile within the doodads' view distance loads them by the near rule.
                 const bool nearTile = yardsTo(keyX(k), keyY(k), env.x, env.y) <= env.models.viewDistance;
+                if (!needTerrain && have && !doodadPlacementMemoryOk(keyX(k), keyY(k), nearTile)) {
+                    ++lowStarves_;
+                    have->doodadRetry = true;
+                    have->doodadRetryMs = pp::logUptimeMs() + 1000u;
+                    queue_.erase(queue_.begin());
+                    continue;
+                }
                 if (!memoryOk(needTerrain, nearTile)) {
                     if (!needTerrain) {
                         // (Seen on the emulator: tiles=6 queue=7 for minutes - the doodads at the queue's head
@@ -1272,10 +1340,9 @@ void TileStreamer::stepTextures(Env& env) {
 // The landing hold, ui_teleport_hold.hpp: the tile under (x, y) has its doodads in (or none to load).
 bool TileStreamer::doodadsInAt(float x, float y) {
     const int tx = static_cast<int>(std::floor(32.0f - y / kTile)), ty = static_cast<int>(std::floor(32.0f - x / kTile));
-    if (job_.active && job_.x == tx && job_.y == ty && job_.wantDoodads && !job_.doodadsDone) return false;
     const TileRec* t = findTile(tx, ty);
-    if (!t) return false;
-    return t->doodads || !needsDoodads(*t, x, y);
+    const bool loading=job_.active && job_.x==tx && job_.y==ty && job_.wantDoodads && !job_.doodadsDone;
+    return rendering::psp::collisionDoodadsReady(t!=nullptr,t && t->doodads,t && needsDoodads(*t,x,y),loading);
 }
 
 // The window is in - every baked tile of it with its ground, every tile within doodadradius with its
@@ -1289,6 +1356,8 @@ void TileStreamer::checkReady(Env& env) {
         return;
     }
     const uint32_t now = pp::logUptimeMs();
+    if(!rp::pollStreamReadiness(now,readyCheckNextMs_))return;
+    PROF_SCOPE("stream.ready");
     if (!readySinceMs_) readySinceMs_ = now | 1u;
     // near: what the player can see is in - every baked tile with its ground, every doodad tile within the view
     // distance loaded, no deferred placement in view, no missing texture. full: all of the window as well.

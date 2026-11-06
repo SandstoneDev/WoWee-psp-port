@@ -29,7 +29,8 @@ constexpr uint16_t kModelFormatVersion = 1;
 
 enum ModelFlags : uint16_t {
     kModelFoliage = 1u << 0,       // tree/bush: drawn farther, alpha-tested leaves
-    kModelGroundDetail = 1u << 1,  // grass/clutter: drawn close only
+    kModelGrassPatch = 1u << 6,   // legacy grass patch; excluded by the PSP runtime
+    kModelGroundDetail = 1u << 1,  // legacy grass/clutter: excluded by the PSP runtime
     kModelBuilding = 1u << 2,      // WMO group (M8): placed like a doodad, drawn far
     kModelNearSplit = 1u << 4,     // LOD 0 = big triangles split (drawn only near the camera),
                                    // LOD 1 = the original mesh
@@ -276,11 +277,27 @@ static_assert(sizeof(LayerHeader) == 16, "WLAY header is 16 bytes");
 // / 32767 (consecutive frames on one hemisphere); translation x, y, z *
 // translationScale; scale x, y, z / kSkinScaleOne.
 constexpr uint16_t kSkinFormatVersion = 1;
+// PSP: v2 keeps the v1 layout, but scale keys occupy TWO 8-byte key slots
+// containing float xyz + zero padding. Only models exceeding v1's +/-8 scale
+// range need v2; old runtimes reject them instead of silently clipping scale.
+constexpr uint16_t kSkinFloatScaleVersion = 2;
+constexpr uint16_t kSkinPrecisionVersion = 3;  // PSP: precise weights / virtual palettes
+constexpr uint16_t kSkinTimedVersion = 4;      // PSP: authored times and float translation keys
+constexpr uint16_t kSkinFloatPosition = 1u << 2;  // PSP: normalized float xyz, wide-scale models only
+constexpr uint16_t kSkinHasVirtualPalette = 1u << 3;
+// PSP: opt-in v4 rotation modes; legacy clips retain their existing sampler.
+constexpr uint16_t kSkinSlerpRotation = 1u << 4;
+constexpr uint16_t kSkinFloatRotation = 1u << 5;  // float xyzw in two 8-byte slots
+constexpr uint8_t kSkinWeights16 = 1u << 0;     // SkinSubBatch.reserved, v3 only
+constexpr uint8_t kSkinVirtualPalette = 1u << 1;
 constexpr int kSkinMaxPalette = 8;          // GE bone matrices
 constexpr float kSkinWeightOne = 128.0f;    // GU_WEIGHT_8BIT
 constexpr float kSkinScaleOne = 4096.0f;
 constexpr uint32_t kTrackNone = 0xFFFFFFFFu;
 constexpr uint32_t kTrackAnimated = 0x80000000u;
+// PSP: v4 T only; xyz int16 + three 5-bit negative axis exponents in word4.
+// Scale = translationScale / 2^exponent. One 8-byte slot per compact key.
+constexpr uint32_t kTrackCompactTranslation = 0x40000000u;
 
 struct SkinHeader {
     char magic[4];          // "WSKN"
@@ -349,7 +366,40 @@ struct SkinSubBatch {
 };
 static_assert(sizeof(SkinSubBatch) == 16, "WSKN sub-batch is 16 bytes");
 
+// PSP: table at SkinHeader.reserved[2], followed by subBatchCount * 8 slots.
+// Virtual IDs are local to a sub-batch; the number of global blends is unbounded.
+struct SkinPaletteHeader {
+    char magic[4];  // WVPL
+    uint16_t version, slots;  // 1, 8
+    uint32_t subBatchCount;
+};
+struct SkinPaletteBlend {
+    uint8_t bones[4];
+    uint8_t weights[4];  // normalized on their sum, like the source skinning
+};
+static_assert(sizeof(SkinPaletteHeader) == 12, "WVPL header is 12 bytes");
+static_assert(sizeof(SkinPaletteBlend) == 8, "WVPL blend is 8 bytes");
+
+// PSP: v4 follows the 120-byte SkinHeader with this extension. All sections
+// start at or after byte128; WTIM entries point to absolute u32 millisecond times.
+struct SkinTimingExtension { uint32_t timingOffset, reserved; };
+struct SkinTimingHeader { char magic[4]; uint32_t version, sequenceCount; };
+struct SkinTimingSequence { uint32_t offset, count; };
+static_assert(sizeof(SkinTimingExtension) == 8, "timing extension is 8 bytes");
+static_assert(sizeof(SkinTimingHeader) == 12, "WTIM header is 12 bytes");
+static_assert(sizeof(SkinTimingSequence) == 8, "WTIM sequence is 8 bytes");
+
 constexpr int skinVertexStride(int weights) { return ((weights + 1) & ~1) + 12; }
+constexpr int skinWeightBytes(int weights, uint8_t flags = 0) {
+    return (flags & kSkinWeights16) ? weights * 2 : ((weights + 1) & ~1);
+}
+constexpr int skinPositionOffset(int weights, bool floatPosition, uint8_t flags = 0) {
+    const int offset = skinWeightBytes(weights, flags) + 6;
+    return floatPosition ? (offset + 3) & ~3 : offset;
+}
+constexpr int skinVertexStride(int weights, bool floatPosition, uint8_t flags = 0) {
+    return skinPositionOffset(weights, floatPosition, flags) + (floatPosition ? 12 : 6);
+}
 
 // Emotes (M9c), in characters.pak:
 //   "o_<race>_<sex>"  WSKA: extra sequences for the same skeleton as n_ (a

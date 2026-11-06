@@ -209,6 +209,8 @@ void WorldScreen::applyTeleport(const glm::vec3& to, float orientation) {
     const bool flush = pp::configGetInt("tpflush", 1) != 0 &&
                        teleportLeavesWindow(playerX_, playerY_, to.x, to.y,
                                             std::clamp(pp::configGetInt("streamradius", 1), 0, 1));
+    wmoSafeValid_ = false;
+    fallStartZ_ = to.z;
     playerX_ = to.x;
     playerY_ = to.y;
     playerZ_ = to.z;
@@ -248,12 +250,16 @@ bool WorldScreen::teleportHold() {
     if (!tpHold_.active) return false;
     const uint32_t now = pp::logUptimeMs();
     TeleportHoldState st;
-    float tz = 0.0f;
-    st.terrainLoaded = wmoOnly_ || terrain_.heightAt(playerX_, playerY_, tz);
+    st.terrainLoaded = wmoOnly_ || terrain_.tileLoadedAt(playerX_, playerY_);
     st.doodadsLoaded = wmoOnly_ || !stream_.active() || stream_.doodadsInAt(playerX_, playerY_);
     uint32_t colResident = 0, colWanted = 0;
     bigWmoLanding(playerX_, playerY_, playerZ_, st.insideBigWmo, st.wmoReady, colResident, colWanted);
-    const float floor = floorAt(playerX_, playerY_, playerZ_ + 0.6f);
+    st.objectCollisionReady = models_.collisionReadyAt(playerX_, playerY_, playerZ_) &&
+                              goModels_.collisionReadyAt(playerX_, playerY_, playerZ_) &&
+                              transportCollisionReady(playerX_, playerY_, playerZ_);
+    const float floor = st.objectCollisionReady && (!st.insideBigWmo || st.wmoReady) &&
+                                (st.doodadsLoaded || st.insideBigWmo)
+                            ? floorAt(playerX_, playerY_, playerZ_ + 0.6f) : -1e30f;
     st.floorNear = floor > -1e29f && floor >= playerZ_ - 2.0f;
     const TeleportHoldWhy why = teleportHoldDecide(st, now - tpHold_.startMs, tpHold_.holdMs);
     if (why == TeleportHoldWhy::kHold) {
@@ -266,7 +272,7 @@ bool WorldScreen::teleportHold() {
         return true;
     }
     tpHold_.active = false;
-    if (st.floorNear) {  // stand on it (the floor, a big WMO's when it is there - floorAt takes the highest)
+    if (why == TeleportHoldWhy::kFloor && st.floorNear) {  // stand on it (the floor, a big WMO's when it is there - floorAt takes the highest)
         playerZ_ = floor;
         shownZ_ = floor;
     }
@@ -297,6 +303,7 @@ void WorldScreen::updateDeath(const pp::PadState& pad, float dtSec) {
         const uint8_t from = lastLife_;
         lastLife_ = static_cast<uint8_t>(life);
         if (life == Life::Dead) {
+            if(death_.sawAlive)sounds_.playDeath();
             PSP_LOGI(pp::tag::Gfx, "player_dead x=%.1f y=%.1f z=%.1f", playerX_, playerY_, playerZ_);
             session_.stopAutoAttack();
             meleeSwingTimer_ = 0.0f;

@@ -1,3 +1,6 @@
+#include "rendering/psp/psp_collision_math.hpp"
+#include "rendering/psp/psp_collision_world_bounds.hpp"
+#include "rendering/psp/psp_bigwmo_vis.hpp" // shared WCOL validation
 #include "rendering/psp/psp_models.hpp"
 #include "platform/psp/psp_prof.hpp"
 #include "rendering/psp/psp_cpu_fast.hpp"
@@ -21,6 +24,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <new>
 
 namespace wowee::rendering::psp {
 
@@ -62,6 +66,11 @@ void ModelRenderer::clear() {
     instances_.clear();
     seen_.clear();
     insts_.clear();
+    collisionTransforms_.clear();
+    collisionBounds_.clear();
+    wallCache_.reset();
+    pendingCollisionCount_ = 0;
+    collisionOrder_.clear();
     cells_.clear();
     gridDirty_ = false;
     visible_.clear();
@@ -76,14 +85,15 @@ void ModelRenderer::clear() {
     stats_ = ModelStats{};
 }
 
-bool ModelRenderer::loadTexture(pp::Pak& pak, uint16_t id, bool allowLod) {
+bool ModelRenderer::loadTexture(pp::Pak& pak, uint16_t id, bool allowLod, bool parkedOnly) {
     if (id >= textures_.size()) textures_.resize(id + 1u);
     Tex& t = textures_[id];
     if (t.tried) return t.ok;
-    t.tried = true;
     char name[16];
     std::snprintf(name, sizeof(name), "x_%u", static_cast<unsigned>(id));
     const pp::PakEntry* e = pak.find(name);
+    if (parkedOnly && e && !pp::pakPrefetchPeek(pak.fileId(), e->offset)) return false;
+    t.tried = true;
     void* blob = e ? pak.load(e) : nullptr;
     if (!blob) return false;
     if (!pp::textureFromBlob(blob, e->size, t.t, true)) {
@@ -112,10 +122,14 @@ const pp::Texture* ModelRenderer::texture(uint16_t id) const {
     return &textures_[id].t;
 }
 
-const ModelRenderer::Model* ModelRenderer::model(pp::Pak& pak, uint16_t id) {
+const ModelRenderer::Model* ModelRenderer::model(pp::Pak& pak, uint16_t id, bool parkedTexturesOnly) {
     if (id >= models_.size()) models_.resize(id + 1u);
     Model& m = models_[id];
-    if (m.tried) return m.h ? &m : nullptr;
+    if (m.tried) {
+        if (m.h && m.collisionPending && static_cast<int32_t>(pp::logUptimeMs()-m.collisionRetryMs)>=0)
+            loadCollision(pak,id,m);
+        return m.h ? &m : nullptr;
+    }
     m.tried = true;
     char name[16];
     std::snprintf(name, sizeof(name), "m_%u", static_cast<unsigned>(id));
@@ -134,6 +148,9 @@ const ModelRenderer::Model* ModelRenderer::model(pp::Pak& pak, uint16_t id) {
         m.bad = true;  // broken data - forgetFailed() leaves it
         return nullptr;
     }
+    if(excludedGroundDecoration(h->flags)) {
+        m.excluded=true;pp::pakFree(blob);return nullptr;
+    }
     m.blob = blob;
     m.h = h;
     m.verts = reinterpret_cast<const ModelVertex*>(blob + h->vertexOffset);
@@ -151,7 +168,7 @@ const ModelRenderer::Model* ModelRenderer::model(pp::Pak& pak, uint16_t id) {
         }
     }
     for (uint32_t i = 0; i < batches; ++i)
-        if (m.batches[i].texture != kNoTexture) loadTexture(pak, m.batches[i].texture);
+        if (m.batches[i].texture != kNoTexture) loadTexture(pak, m.batches[i].texture, true, parkedTexturesOnly);
     // which LODs have blended batches (the blended pass skips the others).
     for (uint8_t lod = 0; lod < 3; ++lod) {
         if (lod == 2 && !(h->flags & kModelLod2)) continue;
@@ -163,24 +180,62 @@ const ModelRenderer::Model* ModelRenderer::model(pp::Pak& pak, uint16_t id) {
     memoryBytes_ += e->size;
     ++stats_.models;
     if (h->flags & kModelFoliage) loadImpostor(pak, id, m);  // "i_<n>", when baked
-    // Collision mesh, when the model has one.
+    loadCollision(pak,id,m);
+    m.readyMs=pp::logUptimeMs();
+    return &m;
+}
+
+void ModelRenderer::loadCollision(pp::Pak& pak, uint16_t id, Model& m) {
+    if (m.col) return;
+    const bool wasPending=m.collisionPending;
+    char name[16];
     std::snprintf(name, sizeof(name), "k_%u", static_cast<unsigned>(id));
     if (const pp::PakEntry* ce = pak.find(name)) {
         auto* cb = static_cast<uint8_t*>(pak.load(ce));
         const auto* ch = reinterpret_cast<const CollisionHeader*>(cb);
-        if (cb && ce->size >= sizeof(CollisionHeader) && std::memcmp(ch->magic, "WCOL", 4) == 0 &&
-            ch->listOffset + ch->listCount * 4u <= ce->size &&
-            ch->cellOffset + static_cast<uint32_t>(ch->nx) * ch->ny * 8u <= ce->size &&
-            ch->triangleOffset + ch->triangleCount * sizeof(CollisionTri) <= ce->size &&
-            ch->vertexOffset + ch->vertexCount * 12u <= ce->size) {
+        if (cb && collisionValid(cb,ce->size)) {
             m.colBlob = cb;
             m.col = ch;
             collisionBytes_ += ce->size;
+            m.collisionPending = false;
+            gridDirty_ = true;
         } else if (cb) {
             pp::pakFree(cb);
+            m.collisionPending = true;
+        } else {
+            m.collisionPending = true;
         }
+    } else {
+        m.collisionPending = false; // the asset intentionally has no collision
     }
-    return &m;
+    if (m.collisionPending) {
+        m.collisionRetryMs=pp::logUptimeMs()+1000u;
+        PSP_LOGW(pp::tag::Gfx,"model_collision_pending model=%u retry_ms=1000",static_cast<unsigned>(id));
+    }
+    if(m.collisionPending && !wasPending) ++pendingCollisionCount_;
+    if(!m.collisionPending && wasPending && pendingCollisionCount_) --pendingCollisionCount_;
+}
+
+void ModelRenderer::retryCollisions(pp::Pak& pak) {
+    if(!pendingCollisionCount_) return;
+    const uint32_t now=pp::logUptimeMs();
+    for(uint32_t id=0;id<models_.size();++id) {
+        Model& m=models_[id];
+        if(!m.h || !m.collisionPending || static_cast<int32_t>(now-m.collisionRetryMs)<0) continue;
+        loadCollision(pak,static_cast<uint16_t>(id),m);
+        flushGrid();
+        break; // recovery work is bounded; never reread the whole scene at once
+    }
+}
+
+bool ModelRenderer::collisionReadyAt(float x,float y,float z) const {
+    if(!pendingCollisionCount_) return true;
+    for(const Inst& in:insts_) {
+        if(!in.m->collisionPending) continue;
+        const float dx=in.x-x,dy=in.y-y,r=in.r+1.5f;
+        if(dx*dx+dy*dy<=r*r && z>=in.z-in.r-3.f && z<=in.z+in.r+8.f) return false;
+    }
+    return true;
 }
 
 bool ModelRenderer::loadTile(pp::Pak& pak, int tileX, int tileY) {
@@ -201,8 +256,11 @@ bool ModelRenderer::loadTile(pp::Pak& pak, int tileX, int tileY) {
     memoryBytes_ += e->size;
     const auto* p = reinterpret_cast<const DoodadPlacement*>(blob + sizeof(DoodadTileHeader));
     for (uint32_t i = 0; i < h->count; ++i) {
-        if (!seen_.insert(p[i].uniqueId).second) continue;  // already added by a neighbour tile
-        if (!model(pak, p[i].model)) continue;
+        if (seen_.count(p[i].uniqueId))continue;
+        const auto* loaded=model(pak,p[i].model);
+        if(p[i].model<models_.size() && models_[p[i].model].excluded)continue;
+        seen_.insert(p[i].uniqueId);
+        if(!loaded)continue;
         instances_.push_back(&p[i]);
     }
     gridDirty_ = true;
@@ -226,8 +284,11 @@ bool ModelRenderer::setPlacements(pp::Pak& pak, int tileX, int tileY, const Dood
     tileKeys_.push_back((static_cast<uint32_t>(tileX & 0xFFFF) << 16) | static_cast<uint32_t>(tileY & 0xFFFF));
     const auto* q = reinterpret_cast<const DoodadPlacement*>(blob + sizeof(DoodadTileHeader));
     for (uint32_t i = 0; i < n; ++i) {
-        if (!seen_.insert(q[i].uniqueId).second) continue;  // still placed by the old set (dropped next)
-        if (!model(pak, q[i].model)) continue;
+        if(seen_.count(q[i].uniqueId))continue;
+        const auto* loaded=model(pak,q[i].model);
+        if(q[i].model<models_.size() && models_[q[i].model].excluded)continue;
+        seen_.insert(q[i].uniqueId);
+        if(!loaded)continue;
         instances_.push_back(&q[i]);
     }
     gridDirty_ = true;
@@ -268,9 +329,12 @@ void ModelRenderer::reserveTables(const pp::Pak& pak) {
 void ModelRenderer::buildGrid() {
     gridDirty_ = false;
     insts_.clear();
+    collisionTransforms_.clear();
     cells_.clear();
     ++gridGen_;        // the collision memo forgets the old world
     lattice_.clear();
+    collisionBounds_.build({});
+    collisionOrder_.clear();
     if (instances_.empty()) return;
     constexpr float kCell = 64.0f;
     float minX = 1e30f, minY = 1e30f, maxX = -1e30f, maxY = -1e30f;
@@ -289,6 +353,12 @@ void ModelRenderer::buildGrid() {
     for (const DoodadPlacement* p : instances_) ++counts[cellOf(p) + 1];
     for (size_t i = 1; i < counts.size(); ++i) counts[i] += counts[i - 1];
     insts_.resize(instances_.size());
+    size_t collisionCount=0;
+    for(const auto* p:instances_) {
+        if(models_[p->model].col)++collisionCount;
+    }
+    collisionTransforms_.resize(collisionCount);
+    uint32_t nextCollision=0;
     std::vector<uint32_t> fill(counts.begin(), counts.end() - 1);
     for (const DoodadPlacement* p : instances_) {
         const Model* m = &models_[p->model];
@@ -297,11 +367,34 @@ void ModelRenderer::buildGrid() {
         const float r = p->sphere[3];
         float f = std::max(1.0f, r / 12.0f);
         if (m->h->flags & kModelFoliage) f *= 1.6f;
-        if (m->h->flags & kModelGroundDetail) f *= 0.4f;
+        if (m->h->flags & kModelGroundDetail) f = 2.0f; // cell bound covers the full 0..50 yd grass setting
         if (m->h->flags & kModelBuilding) f *= 1.5f;  // buildings stay visible (M8)
-        else if (r < 3.0f) f *= 0.6f;
-        insts_[fill[cellOf(p)]++] = Inst{p->sphere[0], p->sphere[1], p->sphere[2], r, f, p, m};
+        else if (r < 3.0f && !(m->h->flags & kModelGroundDetail)) f *= 0.6f;
+        Inst& in = insts_[fill[cellOf(p)]++];
+        in = Inst{p->sphere[0], p->sphere[1], p->sphere[2], r, f, p, m};
+        if(m->col) {
+            const glm::mat3 axes(glm::vec3(p->axes[0],p->axes[1],p->axes[2]),
+                                 glm::vec3(p->axes[3],p->axes[4],p->axes[5]),
+                                 glm::vec3(p->axes[6],p->axes[7],p->axes[8]));
+            const float det=glm::determinant(axes);
+            if(std::isfinite(det) && std::fabs(det)>1e-12f) {
+                auto& collision=collisionTransforms_[nextCollision++];
+                in.collision=nextCollision;
+                collision.inverse=glm::inverse(axes);
+                collisionWorldBounds(glm::vec3(m->col->bmin[0],m->col->bmin[1],m->col->bmin[2]),
+                    glm::vec3(m->col->bmax[0],m->col->bmax[1],m->col->bmax[2]),axes,
+                    glm::vec3(p->position[0],p->position[1],p->position[2]),collision.collisionLo,collision.collisionHi);
+            }
+        }
     }
+    collisionTransforms_.resize(nextCollision);
+    std::vector<CollisionBoundsIndex::Entry> collisionBounds;
+    for(uint32_t i=0;i<insts_.size();++i)
+        if(insts_[i].collision) {
+            collisionBounds.push_back({collisionTransforms_[insts_[i].collision-1].collisionLo,collisionTransforms_[insts_[i].collision-1].collisionHi,i});
+            collisionOrder_.push_back(i);
+        }
+    collisionBounds_.build(std::move(collisionBounds));
     for (size_t c = 0; c + 1 < counts.size(); ++c) {
         if (counts[c + 1] == counts[c]) continue;
         Cell cell{0, 0, 0, 0, 0, counts[c], counts[c + 1] - counts[c]};
@@ -343,6 +436,10 @@ void ModelRenderer::buildGrid() {
                                    iy - slot(c.y - reach, minY), slot(c.y + reach, minY) - iy});
         }
     }
+    if(vramOn)PSP_LOGI(pp::tag::Mem,"model_grid_memory instances=%u collisions=%u instance_kb=%u collision_kb=%u",
+        static_cast<unsigned>(insts_.size()),static_cast<unsigned>(collisionTransforms_.size()),
+        static_cast<unsigned>(insts_.capacity()*sizeof(Inst)/1024u),
+        static_cast<unsigned>(collisionTransforms_.capacity()*sizeof(CollisionTransform)/1024u));
     if (vramOn)  // The game objects' renderer rebuilds often - its own log line (gameobjects_set)
         PSP_LOGI(pp::tag::Gfx, "%s_grid cells=%u doodads=%u lattice=%dx%d spill=%d", logTag,
                  static_cast<unsigned>(cells_.size()), static_cast<unsigned>(insts_.size()), lattice_.empty() ? 0 : nx,
@@ -416,6 +513,7 @@ void ModelRenderer::drawModel(const Visible& v, bool blendPass) {
         const ModelBatch& b = v.m->batches[i];
         if (isBlended(b.blend) != blendPass) continue;
         if (!matrixSet) {
+            lightObjectFog(v.fogStart);
             sceGuSetMatrix(GU_MODEL, &v.mtx);
             matrixSet = true;
         }
@@ -445,10 +543,18 @@ void ModelRenderer::moveToVram() {
 }
 
 void ModelRenderer::draw(const TerrainCamera& cam, uint32_t fogColorABGR) {
+    drawNowMs_=pp::logUptimeMs();
     // cpufast=0 keeps the build-104 pass (A/B on the same build).
     ++g_cpuStats.frames;
     if (g_cpuFast) drawFast(cam, fogColorABGR);
     else drawOld(cam, fogColorABGR);
+
+}
+
+float ModelRenderer::instanceFogStart(const Inst&,const TerrainCamera& cam,float) const {
+    // Authored zone fog only. Moving the fog start per object painted newly
+    // streamed grass/fences white instead of revealing their real texture.
+    return lightFogRange(cam).start;
 }
 
 // The build-104 pass, unchanged (cpufast=0).
@@ -473,7 +579,7 @@ void ModelRenderer::drawOld(const TerrainCamera& cam, uint32_t fogColorABGR) {
     visible_.clear();
     for (const Cell& cell : cells_) {
         const glm::vec3 cc(cell.x - cam.pos.x, cell.y - cam.pos.y, cell.z - cam.pos.z);
-        const float cellReach = std::min(viewDistance * cell.maxReach, farLimit) + cell.r;
+        const float cellReach = std::min(std::min(viewDistance,std::max(25.f,viewDistance*performanceScale)) * cell.maxReach, farLimit) + cell.r;
         if (glm::dot(cc, cc) > cellReach * cellReach || fr.sphereOutside(cc, cell.r)) {
             stats_.culled += cell.count;
             continue;
@@ -481,8 +587,9 @@ void ModelRenderer::drawOld(const TerrainCamera& cam, uint32_t fogColorABGR) {
         for (uint32_t i = cell.first; i < cell.first + cell.count; ++i) {
             const Inst& in = insts_[i];
             const glm::vec3 c(in.x - cam.pos.x, in.y - cam.pos.y, in.z - cam.pos.z);
-            const float reach = std::min(viewDistance * in.reach, farLimit) + in.r;
+            const float reach = std::min(std::min(viewDistance,std::max(25.f,viewDistance*performanceScale)) * in.reach, farLimit) + in.r;
             const float d2 = glm::dot(c, c);
+
             if (d2 > reach * reach || fr.sphereOutside(c, in.r)) {
                 ++stats_.culled;
                 continue;
@@ -496,7 +603,7 @@ void ModelRenderer::drawOld(const TerrainCamera& cam, uint32_t fogColorABGR) {
             // the opaque pass), the rest pick LOD 0 / 1 / 2 (psp_impostors.cpp).
             if (in.m->imp && pickImpostor(in, dist)) continue;
             const uint8_t lod = pickLod(in, dist);
-            Visible v{in.p, in.m, dist, lod, {}};
+            Visible v{in.p, in.m, dist, instanceFogStart(in,cam,dist), lod, {}};
             // Model matrix: placement axes scaled by the s16 half extent,
             // translation = the model centre, camera-relative.
             const DoodadPlacement& p = *in.p;
@@ -509,7 +616,7 @@ void ModelRenderer::drawOld(const TerrainCamera& cam, uint32_t fogColorABGR) {
             v.mtx.x = {ax.x * h.half[0], ax.y * h.half[0], ax.z * h.half[0], 0.0f};
             v.mtx.y = {ay.x * h.half[1], ay.y * h.half[1], ay.z * h.half[1], 0.0f};
             v.mtx.z = {az.x * h.half[2], az.y * h.half[2], az.z * h.half[2], 0.0f};
-            v.mtx.w = {t.x, t.y, t.z, 1.0f};
+            v.mtx.w = {t.x, t.y, t.z+(p.uniqueId==visualOffsetId_?visualOffsetZ_:0.f), 1.0f};
             visible_.push_back(v);
         }
     }
@@ -563,6 +670,7 @@ void ModelRenderer::drawOld(const TerrainCamera& cam, uint32_t fogColorABGR) {
             }
             if (!setBatchState(*head.m, b)) continue;  // Its texture is missing (tex_missing)
             for (size_t k = g; k < end; ++k) {
+                lightObjectFog(visible_[order_[k]].fogStart);
                 sceGuSetMatrix(GU_MODEL, &visible_[order_[k]].mtx);
                 drawBatch(*head.m, b);
             }
@@ -684,7 +792,7 @@ void ModelRenderer::drawFast(const TerrainCamera& cam, uint32_t fogColorABGR) {
     mtxFast_.clear();
     for (const Cell& cell : cells_) {
         const glm::vec3 cc(cell.x - cam.pos.x, cell.y - cam.pos.y, cell.z - cam.pos.z);
-        const float cellReach = std::min(viewDistance * cell.maxReach, farLimit) + cell.r;
+        const float cellReach = std::min(std::min(viewDistance,std::max(25.f,viewDistance*performanceScale)) * cell.maxReach, farLimit) + cell.r;
         if (glm::dot(cc, cc) > cellReach * cellReach || fr.sphereOutside(cc, cell.r)) {
             stats_.culled += cell.count;
             continue;
@@ -693,8 +801,9 @@ void ModelRenderer::drawFast(const TerrainCamera& cam, uint32_t fogColorABGR) {
         for (uint32_t i = cell.first; i < cell.first + cell.count; ++i) {
             const Inst& in = insts_[i];
             const glm::vec3 c(in.x - cam.pos.x, in.y - cam.pos.y, in.z - cam.pos.z);
-            const float reach = std::min(viewDistance * in.reach, farLimit) + in.r;
+            const float reach = std::min(std::min(viewDistance,std::max(25.f,viewDistance*performanceScale)) * in.reach, farLimit) + in.r;
             const float d2 = glm::dot(c, c);
+
             if (d2 > reach * reach || (!inside && fr.sphereOutside(c, in.r))) {
                 ++stats_.culled;
                 continue;
@@ -726,8 +835,8 @@ void ModelRenderer::drawFast(const TerrainCamera& cam, uint32_t fogColorABGR) {
             mtx.x = {ax.x * h.half[0], ax.y * h.half[0], ax.z * h.half[0], 0.0f};
             mtx.y = {ay.x * h.half[1], ay.y * h.half[1], ay.z * h.half[1], 0.0f};
             mtx.z = {az.x * h.half[2], az.y * h.half[2], az.z * h.half[2], 0.0f};
-            mtx.w = {t.x, t.y, t.z, 1.0f};
-            visFast_.push_back(VisFast{in.m, dist, static_cast<uint32_t>(mtxFast_.size()), lod});
+            mtx.w = {t.x, t.y, t.z+(p.uniqueId==visualOffsetId_?visualOffsetZ_:0.f), 1.0f};
+            visFast_.push_back(VisFast{in.m, dist, instanceFogStart(in,cam,dist), static_cast<uint32_t>(mtxFast_.size()), lod});
             mtxFast_.push_back(mtx);
         }
     }
@@ -775,6 +884,7 @@ void ModelRenderer::drawFast(const TerrainCamera& cam, uint32_t fogColorABGR) {
             }
             if (!setBatchState(*head.m, b)) continue;  // Its texture is missing (tex_missing)
             for (size_t k = g; k < end; ++k) {
+                lightObjectFog(visFast_[order_[k]].fogStart);
                 sceGuSetMatrix(GU_MODEL, &mtxFast_[visFast_[order_[k]].mi]);
                 drawBatchNoStall(*head.m, b, (k - g) % kStallEvery == kStallEvery - 1 || k + 1 == end);
             }
@@ -804,6 +914,7 @@ void ModelRenderer::drawFast(const TerrainCamera& cam, uint32_t fogColorABGR) {
             const ModelBatch& b = v.m->batches[i];
             if (!isBlended(b.blend)) continue;
             if (!matrixSet) {
+                lightObjectFog(v.fogStart);
                 sceGuSetMatrix(GU_MODEL, &mtxFast_[v.mi]);
                 matrixSet = true;
             }
@@ -825,10 +936,9 @@ void ModelRenderer::drawFast(const TerrainCamera& cam, uint32_t fogColorABGR) {
 
 namespace {
 
-constexpr float kMinWalkableNormalZ = 0.642787635f;  // cos 50 deg (upstream movement_limits.hpp)
 constexpr float kPlayerRadius = 0.5f;
 constexpr float kPlayerHeight = 2.0f;
-constexpr float kWallStepHeight = 1.0f;  // upstream checkWallCollision MAX_STEP_HEIGHT
+constexpr float kWallStepHeight = 0.6f;  // same maximum step as player movement
 
 struct ColView {
     const CollisionHeader* h;
@@ -866,22 +976,6 @@ void forCells(const ColView& c, glm::vec2 lo, glm::vec2 hi, Fn&& fn) {
 glm::mat3 axesOf(const DoodadPlacement& p) {
     return glm::mat3(glm::vec3(p.axes[0], p.axes[1], p.axes[2]), glm::vec3(p.axes[3], p.axes[4], p.axes[5]),
                      glm::vec3(p.axes[6], p.axes[7], p.axes[8]));
-}
-
-// Moller-Trumbore; returns t along d (d need not be unit), or < 0 on a miss.
-float rayTri(const glm::vec3& o, const glm::vec3& d, const glm::vec3& a, const glm::vec3& b, const glm::vec3& c) {
-    const glm::vec3 e1 = b - a, e2 = c - a;
-    const glm::vec3 pv = glm::cross(d, e2);
-    const float det = glm::dot(e1, pv);
-    if (std::fabs(det) < 1e-9f) return -1.0f;
-    const float inv = 1.0f / det;
-    const glm::vec3 tv = o - a;
-    const float u = glm::dot(tv, pv) * inv;
-    if (u < 0.0f || u > 1.0f) return -1.0f;
-    const glm::vec3 qv = glm::cross(tv, e1);
-    const float v = glm::dot(d, qv) * inv;
-    if (v < 0.0f || u + v > 1.0f) return -1.0f;
-    return glm::dot(e2, qv) * inv;
 }
 
 glm::vec3 closestOnTri(const glm::vec3& p, const glm::vec3& a, const glm::vec3& b, const glm::vec3& c) {
@@ -950,11 +1044,14 @@ bool ModelRenderer::rayGridOk(const glm::vec3& origin, const glm::vec3& dir, flo
     return len2 > 0.999f && len2 < 1.001f;
 }
 
-bool ModelRenderer::floorHeight(float x, float y, float probeZ, float& outZ) const {
+bool ModelRenderer::floorHeight(float x, float y, float probeZ, float& outZ, uint32_t* placementId) const {
     PROF_SCOPE("col.floor");
     ++g_cpuStats.colQueries;
     bool found = false;
     float best = -1e30f;
+    uint32_t bestPlacement = 0;
+    size_t bestInst = insts_.size();
+    if (placementId) *placementId = 0;
     // same input, same world -> the last answer.
     const uint32_t key[3] = {bitsOf(x), bitsOf(y), bitsOf(probeZ)};
     if (g_cpuFast) {
@@ -962,48 +1059,48 @@ bool ModelRenderer::floorHeight(float x, float y, float probeZ, float& outZ) con
             if (m.gen == gridGen_ && std::memcmp(m.key, key, sizeof(key)) == 0) {
                 ++g_cpuStats.colMemoHits;
                 if (m.found) outZ = m.z;
+                if (placementId) *placementId = m.placementId;
                 return m.found;
             }
         }
     }
     auto visit = [&](const Inst& in) {  // the build-104 loop body
         ++g_cpuStats.colInsts;
-        if (!in.m->col) return;
-        const float dx = in.x - x, dy = in.y - y;
-        if (dx * dx + dy * dy > in.r * in.r || in.z - in.r > probeZ) return;
+        if (!in.collision) return;
+        if(x<collisionTransforms_[in.collision-1].collisionLo.x || x>collisionTransforms_[in.collision-1].collisionHi.x || y<collisionTransforms_[in.collision-1].collisionLo.y || y>collisionTransforms_[in.collision-1].collisionHi.y || collisionTransforms_[in.collision-1].collisionLo.z>probeZ) return;
         const DoodadPlacement& p = *in.p;
         const glm::mat3 A = axesOf(p);
-        const glm::mat3 Ai = glm::inverse(A);
+        const glm::mat3& Ai = collisionTransforms_[in.collision-1].inverse;
         const glm::vec3 pos(p.position[0], p.position[1], p.position[2]);
         const glm::vec3 o = Ai * (glm::vec3(x, y, probeZ) - pos);
         const glm::vec3 d = Ai * glm::vec3(0.0f, 0.0f, -1.0f);
-        const float maxT = probeZ - (in.z - in.r);
+        const float maxT = probeZ - collisionTransforms_[in.collision-1].collisionLo.z;
         const glm::vec3 e = o + d * maxT;
         const ColView c = view(in.m->col);
         forCells(c, glm::min(glm::vec2(o), glm::vec2(e)), glm::max(glm::vec2(o), glm::vec2(e)), [&](uint32_t ti) {
             const CollisionTri& t = c.t[ti];
             const glm::vec3 a = c.vert(t.a), b = c.vert(t.b), cc = c.vert(t.c);
-            const float hit = rayTri(o, d, a, b, cc);
+            const float hit = collisionRayTri(o, d, a, b, cc);
             if (hit < 0.0f || hit > maxT) return;
             const float z = probeZ - hit;
-            if (z <= best) return;
+            const size_t instIndex=static_cast<size_t>(&in-insts_.data());
+            if (z < best || (z == best && instIndex >= bestInst)) return;
             const glm::vec3 n = glm::cross(A * (b - a), A * (cc - a));
-            const float nl = glm::length(n);
-            if (nl < 1e-9f || std::fabs(n.z) / nl < kMinWalkableNormalZ) return;  // too steep to stand on
+            if (!collisionWalkable(n)) return;  // too steep to stand on
             best = z;
             found = true;
+            bestPlacement = p.uniqueId;
+            bestInst = instIndex;
         });
     };
     const bool finite = std::fabs(x) < 1.0e6f && std::fabs(y) < 1.0e6f && std::fabs(probeZ) < 1.0e6f;
-    if (g_cpuFast && finite && !lattice_.empty()) {
-        // A doodad passing the test above holds (x, y) in its disk and
-        // reaches down to probeZ - so does its cell's sphere.
-        forGrid(x, y, x, y,
-                [&](const Cell& c) {
-                    const float dx = c.x - x, dy = c.y - y, rm = c.r + kCellMargin;
-                    return !(dx * dx + dy * dy > rm * rm || c.z - rm > probeZ);
-                },
-                visit);
+    if (g_cpuFast && finite) {
+        if (const auto* set=collisionCandidates_.get(collisionBounds_,gridGen_,x,y,x,y)) {
+            for(size_t n=0;n<set->count;++n)visit(insts_[set->ids[n]]);
+        } else {
+            collisionBounds_.query(glm::vec3(x,y,-1e30f),glm::vec3(x,y,probeZ),
+                                   [&](const CollisionBoundsIndex::Entry& e){visit(insts_[e.id]);});
+        }
     } else {
         for (const Inst& in : insts_) visit(in);
     }
@@ -1014,8 +1111,10 @@ bool ModelRenderer::floorHeight(float x, float y, float probeZ, float& outZ) con
         m.gen = gridGen_;
         m.z = best;
         m.found = found;
+        m.placementId = bestPlacement;
     }
     if (found) outZ = best;
+    if (placementId) *placementId = bestPlacement;
     return found;
 }
 
@@ -1036,15 +1135,14 @@ float ModelRenderer::raycastBuildings(const glm::vec3& origin, const glm::vec3& 
     }
     auto visit = [&](const Inst& in) {  // the build-104 loop body
         ++g_cpuStats.colInsts;
-        if (!in.m->col || !(in.m->h->flags & kModelBuilding)) return;
+        if (!in.collision || !(in.m->h->flags & kModelBuilding)) return;
         // Ray vs bounding sphere first.
         const glm::vec3 oc = glm::vec3(in.x, in.y, in.z) - origin;
         const float tc = glm::dot(oc, dir);
         const float d2 = glm::dot(oc, oc) - tc * tc;
         if (d2 > in.r * in.r || tc + in.r < 0.0f || tc - in.r > best) return;
         const DoodadPlacement& p = *in.p;
-        const glm::mat3 A = axesOf(p);
-        const glm::mat3 Ai = glm::inverse(A);
+        const glm::mat3& Ai = collisionTransforms_[in.collision-1].inverse;
         const glm::vec3 pos(p.position[0], p.position[1], p.position[2]);
         const glm::vec3 o = Ai * (origin - pos);
         const glm::vec3 d = Ai * dir;  // t stays in world yards
@@ -1052,24 +1150,12 @@ float ModelRenderer::raycastBuildings(const glm::vec3& origin, const glm::vec3& 
         const ColView c = view(in.m->col);
         forCells(c, glm::min(glm::vec2(o), glm::vec2(e)), glm::max(glm::vec2(o), glm::vec2(e)), [&](uint32_t ti) {
             const CollisionTri& t = c.t[ti];
-            const float hit = rayTri(o, d, c.vert(t.a), c.vert(t.b), c.vert(t.c));
+            const float hit = collisionRayTri(o, d, c.vert(t.a), c.vert(t.b), c.vert(t.c));
             if (hit > 0.0f && hit < best) best = hit;
         });
     };
-    if (rayGridOk(origin, dir, maxDist)) {
-        // A sphere passing the ray test above lies within its cell's sphere,
-        // which then passes the same test (unit dir, any best).
-        const glm::vec3 end = origin + dir * maxDist;
-        forGrid(std::min(origin.x, end.x), std::min(origin.y, end.y), std::max(origin.x, end.x),
-                std::max(origin.y, end.y),
-                [&](const Cell& cl) {
-                    const glm::vec3 oc = glm::vec3(cl.x, cl.y, cl.z) - origin;
-                    const float tc = glm::dot(oc, dir);
-                    const float d2 = glm::dot(oc, oc) - tc * tc;
-                    const float rm = cl.r + kCellMargin;
-                    return !(d2 > rm * rm || tc + rm < 0.0f || tc - rm > best);
-                },
-                visit);
+    if (!gridDirty_ && g_cpuFast) {
+        collisionBounds_.rayQuery(origin,dir,best,[&](const CollisionBoundsIndex::Entry& e){visit(insts_[e.id]);});
     } else {
         for (const Inst& in : insts_) visit(in);
     }
@@ -1086,45 +1172,31 @@ float ModelRenderer::raycastBuildings(const glm::vec3& origin, const glm::vec3& 
 void ModelRenderer::collideWalls(glm::vec3& to, float feetZ) const {
     PROF_SCOPE("col.walls");
     ++g_cpuStats.colQueries;
-    // `to` moves while the doodads push it, so no lattice
-    // box here: every cell in order, each with a conservative test against
-    // the current `to` (a cell left out holds only doodads the test below
-    // rejects at that moment, and nothing moves `to` in between).
-    auto cellOk = [&](const Cell& c) {
-        const float dx = c.x - to.x, dy = c.y - to.y, rm = c.r + kCellMargin;
-        const float reach = rm + kPlayerRadius;
-        return !(dx * dx + dy * dy > reach * reach || feetZ + kPlayerHeight < c.z - rm || feetZ > c.z + rm);
-    };
+    // Exact collision bounds avoid visual-sphere false negatives. Candidate
+    // order is restored below before resolving contacts.
     auto visit = [&](const Inst& in) {  // the build-104 loop body
         ++g_cpuStats.colInsts;
-        if (!in.m->col) return;
-        const float dx = in.x - to.x, dy = in.y - to.y;
-        const float reach = in.r + kPlayerRadius;
-        if (dx * dx + dy * dy > reach * reach) return;
-        if (feetZ + kPlayerHeight < in.z - in.r || feetZ > in.z + in.r) return;
+        if (!in.collision) return;
+        if(to.x+kPlayerRadius<collisionTransforms_[in.collision-1].collisionLo.x || to.x-kPlayerRadius>collisionTransforms_[in.collision-1].collisionHi.x ||
+           to.y+kPlayerRadius<collisionTransforms_[in.collision-1].collisionLo.y || to.y-kPlayerRadius>collisionTransforms_[in.collision-1].collisionHi.y ||
+           feetZ+kPlayerHeight<collisionTransforms_[in.collision-1].collisionLo.z || feetZ>collisionTransforms_[in.collision-1].collisionHi.z) return;
         const DoodadPlacement& p = *in.p;
         const glm::mat3 A = axesOf(p);
-        const glm::mat3 Ai = glm::inverse(A);
+        const glm::mat3& Ai = collisionTransforms_[in.collision-1].inverse;
         const glm::vec3 pos(p.position[0], p.position[1], p.position[2]);
         const float scale = std::max(0.01f, glm::length(A[0]));
-        // Step-over height: buildings keep upstream's 1.0 (WMO
-        // checkWallCollision); props only what the feet can step (0.6) -
-        // a 1.28 yd stone fence on a 0.4 yd slope was walked through
-        // (on the hardware).
-        const float stepOver = (in.m->h->flags & kModelBuilding) ? kWallStepHeight : 0.6f;
+        // Walls and floor movement share the same 0.6 yd step limit.
+        const float stepOver = kWallStepHeight;
         const glm::vec3 local = Ai * (to - pos);
         const float margin = (kPlayerRadius + kPlayerHeight) / scale;
         const ColView c = view(in.m->col);
-        forCells(c, glm::vec2(local) - margin, glm::vec2(local) + margin, [&](uint32_t ti) {
-            const CollisionTri& t = c.t[ti];
-            if (!(t.flags & kColBlocksWalls)) return;
-            const glm::vec3 a = A * c.vert(t.a) + pos, b = A * c.vert(t.b) + pos, cc = A * c.vert(t.c) + pos;
-            const float minZ = std::min({a.z, b.z, cc.z}), maxZ = std::max({a.z, b.z, cc.z});
-            if (maxZ <= feetZ + stepOver || minZ >= feetZ + kPlayerHeight) return;  // step over / above head
-            if (maxZ - minZ < 1.0f && maxZ <= feetZ + 1.2f) return;                        // stair riser
-            const glm::vec3 n = glm::cross(b - a, cc - a);
-            const float nl = glm::length(n);
-            if (nl < 1e-9f || std::fabs(n.z) / nl >= kMinWalkableNormalZ) return;  // floors are not walls
+        auto contact = [&](const glm::vec3& a,const glm::vec3& b,const glm::vec3& cc,
+                           const glm::vec3& n,const glm::vec3& lo,const glm::vec3& hi) {
+            // A triangle outside the cylinder's XY box cannot make contact.
+            // Prepared normals/bounds are reused; contacts still use the live position.
+            if (to.x+kPlayerRadius<lo.x || to.x-kPlayerRadius>hi.x ||
+                to.y+kPlayerRadius<lo.y || to.y-kPlayerRadius>hi.y) return;
+            if (hi.z <= feetZ + stepOver || lo.z >= feetZ + kPlayerHeight) return;  // step over / above head
             // Sample the cylinder at knee and chest height.
             for (float h : {stepOver + 0.1f, 1.7f}) {
                 const glm::vec3 q(to.x, to.y, feetZ + h);
@@ -1145,20 +1217,65 @@ void ModelRenderer::collideWalls(glm::vec3& to, float feetZ) const {
                 to.x += push.x * (kPlayerRadius - dist);
                 to.y += push.y * (kPlayerRadius - dist);
             }
-        });
-    };
-    for (int iter = 0; iter < 2; ++iter) {
-        const bool finite = std::fabs(to.x) < 1.0e6f && std::fabs(to.y) < 1.0e6f && std::fabs(feetZ) < 1.0e6f;
-        if (g_cpuFast && finite) {
-            for (const Cell& c : cells_) {
-                ++g_cpuStats.colCells;
-                if (!cellOk(c)) continue;
-                for (uint32_t i = c.first; i < c.first + c.count; ++i) visit(insts_[i]);
+        };
+        const WallCollisionCache::Set* prepared=nullptr;
+        if(g_cpuFast) {
+            if(!wallCache_)wallCache_.reset(new(std::nothrow) WallCollisionCache);
+            if(wallCache_)prepared=wallCache_->get(c.h,gridGen_,static_cast<uint32_t>(&in-insts_.data()),
+                                                  A,pos,glm::vec2(local)-margin,glm::vec2(local)+margin);
+        }
+        if(prepared) {
+            for(size_t i=0;i<prepared->count;++i) {
+                const auto& t=prepared->triangles[i];contact(t.a,t.b,t.c,t.n,t.lo,t.hi);
             }
         } else {
-            for (const Inst& in : insts_) visit(in);
+            // Dense cells or allocation failure use the original complete traversal.
+            forCells(c,glm::vec2(local)-margin,glm::vec2(local)+margin,[&](uint32_t ti) {
+                const auto& t=c.t[ti];if(!(t.flags&kColBlocksWalls))return;
+                const glm::vec3 a=A*c.vert(t.a)+pos,b=A*c.vert(t.b)+pos,cc=A*c.vert(t.c)+pos;
+                const glm::vec3 n=glm::cross(b-a,cc-a);
+                if(glm::dot(n,n)<1e-18f || collisionWalkable(n))return;
+                contact(a,b,cc,n,glm::min(a,glm::min(b,cc)),glm::max(a,glm::max(b,cc)));
+            });
+        }
+    };
+    for (int iter = 0; iter < 2; ++iter) {
+        // Re-test bounds at the updated position after every push. A fixed
+        // query box can miss the next wall when another wall moves the capsule.
+        if (!g_cpuFast) { for(uint32_t i:collisionOrder_)visit(insts_[i]);continue; }
+        uint32_t next=0;
+        for (;;) {
+            const auto* set=collisionCandidates_.get(collisionBounds_,gridGen_,
+                to.x-kPlayerRadius,to.y-kPlayerRadius,to.x+kPlayerRadius,to.y+kPlayerRadius);
+            if (!set) {
+                // Overflow/nonfinite: retain the original ordered resolver.
+                for(uint32_t i:collisionOrder_)if(i>=next)visit(insts_[i]);
+                break;
+            }
+            const auto end=set->ids.begin()+set->count;
+            auto it=std::lower_bound(set->ids.begin(),end,next);
+            for(;it!=end;++it) {
+                const uint32_t id=*it;next=id+1;visit(insts_[id]);
+                // Sequential reuse avoids another cache lookup/binary search
+                // per instance. Leaving the column still rebuilds immediately.
+                if(to.x-kPlayerRadius<set->x0 || to.y-kPlayerRadius<set->y0 ||
+                   to.x+kPlayerRadius>set->x1 || to.y+kPlayerRadius>set->y1)break;
+            }
+            if(it==end)break;
         }
     }
+}
+
+void ModelRenderer::logWallCacheStats() const {
+    if(!wallCache_)return;
+    PSP_LOGI(pp::tag::Gfx,"wall_cache hits=%u builds=%u prepared=%u overflow=%u kb=%u",
+        static_cast<unsigned>(wallCache_->hits),static_cast<unsigned>(wallCache_->builds),
+        static_cast<unsigned>(wallCache_->prepared),static_cast<unsigned>(wallCache_->overflows),
+        static_cast<unsigned>((sizeof(WallCollisionCache)+1023)/1024));
+    PSP_LOGI(pp::tag::Gfx,"wall_cache_miss gen=%u transform=%u cells=%u capacity=%u cold=%u evict=%u",
+        static_cast<unsigned>(wallCache_->generationMisses),static_cast<unsigned>(wallCache_->transformMisses),
+        static_cast<unsigned>(wallCache_->cellMisses),static_cast<unsigned>(wallCache_->capacityMisses),
+        static_cast<unsigned>(wallCache_->coldMisses),static_cast<unsigned>(wallCache_->evictions));
 }
 
 // ---------------------------------------------------------------------------
@@ -1219,6 +1336,11 @@ bool ModelRenderer::hasTile(int tileX, int tileY) const {
 
 bool ModelRenderer::modelKnown(uint16_t id) const { return id < models_.size() && models_[id].tried; }
 
+void ModelRenderer::excludeGroundDecoration(uint16_t id) {
+    if(id>=models_.size())models_.resize(id+1u);
+    // Stream headers arrive before installation; no resident object is replaced.
+    if(!models_[id].h){models_[id].excluded=true;models_[id].tried=true;}
+}
 bool ModelRenderer::textureKnown(uint16_t id) const { return id < textures_.size() && textures_[id].tried; }
 
 void ModelRenderer::flushGrid() {
@@ -1226,6 +1348,9 @@ void ModelRenderer::flushGrid() {
     buildGrid();       // clears gridDirty_
     vramFull_ = false;  // new models may fit
 }
+
+
+
 
 uint32_t ModelRenderer::unloadTile(const pp::Pak& pak, int tileX, int tileY) {
     const uint32_t key = streamTileKey(tileX, tileY);
@@ -1257,6 +1382,7 @@ uint32_t ModelRenderer::unloadTile(const pp::Pak& pak, int tileX, int tileY) {
         const Deferred* dfr = deferred_.empty() ? nullptr : deferredOf(tileKeys_[t]);
         for (uint32_t i = 0; i < h->count; ++i) {
             if (dfr && i < dfr->flag.size() && dfr->flag[i]) continue;  // deferred - not seen yet
+            if(p[i].model<models_.size() && models_[p[i].model].excluded)continue;
             if (!seen_.insert(p[i].uniqueId).second) continue;
             if (p[i].model >= models_.size() || !models_[p[i].model].h) continue;
             instances_.push_back(&p[i]);
@@ -1295,6 +1421,7 @@ uint32_t ModelRenderer::unloadTile(const pp::Pak& pak, int tileX, int tileY) {
             pp::pakFree(m.impBlob);
         }
         pp::pakFree(m.blob);
+        if(m.collisionPending && pendingCollisionCount_) --pendingCollisionCount_;
         m = Model{};  // loadable again
         if (stats_.models) --stats_.models;
     }
@@ -1331,7 +1458,7 @@ uint32_t ModelRenderer::unloadTile(const pp::Pak& pak, int tileX, int tileY) {
 // see psp_models.hpp.
 void ModelRenderer::forgetFailed() {
     for (Model& m : models_)
-        if (m.tried && !m.h && !m.bad) m.tried = false;
+        if (m.tried && !m.h && !m.bad && !m.excluded) m.tried = false;
     for (Tex& t : textures_)
         if (t.tried && !t.ok) t.tried = false;
 }
@@ -1422,30 +1549,30 @@ uint32_t ModelRenderer::modelNeedBytes(const pp::Pak& pak, uint16_t id, bool& pa
 uint32_t ModelRenderer::placeBudgeted(pp::Pak& pak, const DoodadPlacement* p, const std::vector<uint32_t>& order,
                                       const LoadBudget& budget, std::vector<uint32_t>& left) {
     TileBudgetMeter meter;
-    meter.reserveBytes = budget.reserveKb * 1024u;
-    meter.stepBytes = std::max<uint32_t>(1u, budget.stepKb) * 1024u;
-    uint32_t placed = 0;
+    meter.reserveBytes = budget.reserveKb ? std::max<uint32_t>(budget.reserveKb*1024u,kPlacementReserveBytes) : 0;
+    meter.stepBytes = std::min<uint32_t>(128u*1024u,std::max<uint32_t>(1u,budget.stepKb)*1024u);
+    uint32_t placed = 0,probes=0;
     for (uint32_t i : order) {
         const DoodadPlacement& q = p[i];
-        if (seen_.count(q.uniqueId)) continue;  // already placed (a neighbour tile): as loadTile
-        const uint16_t id = q.model;
-        const bool known = id < models_.size() && models_[id].tried;  // resident, failed or bad: no read
-        if (!known) {
-            bool parked = true;
-            const uint32_t need = modelNeedBytes(pak, id, parked);
-            // PSP (emulator emu_memdiet7: a top-up read 1.5 MB ahead every 5 s and placed none of it): a
-            // model the loader parked is in the heap already - placing it costs nothing, no probe.
-            const bool inHeap = parked && need == 0;
-            if ((budget.parkedOnly && !parked) || (!inHeap && !meter.admit(need, budget.nearRule ? budgetNearProbe : budgetProbe))) {
-                left.push_back(i);
-                continue;
-            }
+        if (seen_.count(q.uniqueId)) continue;
+        const uint16_t id=q.model;
+        if(id<models_.size() && models_[id].excluded)continue;
+        const bool known=id<models_.size() && models_[id].tried;
+        bool parked=true;const uint32_t need=known?0:modelNeedBytes(pak,id,parked);
+        if((!known && budget.parkedOnly && !parked) ||
+           !meter.admit(need+kPlacementBudgetBytes,budget.nearRule?budgetNearProbe:budgetProbe)) {
+            left.push_back(i);continue;
         }
+        const auto* loaded=model(pak,id,budget.parkedOnly);
+        if(!known) { // Texture loading is not included in m_/k_/i_ sizes: recheck actual headroom next.
+            probes+=meter.probes;meter.probes=0;
+        }
+        if(id<models_.size() && models_[id].excluded)continue;
         seen_.insert(q.uniqueId);
-        if (!model(pak, id)) continue;  // failed / bad: seen, not drawn (as loadTile)
-        instances_.push_back(&q);
-        ++placed;
+        if(!loaded)continue;
+        instances_.push_back(&q);++placed;
     }
+    budgetStats_.probes += probes;
     budgetStats_.probes += meter.probes;
     if (meter.stopped) ++budgetStats_.stops;
     return placed;
@@ -1456,6 +1583,11 @@ bool ModelRenderer::loadTile(pp::Pak& pak, int tileX, int tileY, const LoadBudge
     char name[32];
     std::snprintf(name, sizeof(name), "d_%d_%d", tileX, tileY);
     const pp::PakEntry* e = pak.find(name);
+    if(e) {
+        const bool parked=pp::pakPrefetchPeek(pak.fileId(),e->offset)!=nullptr;
+        const uint32_t need = tilePlacementHeadroom(budget.reserveKb, e->size, parked);
+        if(!(budget.nearRule?budgetNearProbe:budgetProbe)(need))return false;
+    }
     auto* blob = e ? static_cast<uint8_t*>(pak.load(e)) : nullptr;
     if (!blob) return false;
     const auto* h = reinterpret_cast<const DoodadTileHeader*>(blob);
@@ -1497,7 +1629,8 @@ uint32_t ModelRenderer::resumeTile(pp::Pak& pak, int tileX, int tileY, const Loa
     const auto* p = reinterpret_cast<const DoodadPlacement*>(static_cast<const uint8_t*>(b) + sizeof(DoodadTileHeader));
     // The deferred ones nearest the player now (it moved since).
     std::vector<std::pair<float, uint32_t>> byYd;
-    byYd.reserve(d->idx.size());
+    std::vector<uint32_t> order,left;
+    left.reserve(d->idx.size());
     for (uint32_t i : d->idx) {
         if (i >= h->count) continue;
         const float dx = p[i].sphere[0] - budget.x, dy = p[i].sphere[1] - budget.y;
@@ -1505,7 +1638,6 @@ uint32_t ModelRenderer::resumeTile(pp::Pak& pak, int tileX, int tileY, const Loa
     }
     std::stable_sort(byYd.begin(), byYd.end(),
                      [](const std::pair<float, uint32_t>& a, const std::pair<float, uint32_t>& c) { return a.first < c.first; });
-    std::vector<uint32_t> order, left;
     order.reserve(byYd.size());
     for (const auto& [yd, i] : byYd) order.push_back(i);
     std::vector<std::pair<float, uint32_t>>().swap(byYd);
@@ -1513,7 +1645,7 @@ uint32_t ModelRenderer::resumeTile(pp::Pak& pak, int tileX, int tileY, const Loa
     for (uint32_t i : order) d->flag[i] = false;
     const uint32_t placed = placeBudgeted(pak, p, order, budget, left);
     for (uint32_t i : left) d->flag[i] = true;
-    budgetStats_.resumed += static_cast<uint32_t>(order.size() - left.size());
+    budgetStats_.resumed += placed;
     if (left.empty()) {
         for (size_t k = 0; k < deferred_.size(); ++k)
             if (&deferred_[k] == d) {
@@ -1547,6 +1679,7 @@ uint32_t ModelRenderer::deferredInView(int tileX, int tileY, float x, float y) c
     uint32_t n = 0;
     for (uint32_t i : d->idx) {
         if (i >= h->count || seen_.count(p[i].uniqueId)) continue;
+        if(p[i].model<models_.size() && models_[p[i].model].excluded)continue;
         const float r = p[i].sphere[3];
         const float dx = p[i].sphere[0] - x, dy = p[i].sphere[1] - y;
         const float reach = viewDistance * std::max(1.0f, r / 12.0f) * 1.6f + r;
@@ -1634,7 +1767,7 @@ float ModelRenderer::raycastProps(const glm::vec3& origin, const glm::vec3& dir,
     }
     auto visit = [&](const Inst& in) {  // the build-104 loop body
         ++g_cpuStats.colInsts;
-        if (!in.m->col || (in.m->h->flags & (kModelBuilding | kModelGroundDetail))) return;
+        if (!in.collision || (in.m->h->flags & (kModelBuilding | kModelGroundDetail))) return;
         const glm::vec3 oc = glm::vec3(in.x, in.y, in.z) - origin;
         const float tc = glm::dot(oc, dir);
         const float d2 = glm::dot(oc, oc) - tc * tc;
@@ -1643,7 +1776,7 @@ float ModelRenderer::raycastProps(const glm::vec3& origin, const glm::vec3& dir,
         const glm::mat3 A = axesOf(p);
         const CollisionHeader& ch = *in.m->col;
         if ((ch.bmax[2] - ch.bmin[2]) * glm::length(A[2]) < minHeight) return;  // fences, crates, bushes
-        const glm::mat3 Ai = glm::inverse(A);
+        const glm::mat3& Ai = collisionTransforms_[in.collision-1].inverse;
         const glm::vec3 pos(p.position[0], p.position[1], p.position[2]);
         const glm::vec3 o = Ai * (origin - pos);
         const glm::vec3 d = Ai * dir;  // t stays in world yards
@@ -1651,22 +1784,12 @@ float ModelRenderer::raycastProps(const glm::vec3& origin, const glm::vec3& dir,
         const ColView c = view(in.m->col);
         forCells(c, glm::min(glm::vec2(o), glm::vec2(e)), glm::max(glm::vec2(o), glm::vec2(e)), [&](uint32_t ti) {
             const CollisionTri& t = c.t[ti];
-            const float hit = rayTri(o, d, c.vert(t.a), c.vert(t.b), c.vert(t.c));
+            const float hit = collisionRayTri(o, d, c.vert(t.a), c.vert(t.b), c.vert(t.c));
             if (hit > 0.0f && hit < best) best = hit;
         });
     };
-    if (rayGridOk(origin, dir, maxDist)) {  // as raycastBuildings
-        const glm::vec3 end = origin + dir * maxDist;
-        forGrid(std::min(origin.x, end.x), std::min(origin.y, end.y), std::max(origin.x, end.x),
-                std::max(origin.y, end.y),
-                [&](const Cell& cl) {
-                    const glm::vec3 oc = glm::vec3(cl.x, cl.y, cl.z) - origin;
-                    const float tc = glm::dot(oc, dir);
-                    const float d2 = glm::dot(oc, oc) - tc * tc;
-                    const float rm = cl.r + kCellMargin;
-                    return !(d2 > rm * rm || tc + rm < 0.0f || tc - rm > best);
-                },
-                visit);
+    if (!gridDirty_ && g_cpuFast) {
+        collisionBounds_.rayQuery(origin,dir,best,[&](const CollisionBoundsIndex::Entry& e){visit(insts_[e.id]);});
     } else {
         for (const Inst& in : insts_) visit(in);
     }
@@ -1704,7 +1827,7 @@ bool ModelRenderer::drawHighlight(uint32_t uniqueId, const TerrainCamera& cam, u
     mtx.x = {ax.x * h.half[0], ax.y * h.half[0], ax.z * h.half[0], 0.0f};
     mtx.y = {ay.x * h.half[1], ay.y * h.half[1], ay.z * h.half[1], 0.0f};
     mtx.z = {az.x * h.half[2], az.y * h.half[2], az.z * h.half[2], 0.0f};
-    mtx.w = {t.x, t.y, t.z, 1.0f};
+    mtx.w = {t.x, t.y, t.z+(p.uniqueId==visualOffsetId_?visualOffsetZ_:0.f), 1.0f};
     pp::textureResetBinding();
     sceGuEnable(GU_DEPTH_TEST);
     sceGuDisable(GU_CULL_FACE);

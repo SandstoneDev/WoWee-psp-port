@@ -4,7 +4,9 @@
 #include "platform/psp/psp_display.hpp"
 #include "platform/psp/psp_bigheap.hpp"
 #include "platform/psp/psp_log.hpp"
+#include "platform/psp/psp_config.hpp"
 #include "rendering/animation/animation_ids.hpp"        // Creature anim
+#include "rendering/psp/psp_npc_pose_policy.hpp"
 #include "rendering/animation/melee_anim_chains.hpp"   // Creature anim
 #include "rendering/psp/psp_attachments.hpp"           // NPC equipment
 #include "rendering/psp/psp_equipment.hpp"             // NPC equipment
@@ -60,6 +62,27 @@ long entryNumber(const char* name, const char* prefix) {
 
 CreatureRenderer::~CreatureRenderer() { close(); }
 
+struct CreatureRenderer::InstallTimer {
+    CreatureRenderer& renderer;
+    uint32_t before;
+    uint64_t start;
+    explicit InstallTimer(CreatureRenderer& r):renderer(r),before(r.asyncCommits_),start(sceKernelGetSystemTimeWide()){}
+    ~InstallTimer(){if(renderer.asyncDrawing_ && renderer.asyncCommits_!=before)
+        renderer.asyncInstallUs_+=static_cast<uint32_t>(sceKernelGetSystemTimeWide()-start);}
+};
+
+void CreatureRenderer::startAsync(const char* path) {
+    if(!pp::configGetInt("npcasync",1)) return;
+    asyncInstallLimitUs_=static_cast<uint32_t>(std::clamp(pp::configGetInt("npcinstallus",2000),500,5000));
+    auto loader=std::make_unique<pp::NpcAssetLoader>();
+    if(loader->start(path,pak_.isOpen()?&pak_:nullptr)) async_=std::move(loader);
+    if(async_) {
+        index_.setRare(true);pak_.setRare(true);
+        index_.releaseFd();pak_.releaseFd();
+    }
+    PSP_LOGI(pp::tag::Gfx,"npc_async enabled=%d slots=4 install_us=%u",async_?1:0,static_cast<unsigned>(asyncInstallLimitUs_));
+}
+
 // a sorted pak (every display of the DBCs) opens through PakIndex - nothing is read but
 // its fence; an older pak through Pak (TOC in RAM, as before). Displays are found when a unit needs them.
 bool CreatureRenderer::open(const char* absPath) {
@@ -71,6 +94,7 @@ bool CreatureRenderer::open(const char* absPath) {
         PSP_LOGI(pp::tag::Gfx, "npc_pak sorted records=%u index_kb=%u pool=%u entry_cache=%u",
                  static_cast<unsigned>(index_.count()), static_cast<unsigned>(index_.ramBytes() / 1024u),
                  static_cast<unsigned>(kDisplayPool), static_cast<unsigned>(kEntryCacheSlots));
+        startAsync(absPath);
         return true;
     }
     if (!pak_.open(absPath)) return false;
@@ -84,10 +108,13 @@ bool CreatureRenderer::open(const char* absPath) {
     PSP_LOGI(pp::tag::Gfx, "npc_pak unsorted (older bake) displays=%u models=%u skins=%u records=%u",
              static_cast<unsigned>(displays), static_cast<unsigned>(models), static_cast<unsigned>(skins),
              static_cast<unsigned>(pak_.count()));
+    if(displays>0) startAsync(absPath);
     return displays > 0;
 }
 
 void CreatureRenderer::close() {
+    async_.reset(); // join before renderer blobs or the legacy lookup TOC are freed
+    asyncDrawing_=false;entryPending_=false;loadingScreen_=false;
     for (auto& [id, m] : models_)
         if (m.blob) pp::pakFree(m.blob);
     for (auto& [id, t] : textures_)
@@ -112,6 +139,7 @@ void CreatureRenderer::close() {
 }
 
 uint32_t CreatureRenderer::releaseModels() {
+    if(async_) async_->cancel(); // old map/character results can never install after this flush
     const uint32_t held = memoryBytes_;
     for (auto& [id, m] : models_)
         if (m.blob) pp::pakFree(m.blob);
@@ -192,9 +220,33 @@ bool CreatureRenderer::tocBudgetLeft() const {
 // The place of "<kind>_<id>" in the pak: the entry cache, else a lookup (PakIndex: at most one TOC block
 // read; Pak: its TOC in RAM). A missing entry is not cached (the caller marks its resource failed).
 bool CreatureRenderer::findEntry(EntryKind kind, uint32_t id, pp::PakEntry& out) {
+    entryPending_=false;
     static const char* const kPrefix[] = {"d_", "m_", "n_", "p_", "x_"};
     const uint32_t key = (static_cast<uint32_t>(kind) << 24) | (id & 0xFFFFFFu);
     EntrySlot* slot = entryCache_.empty() ? nullptr : &entryCache_[(key * 2654435761u >> 7) % kEntryCacheSlots];
+    if(asyncDrawing_) {
+        assetKey_=key;
+        char name[24];std::snprintf(name,sizeof(name),"%s%u",kPrefix[kind],static_cast<unsigned>(id));
+        pp::NpcAssetLoader::Result result;
+        const uint32_t now=pp::logUptimeMs();
+        auto status=async_->request(key,name,0,result,now);
+        if(status==pp::NpcAssetLoader::Status::Pending && async_->mayQueue(key)) {
+            uint32_t limit=2u*1024u*1024u;
+            if(slot && slot->key==key) limit=slot->size;
+            else if(kind==kEntryDisplay || kind==kEntryPoints) limit=64u*1024u;
+            else if(kind==kEntryTexture) limit=512u*1024u;
+            limit=std::max(limit,result.size);
+            const uint64_t free=pp::heapFreeBytes(),reserve=static_cast<uint64_t>(heapReserveKb)*1024u+async_->reservedBytes();
+            const uint32_t allowance=free>reserve?static_cast<uint32_t>(std::min<uint64_t>(free-reserve,limit)):0u;
+            status=async_->request(key,name,allowance,result,now);
+        }
+        if(result.size && slot) *slot=EntrySlot{key,result.offset,result.size};
+        if(status==pp::NpcAssetLoader::Status::Ready) {
+            out=pp::PakEntry{kPrefix[kind],result.offset,result.size,result.kind};return true;
+        }
+        entryPending_=status!=pp::NpcAssetLoader::Status::Missing;
+        return false;
+    }
     if (slot && slot->key == key) {
         out = pp::PakEntry{kPrefix[kind], slot->offset, slot->size, 0};
         return true;
@@ -216,6 +268,13 @@ bool CreatureRenderer::findEntry(EntryKind kind, uint32_t id, pp::PakEntry& out)
 }
 
 void* CreatureRenderer::loadEntry(const pp::PakEntry& e) {
+    if(asyncDrawing_) {
+        if(asyncCommits_>=loadsPerFrame || asyncInstallUs_>=asyncInstallLimitUs_) {entryPending_=true;return nullptr;}
+        void* blob=async_->take(assetKey_);
+        if(blob) {++asyncCommits_;entryPending_=false;}
+        else entryPending_=true;
+        return blob;
+    }
     if (index_.isOpen()) return index_.load(e);
     return pak_.isOpen() ? pak_.load(&e) : nullptr;
 }
@@ -349,6 +408,8 @@ int32_t CreatureRenderer::findDisplay(uint32_t displayId, bool lookup) {
     if (!lookup || !tocBudgetLeft()) return -1;
     pp::PakEntry e{};
     if (!findEntry(kEntryDisplay, displayId, e)) {
+        // A descriptor/read failure is not evidence that the creature is absent.
+        if (entryPending_ || (!asyncDrawing_ && index_.isOpen() && index_.lookupIoFailed())) return -1;
         displayIdx_.emplace(displayId, kDisplayAbsent);
         return kDisplayAbsent;
     }
@@ -411,6 +472,7 @@ void CreatureRenderer::evictDisplays() {
 
 // See the header. One failed probe holds the rest of the frame (no probe per candidate).
 bool CreatureRenderer::roomFor(uint32_t size) {
+    if(asyncDrawing_ && async_->ready(assetKey_)) return true; // the worker's blob already occupies this memory
     if (!heapReserveKb) return true;
     if (heapHeldFrame_ == frame_) return false;
     // Its own block + the margin in total (the world-entry prefetch keeps the larger one).
@@ -421,16 +483,22 @@ bool CreatureRenderer::roomFor(uint32_t size) {
 }
 
 bool CreatureRenderer::loadDisplay(Display& d) {
+    InstallTimer timer(*this);
+    if (d.retryAtMs && static_cast<int32_t>(pp::logUptimeMs()-d.retryAtMs)<0) return false;
     PROF_SCOPE("npc.load");
     pp::PakEntry e{};
     const bool found = findEntry(kEntryDisplay, d.id, e);
+    if(!found && entryPending_) return false;
     if (found && !roomFor(e.size)) return false;  // Waits, not failed
     auto* blob = found ? static_cast<uint8_t*>(loadEntry(e)) : nullptr;
+    if(!blob && entryPending_) return false;
     ++stats_.loads;
     if (!blob) {
-        d.failed = true;
+        d.failed = !found && !(!asyncDrawing_ && index_.isOpen() && index_.lookupIoFailed());
+        if (!d.failed) d.retryAtMs=pp::logUptimeMs()+1000u;
         return false;
     }
+    d.retryAtMs=0;
     std::memcpy(&d.h, blob, std::min<uint32_t>(e.size, sizeof(CreatureDisplayHeader)));
     if (e.size < sizeof(CreatureDisplayHeader) || std::memcmp(d.h.magic, "WCDI", 4) != 0 ||
         d.h.version != kModelFormatVersion || sizeof(CreatureDisplayHeader) + d.h.batchCount > e.size) {
@@ -438,6 +506,7 @@ bool CreatureRenderer::loadDisplay(Display& d) {
         d.failed = true;
     } else {
         d.active.assign(blob + sizeof(CreatureDisplayHeader), blob + sizeof(CreatureDisplayHeader) + d.h.batchCount);
+        d.batchPlans=NpcBatchPlans{};
         // the humanoid's equipment (helm / shoulders from items.pak at run time).
         if (const CreatureDisplayEquip* q = creatureDisplayEquip(blob, e.size)) {
             d.equip = *q;
@@ -450,17 +519,24 @@ bool CreatureRenderer::loadDisplay(Display& d) {
 }
 
 bool CreatureRenderer::loadModel(uint16_t id) {
+    InstallTimer timer(*this);
+    Model& m = models_[id];
+    if (m.retryAtMs && static_cast<int32_t>(pp::logUptimeMs()-m.retryAtMs)<0) return false;
     PROF_SCOPE("npc.load");
     pp::PakEntry e{};
     const bool found = findEntry(kEntryModel, id, e);
+    if(!found && entryPending_) return false;
     if (found && !roomFor(e.size)) return false;  // Waits, not failed
-    Model& m = models_[id];
     auto* blob = found ? static_cast<uint8_t*>(loadEntry(e)) : nullptr;
+    if(!blob && entryPending_) return false;
     ++stats_.loads;
     if (!blob) {
-        m.failed = true;
+        m.failed = !found && !(!asyncDrawing_ && index_.isOpen() && index_.lookupIoFailed());
+        if (!m.failed) m.retryAtMs=pp::logUptimeMs()+1000u;
         return false;
     }
+    m.retryAtMs=0;
+    if(e.size<sizeof(ModelHeader)) {pp::pakFree(blob);m.failed=true;return false;}
     const auto* h = reinterpret_cast<const ModelHeader*>(blob);
     const uint32_t batches = static_cast<uint32_t>(h->batchCount[0]) + h->batchCount[1];
     bool ok = e.size >= sizeof(ModelHeader) && std::memcmp(h->magic, "WMDL", 4) == 0 &&
@@ -488,18 +564,28 @@ bool CreatureRenderer::loadModel(uint16_t id) {
 }
 
 bool CreatureRenderer::loadTexture(uint16_t id) {
+    InstallTimer timer(*this);
+    Tex& t = textures_[id];
+    if (t.retryAtMs && static_cast<int32_t>(pp::logUptimeMs()-t.retryAtMs)<0) return false;
     PROF_SCOPE("npc.load");
     pp::PakEntry e{};
     const bool found = findEntry(kEntryTexture, id, e);
+    if(!found && entryPending_) return false;
     if (found && !roomFor(e.size)) return false;  // Waits, not failed (ensure() holds the unit)
-    Tex& t = textures_[id];
     void* blob = found ? loadEntry(e) : nullptr;
+    if(!blob && entryPending_) return false;
     ++stats_.loads;
-    if (!blob || !pp::textureFromBlob(blob, e.size, t.t, true)) {
-        if (blob) pp::pakFree(blob);
-        t.failed = true;  // drawn white from now on
+    if (!blob) {
+        t.failed = !found && !(!asyncDrawing_ && index_.isOpen() && index_.lookupIoFailed());
+        if (!t.failed) t.retryAtMs=pp::logUptimeMs()+1000u;
         return false;
     }
+    if (!pp::textureFromBlob(blob, e.size, t.t, true)) {
+        pp::pakFree(blob);
+        t.failed = true;  // malformed texture data, not a transient read failure
+        return false;
+    }
+    t.retryAtMs=0;
     t.loaded = true;
     t.bytes = e.size;
     t.lastUsed = frame_;
@@ -528,7 +614,7 @@ bool CreatureRenderer::ensure(Display& d, uint32_t& budget) {
                 if (!budget || !tocBudgetLeft()) return false;
                 --budget;
                 const bool ok = loadSkin(d.h.model);
-                if (!ok && heapHeldFrame_ == frame_) return false;  // No room yet - not the static model
+                if (!ok && (heapHeldFrame_ == frame_ || entryPending_)) return false;  // pending is not a missing skin
                 d.skinMode = ok ? 1 : 2;
             } else {
                 d.skinMode = 1;
@@ -542,7 +628,7 @@ bool CreatureRenderer::ensure(Display& d, uint32_t& budget) {
         if (!sk || (!sk->blob && !sk->failed)) {  // evicted since: read it again
             if (!budget || !tocBudgetLeft()) return false;
             --budget;
-            if (!loadSkin(d.h.model) && heapHeldFrame_ == frame_) return false;  // No room yet
+            if (!loadSkin(d.h.model) && (heapHeldFrame_ == frame_ || entryPending_)) return false;
             sk = skinOf(d.h.model);
         }
         if (sk && sk->blob && sk->view.h->batchCount != d.h.batchCount) {
@@ -587,14 +673,18 @@ bool CreatureRenderer::ensure(Display& d, uint32_t& budget) {
         }
         d.texturesKnown = true;
     }
+    bool texturesPending=false;
     for (uint16_t id : d.textures) {
         auto it = textures_.find(id);
         if (it != textures_.end() && (it->second.loaded || it->second.failed)) continue;
         if (!budget || !tocBudgetLeft()) return false;
         --budget;
-        if (!loadTexture(id) && heapHeldFrame_ == frame_) return false;  // No room yet - not white
+        if (!loadTexture(id)) {
+            if(heapHeldFrame_==frame_) return false;
+            if(entryPending_) texturesPending=true; // queue another dependency while this one reads
+        }
     }
-    return true;
+    return !texturesPending; // never display partially loaded textures
 }
 
 const pp::Texture* CreatureRenderer::texture(const Display& d, uint16_t id, uint8_t active) const {
@@ -719,7 +809,12 @@ void CreatureRenderer::draw(const TerrainCamera& cam, uint32_t fogColorABGR) {
     stats_.units = static_cast<uint32_t>(units_.size());
     frameTocReads0_ = index_.blockReads();  // this frame's TOC budget
     stats_.tocReads = 0;
+    asyncCommits_=asyncInstallUs_=0;
+    if(async_) async_->trim(pp::logUptimeMs());
     if (units_.empty() || !isOpen()) return;
+    asyncDrawing_=async_!=nullptr && !loadingScreen_;
+    if(asyncDrawing_) {index_.releaseFd();pak_.releaseFd();} // synchronous warm-up is done
+    struct AsyncDrawEnd {bool& flag;~AsyncDrawEnd(){flag=false;}} asyncEnd{asyncDrawing_};
 
     PROF_SCOPE("npc");
     PROF_GE_PASS("npc");
@@ -728,7 +823,8 @@ void CreatureRenderer::draw(const TerrainCamera& cam, uint32_t fogColorABGR) {
     const glm::mat4 proj = glm::perspective(glm::radians(cam.fovyDeg), aspect, cam.nearZ, cam.farZ);
     const glm::mat4 view = glm::lookAt(glm::vec3(0.0f), cam.forward, cam.up);
     const Frustum fr = makeFrustum(proj * view);
-    const float reach = std::min(viewDistance, cam.farZ * 0.95f);
+    const uint32_t drawLimit=std::min(maxDrawn,performanceMax);
+    const float reach=std::min(std::min(viewDistance,std::max(30.f,viewDistance*performanceScale)),cam.farZ*.95f);
 
     static const uint16_t kCullZone = prof::zoneId("npc.cull");
     prof::zoneEnter(kCullZone);
@@ -739,29 +835,34 @@ void CreatureRenderer::draw(const TerrainCamera& cam, uint32_t fogColorABGR) {
     visible_.clear();
     near_.clear();
     const float coarse = reach + 12.0f;
+    const glm::vec3 priorityOrigin=priorityOriginKnown_ ? priorityOrigin_ : cam.pos;
     for (Unit& un : units_) {
         const glm::vec3 c(un.u.x - cam.pos.x, un.u.y - cam.pos.y, un.u.z + 1.0f - cam.pos.z);
         const float d2 = glm::dot(c, c);
         // Coarse sphere before anything is loaded: the load budget goes to
         // units the camera can see (the exact test follows once the model is in).
-        const bool keep = portraitUnit_ != 0 && un.u.guid == portraitUnit_;  // The portrait's unit
+        const bool keep = (portraitUnit_ != 0 && un.u.guid == portraitUnit_) || un.u.guid == importantGuid || un.u.driven;  // target portrait / controlled rider
         if (!keep && (d2 > coarse * coarse || fr.sphereOutside(c, 8.0f * std::max(1.0f, un.u.scale)))) {
             ++stats_.culled;
             continue;
         }
-        near_.emplace_back(d2, &un);
+        const glm::vec3 fromPlayer=glm::vec3(un.u.x,un.u.y,un.u.z)-priorityOrigin;
+        const bool inViewport=!fr.sphereOutside(c,(keepViewportNpcs ? 8.0f : 1.5f)*std::max(1.0f,un.u.scale));
+        near_.push_back(Candidate{d2,&un,NpcPriority{un.u.driven,inViewport,glm::dot(fromPlayer,fromPlayer),un.u.guid}});
     }
-    // Nearest first for the lookups too (a mount first: its rider is drawn regardless).
-    std::sort(near_.begin(), near_.end(), [](const std::pair<float, Unit*>& a, const std::pair<float, Unit*>& b) {
-        return a.second->u.mount != b.second->u.mount ? a.second->u.mount : a.first < b.first;
+    // Visible neighbors get first claim on display lookups, model reads and draw slots.
+    std::sort(near_.begin(),near_.end(),[](const Candidate& a,const Candidate& b) {
+        return npcPriorityBefore(a.priority,b.priority);
     });
-    for (const auto& [d2, unp] : near_) {
-        Unit& un = *unp;
+    for (const Candidate& candidate:near_) {
+        const float d2=candidate.cameraDistanceSq;
+        Unit& un=*candidate.unit;
         // twice maxDrawn candidates at most - the rest are not drawn this frame, so they
         // take no lookup and no slot of the display pool (a crowd would churn it). The portrait's unit and the
         // mounts always pass.
-        const bool keep = (portraitUnit_ != 0 && un.u.guid == portraitUnit_) || un.u.mount;
-        if (!keep && visible_.size() >= 2u * maxDrawn) {
+        const bool keep = ((portraitUnit_ != 0 && un.u.guid == portraitUnit_) || un.u.guid == importantGuid) || un.u.driven;
+        if (!npcWithinDrawBudget(keepViewportNpcs,candidate.priority.inViewport,keep,
+                                 static_cast<uint32_t>(visible_.size()),2u*drawLimit)) {
             ++stats_.culled;
             continue;
         }
@@ -772,14 +873,20 @@ void CreatureRenderer::draw(const TerrainCamera& cam, uint32_t fogColorABGR) {
         }
         Display& dsp = displays_[static_cast<size_t>(un.display)];
         dsp.lastUsed = frame_;  // a candidate's slot is never given up in this frame
-        visible_.push_back(Visible{&un, &dsp, std::sqrt(d2), 0, {}});
+        Visible v{&un, &dsp, std::sqrt(d2), 0, {}};
+        v.inViewport = candidate.priority.inViewport;
+        visible_.push_back(v);
     }
     uint32_t budget = loadsPerFrame;
     size_t kept = 0;
+    uint32_t worldKept=0;
     for (size_t i = 0; i < visible_.size(); ++i) {
         Visible v = visible_[i];
-        const bool keep = portraitUnit_ != 0 && v.unit->u.guid == portraitUnit_;
-        if (kept >= maxDrawn && !keep) {
+        const bool keep = (portraitUnit_ != 0 && v.unit->u.guid == portraitUnit_) || v.unit->u.guid == importantGuid || v.unit->u.driven;
+        const bool important=v.unit->u.guid==importantGuid || v.unit->u.driven;
+        const float unitReach=important ? std::min(viewDistance,cam.farZ*.95f) : reach;
+        const float lodScale=important ? 1.f : performanceLodScale;
+        if (!npcWithinDrawBudget(keepViewportNpcs,v.inViewport,keep,worldKept,drawLimit)) {
             ++stats_.culled;
             continue;
         }
@@ -789,6 +896,17 @@ void CreatureRenderer::draw(const TerrainCamera& cam, uint32_t fogColorABGR) {
         }
         const CreatureUnit& u = v.unit->u;
         const float scale = unitScale(u, *v.d);  // Mounts (rawScale)
+        // Record the actual realm scale alongside the client scale. In particular,
+        // Northshire's young wolves are intentionally smaller in the DBC; do not
+        // replace that authored scale with an arbitrary species multiplier.
+        if(!v.d->scaleLogged) {
+            v.d->scaleLogged=true;
+            static unsigned generalLogs=0, targetLogs=0;
+            const bool target=u.displayId==31048 || u.displayId==31049 || u.displayId==1954;
+            if((target && targetLogs++<16) || (!target && generalLogs++<32))
+                PSP_LOGI(pp::tag::Gfx,"npc_scale display=%u server=%.3f client=%.3f effective=%.3f raw=%d",
+                    static_cast<unsigned>(u.displayId),u.scale,v.d->h.scale,scale,u.rawScale?1:0);
+        }
         const float cs = std::cos(u.orientation), sn = std::sin(u.orientation);
         const glm::vec3 ax(cs * scale, sn * scale, 0.0f), ay(-sn * scale, cs * scale, 0.0f), az(0.0f, 0.0f, scale);
         if (v.d->skinMode == 1) {  // Creature anim - GE skinning, own culling/matrix
@@ -799,7 +917,8 @@ void CreatureRenderer::draw(const TerrainCamera& cam, uint32_t fogColorABGR) {
             // Bind-pose sphere + 25 %: animated limbs reach beyond it.
             const float r = sh.radius * scale * 1.25f;
             const float dist = std::max(0.0f, glm::length(rel) - r);
-            if (dist > reach || fr.sphereOutside(rel, r) || kept >= maxDrawn) {
+            if (dist > unitReach || fr.sphereOutside(rel, r) ||
+                !npcWithinDrawBudget(keepViewportNpcs,v.inViewport,v.unit->u.driven,worldKept,drawLimit)) {
                 if (!keep) {
                     ++stats_.culled;
                     continue;
@@ -807,7 +926,7 @@ void CreatureRenderer::draw(const TerrainCamera& cam, uint32_t fogColorABGR) {
                 v.portraitOnly = true;  // Posed for the portrait, not drawn in the world
             }
             v.dist = v.portraitOnly ? 0.0f : dist;  // The portrait animates at full rate
-            v.lod = ((sh.flags & kSkinHasLod) && sk.lod0Batches < sh.batchCount && dist > lodDistance) ? 1 : 0;
+            v.lod = ((sh.flags & kSkinHasLod) && sk.lod0Batches < sh.batchCount && dist > lodDistance*lodScale) ? 1 : 0;
             // The bone matrices carry the dequantisation: rotation x scale
             // and the feet only (CharacterModel::draw).
             const glm::vec3 t = feet - cam.pos;
@@ -820,6 +939,7 @@ void CreatureRenderer::draw(const TerrainCamera& cam, uint32_t fogColorABGR) {
             if (a.skin != static_cast<int32_t>(v.d->h.model)) bindAnim(a, *v.unit, sk);
             v.anim = &a;
             visible_[kept++] = v;
+            if (!v.portraitOnly) ++worldKept;
             continue;
         }
         const Model& m = models_[v.d->h.model];
@@ -828,7 +948,8 @@ void CreatureRenderer::draw(const TerrainCamera& cam, uint32_t fogColorABGR) {
         const glm::vec3 rel = center - cam.pos;
         const float r = h.radius * scale;
         const float dist = std::max(0.0f, glm::length(rel) - r);
-        if (dist > reach || fr.sphereOutside(rel, r) || kept >= maxDrawn) {
+        if (dist > unitReach || fr.sphereOutside(rel, r) ||
+            !npcWithinDrawBudget(keepViewportNpcs,v.inViewport,v.unit->u.driven,worldKept,drawLimit)) {
             if (!keep) {
                 ++stats_.culled;
                 continue;
@@ -836,12 +957,13 @@ void CreatureRenderer::draw(const TerrainCamera& cam, uint32_t fogColorABGR) {
             v.portraitOnly = true;
         }
         v.dist = dist;
-        v.lod = (h.batchCount[1] && dist > lodDistance) ? 1 : 0;
+        v.lod = (h.batchCount[1] && dist > lodDistance*lodScale) ? 1 : 0;
         v.mtx.x = {ax.x * h.half[0], ax.y * h.half[0], 0.0f, 0.0f};
         v.mtx.y = {ay.x * h.half[1], ay.y * h.half[1], 0.0f, 0.0f};
         v.mtx.z = {0.0f, 0.0f, az.z * h.half[2], 0.0f};
         v.mtx.w = {rel.x, rel.y, rel.z, 1.0f};
         visible_[kept++] = v;
+        if (!v.portraitOnly) ++worldKept;
     }
     visible_.resize(kept);
     budgetToc_ = false;
@@ -857,6 +979,8 @@ void CreatureRenderer::draw(const TerrainCamera& cam, uint32_t fogColorABGR) {
             AnimUnit& a = *v.anim;
             const Skin& sk = *skinOf(v.d->h.model);
             const bool driven = v.unit->u.driven;  // Mounts - the caller's animation
+            const int previousSequence=a.s.sequence;
+            const uint32_t previousAnim=a.s.animId;
             if (!driven) driveAnim(a, *v.unit, sk);
             else if (a.drivenPending) {
                 skinPlay(sk.view, a.s, a.drivenAnim, a.drivenLoop);
@@ -866,26 +990,29 @@ void CreatureRenderer::draw(const TerrainCamera& cam, uint32_t fogColorABGR) {
             const float rate = (moveAnimRate && !driven) ? moveRate(a, *v.unit, sk) : 1.0f;  // walk/run
             if (skinUpdate(sk.view, a.s, frameDt_ * rate)) a.dirty = true;
             if (a.wasMoving) ++stats_.moving;
-            // Upstream CharacterRenderer boneInterval: 1 near, 2 beyond 45 yd,
-            // 4 beyond 90 (animDistance x 1 / x 2), staggered by guid.
-            uint32_t interval = 1;
-            if (animDistance > 0.0f && !driven)
-                interval = v.dist > animDistance * 2.0f ? 4u : (v.dist > animDistance ? 2u : 1u);
-            const uint32_t phase = static_cast<uint32_t>(v.unit->u.guid) & 3u;
-            if (!a.poseValid || (a.dirty && (interval == 1 || ((frame_ + phase) % interval) == 0)))
+            const bool important=driven || v.portraitOnly || v.unit->u.guid==importantGuid;
+            const uint32_t interval=npcPoseInterval(v.dist,animDistance,a.wasMoving,
+                a.ready,important,!a.s.loop);
+            const bool changed=previousSequence!=a.s.sequence || previousAnim!=a.s.animId;
+            const uint32_t phase=static_cast<uint32_t>(v.unit->u.guid ^ (v.unit->u.guid>>32));
+            if (npcPoseDue(a.poseValid,a.dirty,frame_,phase,interval,changed))
                 posing_.push_back(&v);
         }
         // PSP: at most maxPoses per frame (wowee.cfg npcposes, 0 = all), the
         // longest-waiting first; a unit never posed yet always is (it would
         // draw garbage). The others keep last frame's pose.
-        if (maxPoses && posing_.size() > maxPoses) {
+        const uint32_t poseLimit=performancePoses ? (maxPoses ? std::min(maxPoses,performancePoses) : performancePoses) : maxPoses;
+        if (poseLimit && posing_.size() > poseLimit) {
             // Mounts - a driven unit (the own mount) counts as never posed: always kept.
-            auto must = [](const Visible* x) { return !x->anim->poseValid || x->unit->u.driven; };
+            auto must = [this](const Visible* x) {
+                return npcPoseProtected(x->dist,animDistance,x->anim->poseValid,
+                    x->unit->u.driven || x->portraitOnly || x->unit->u.guid==importantGuid);
+            };
             std::stable_sort(posing_.begin(), posing_.end(), [&](const Visible* x, const Visible* y) {
                 const bool nx = must(x), ny = must(y);
                 return nx != ny ? nx : x->anim->lastPose < y->anim->lastPose;
             });
-            size_t keep = maxPoses;
+            size_t keep = poseLimit;
             while (keep < posing_.size() && must(posing_[keep])) ++keep;
             posing_.resize(keep);
         }
@@ -927,8 +1054,9 @@ void CreatureRenderer::draw(const TerrainCamera& cam, uint32_t fogColorABGR) {
 
     // Opaque pass grouped by display and LOD: batch state once, then a
     // matrix and a draw per unit (ModelRenderer).
-    order_.resize(visible_.size());
-    for (size_t i = 0; i < order_.size(); ++i) order_[i] = static_cast<uint32_t>(i);
+    order_.clear();
+    for(size_t i=0;i<visible_.size();++i)
+        if(!visible_[i].anim)order_.push_back(static_cast<uint32_t>(i));
     std::sort(order_.begin(), order_.end(), [&](uint32_t a, uint32_t b) {
         const Visible& va = visible_[a];
         const Visible& vb = visible_[b];
@@ -1023,6 +1151,10 @@ void CreatureRenderer::draw(const TerrainCamera& cam, uint32_t fogColorABGR) {
     const uint32_t nowMs = pp::logUptimeMs();
     if (nowMs >= nextLogMs_) {
         nextLogMs_ = nowMs + 10000;
+        uint32_t planHits=0,planBuilds=0;
+        for(const auto& d:displays_){planHits+=d.batchPlans.hits;planBuilds+=d.batchPlans.builds;}
+        PSP_LOGI(pp::tag::Gfx,"npc_batch_plan hits=%u builds=%u visible_preserved=1",
+                 static_cast<unsigned>(planHits),static_cast<unsigned>(planBuilds));
         PSP_LOGI(pp::tag::Gfx,
                  "npc_frame units=%u drawn=%u culled=%u waiting=%u lod1=%u batches=%u tris=%u loads=%u "
                  "res=%u/%u/%u kb=%u",
@@ -1050,6 +1182,10 @@ void CreatureRenderer::draw(const TerrainCamera& cam, uint32_t fogColorABGR) {
                  static_cast<unsigned>(lookupMisses_), static_cast<unsigned>(displayEvictions_),
                  static_cast<unsigned>(indexRamBytes() / 1024u), static_cast<unsigned>(stats_.equipped),
                  static_cast<unsigned>(attachmentCacheBytes() / 1024u));
+        if(async_) PSP_LOGI(pp::tag::Gfx,"npc_async_frame reads=%u failures=%u installs=%u install_us=%u reserve_kb=%u",
+                           static_cast<unsigned>(async_->reads()),static_cast<unsigned>(async_->failures()),
+                           static_cast<unsigned>(asyncCommits_),static_cast<unsigned>(asyncInstallUs_),
+                           static_cast<unsigned>(async_->reservedBytes()/1024u));
     }
 }
 
@@ -1274,12 +1410,15 @@ const CreatureRenderer::Skin* CreatureRenderer::skinOf(int32_t model) const {
 // "n_<id>" looked up and read; a model without one (or a bad one) is remembered as
 // failed (drawn static from "m_").
 bool CreatureRenderer::loadSkin(uint16_t id) {
+    InstallTimer timer(*this);
     PROF_SCOPE("npc.load");
     pp::PakEntry e{};
     const bool found = findEntry(kEntrySkin, id, e);
+    if(!found && entryPending_) return false;
     if (found && !roomFor(e.size)) return false;  // Waits, not failed (ensure() holds the unit)
     Skin& k = skins_[id];
     void* blob = found ? loadEntry(e) : nullptr;
+    if(!blob && entryPending_) return false;
     if (found) ++stats_.loads;
     SkinView view;
     if (!blob || !view.init(blob, e.size) || view.h->sequenceCount == 0) {
@@ -1484,15 +1623,19 @@ void CreatureRenderer::drawSkinnedUnit(const Visible& v, bool blendPass) {
     // (group 0, ids 2..99), the bald cap (1) in, as applyEquipmentGeosets does for a player.
     const bool noHair = v.anim && v.anim->attach && v.anim->helmHidesHair && view.geosets && items_ && equipOn &&
                         attachmentsEnabled();
-    for (uint32_t i = first; i < end; ++i) {
-        const ModelBatch& b = view.batches[i];
-        uint8_t active = v.d->active[i];
-        if (noHair) {
-            const uint16_t g = view.geosets[i];
-            if (g > 1 && g < 100) active = 0;
-            else if (g == 1 && !active) active = 1;
+    const auto& plan=v.d->batchPlans.get(view.h,nb,sk.lod0Batches,v.lod!=0,noHair,blendPass,[&](auto& picks) {
+        for(uint32_t i=first;i<end;++i) {
+            uint8_t active=v.d->active[i];
+            if(noHair) {
+                const uint16_t g=view.geosets[i];
+                if(g>1 && g<100)active=0;else if(g==1 && !active)active=1;
+            }
+            if(active && isBlended(view.batches[i].blend)==blendPass)picks.push_back({i,active});
         }
-        if (!active || isBlended(b.blend) != blendPass) continue;
+    });
+    for(const auto& pick:plan) {
+        const ModelBatch& b=view.batches[pick.index];
+        const uint8_t active=pick.active;
         if (v.hull && b.blend != kBlendOpaque) continue;  // Outline - solid batches only
         if (!set) {
             sceGuSetMatrix(GU_MODEL, &v.mtx);
@@ -1564,11 +1707,25 @@ void CreatureRenderer::updateEquipment() {
                                       : frame_ - a.capRetryFrame > 120u && attachmentInUseBytes() < attachmentCapBytes());
         if (a.attach && a.attachKey == key && !capRetry) continue;
         if (loadedOne) continue;  // one dressing per frame
+        if(asyncDrawing_ && (asyncCommits_>=loadsPerFrame || asyncInstallUs_>=asyncInstallLimitUs_)) continue;
         const Seats* points = seatsOf(d.h.model);
+        if(!points && entryPending_) continue;
         if (!points || points->points.empty()) {
             a.attachKey = key;  // no points baked (an older pak): nothing to hang them on
             continue;
         }
+        if(asyncDrawing_ && items_->npcStreaming()) {
+            bool ready=true;
+            for(uint32_t id:{helm,shoulder,weapon,offHand,ranged})
+                if(!items_->prepareNpcRecord(id)) ready=false;
+            if(helm && itemVariant(d.equip.race,d.equip.sex)==kItemVariants-1 && !items_->prepareNpcEntry('h',helm)) ready=false;
+            if(!ready) continue;
+        }
+        struct NpcIoEnd {
+            ItemBank* bank;
+            ~NpcIoEnd(){if(bank)bank->setNpcNoIo(false);}
+        } npcIoEnd{asyncDrawing_ && items_->npcStreaming()?items_:nullptr};
+        if(npcIoEnd.bank) items_->setNpcNoIo(true);
         Equipment eq;
         eq.displayId[0] = helm;
         eq.invType[0] = 1;       // INVTYPE_HEAD
@@ -1608,8 +1765,24 @@ void CreatureRenderer::updateEquipment() {
                 picks.push_back(p);
             }
         }
-        if (!a.attach) a.attach = std::make_shared<CharacterAttachments>();
-        a.attach->set(picks, points->points, *items_, false);  // within attachcap (not essential)
+        if(npcIoEnd.bank && items_->npcDeferred()) continue;
+        if(asyncDrawing_ && !prepareNpcAttachments(*items_,picks)) continue;
+        const uint64_t installStart=sceKernelGetSystemTimeWide();
+        if(asyncDrawing_ && items_->npcStreaming()) {
+            // Stage a complete replacement. If cache pressure exposes another
+            // dependency, keep the old appearance and retry instead of doing I/O.
+            auto replacement=std::make_shared<CharacterAttachments>();
+            replacement->set(picks,points->points,*items_,false);
+            const bool deferred=items_->npcDeferred();
+            asyncInstallUs_+=static_cast<uint32_t>(sceKernelGetSystemTimeWide()-installStart);
+            ++asyncCommits_;
+            if(deferred) continue;
+            if(a.attach && attachCapSkipped(*replacement)) continue; // retain current equipment under cap pressure
+            a.attach=std::move(replacement);
+        } else {
+            if (!a.attach) a.attach = std::make_shared<CharacterAttachments>();
+            a.attach->set(picks, points->points, *items_, false);
+        }
         a.attachKey = key;
         a.capRetryFrame = frame_;
         a.retryNow = false;
@@ -1799,16 +1972,19 @@ const CreatureRenderer::Unit* CreatureRenderer::unitOf(uint64_t guid) const {
 }
 
 const CreatureRenderer::Seats* CreatureRenderer::seatsOf(uint16_t model) {
+    InstallTimer timer(*this);
     auto found = seats_.find(model);
     if (found != seats_.end()) return &found->second;
     pp::PakEntry e{};
     if (!findEntry(kEntryPoints, model, e)) {
+        if(entryPending_) return nullptr;
         seats_[model].loaded = true;  // no "p_": remembered (an empty table)
         return &seats_[model];
     }
     Seats& s = seats_[model];
-    s.loaded = true;
     auto* blob = static_cast<uint8_t*>(loadEntry(e));
+    if(!blob && entryPending_) {seats_.erase(model);return nullptr;}
+    s.loaded = true;
     ++stats_.loads;
     if (!blob) return &s;
     const auto* h = reinterpret_cast<const AttachTable*>(blob);
